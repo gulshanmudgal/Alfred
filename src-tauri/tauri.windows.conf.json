@@ -1,0 +1,14 @@
+{
+  "bundle": {
+    "targets": ["nsis", "msi"],
+    "externalBin": ["binaries/alfred-windows-host"],
+    "resources": [
+      "../browser/chromium-extension/**/*",
+      "../scripts/windows/install-browser-bridge.ps1"
+    ],
+    "windows": {
+      "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true },
+      "nsis": { "installMode": "currentUser" }
+    }
+  }
+}

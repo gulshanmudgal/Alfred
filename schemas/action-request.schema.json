@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://alfred.local/schemas/action-request-v1.json",
+  "title": "Alfred Action Request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocolVersion", "runId", "workflowStep", "application", "intent", "effect"],
+  "properties": {
+    "protocolVersion": { "const": "1.0" },
+    "runId": { "type": "string", "minLength": 1 },
+    "workflowStep": { "type": "string", "minLength": 1 },
+    "application": { "type": "string", "minLength": 1 },
+    "intent": { "type": "string", "minLength": 1 },
+    "effect": {
+      "enum": ["observe", "create", "modify_reversible", "external_write", "destructive", "unknown"]
+    },
+    "targetLabel": { "type": ["string", "null"] },
+    "payload": { "type": "object" }
+  }
+}

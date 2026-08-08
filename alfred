@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ALFRED_ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ALFRED_ROOT"
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "Alfred needs Node.js 20 or newer. Install Node.js, then run this command again."
+  exit 1
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+  if [ -x "/opt/homebrew/opt/rustup/bin/cargo" ]; then
+    export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
+  elif [ -x "$HOME/.cargo/bin/cargo" ]; then
+    export PATH="$HOME/.cargo/bin:$PATH"
+  else
+    echo "Alfred needs the stable Rust toolchain. Install Rust from https://rustup.rs and try again."
+    exit 1
+  fi
+fi
+
+if [ ! -d node_modules ]; then
+  echo "Preparing Alfred for first launch…"
+  npm install
+fi
+
+exec npm run alfred
