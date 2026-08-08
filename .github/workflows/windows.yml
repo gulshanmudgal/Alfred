@@ -16,10 +16,15 @@ jobs:
         with: { dotnet-version: 10.0.x }
       - run: npm ci
       - run: npm run build
+      - run: dotnet publish native/windows-host/Alfred.WindowsHost.csproj -c Release -r win-x64 --self-contained true
+      - name: Stage Windows automation sidecar
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
+          Copy-Item native/windows-host/bin/Release/net10.0-windows/win-x64/publish/alfred-windows-host.exe src-tauri/binaries/alfred-windows-host-x86_64-pc-windows-msvc.exe -Force
       - run: cargo test --manifest-path src-tauri/Cargo.toml
-      - run: dotnet build native/windows-host/Alfred.WindowsHost.csproj -c Release
       - shell: pwsh
-        run: ./scripts/windows/test-e2e.ps1 -SkipDesktop -HostPath native/windows-host/bin/Release/net10.0-windows/win-x64/alfred-windows-host.exe
+        run: ./scripts/windows/test-e2e.ps1 -SkipDesktop -HostPath native/windows-host/bin/Release/net10.0-windows/win-x64/publish/alfred-windows-host.exe
       - shell: pwsh
         run: ./scripts/windows/package.ps1
       - uses: actions/upload-artifact@v4
