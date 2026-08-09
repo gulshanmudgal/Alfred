@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Icon } from "./icons";
-import type { AppSettings, PermissionGrant, ProviderEvent, ProviderStatus, RunEvent, SystemInfo, View, Workflow, WorkflowSchedule } from "./types";
+import type { AppSettings, PermissionGrant, ProviderEvent, ProviderStatus, RunEvent, SystemInfo, View, Workflow, WorkflowSchedule, WorkflowStep } from "./types";
 
 const starterWorkflows: Workflow[] = [
   {
@@ -293,38 +293,88 @@ function RunCockpit({ workflow, settings, onWorkflowChanged, onClose }: { workfl
 }
 
 function WorkflowStudio({ workflow, settings, onWorkflowChanged, onClose }: { workflow: Workflow; settings: AppSettings; onWorkflowChanged: () => Promise<void>; onClose: () => void }) {
+  const initialApplication = /notepad/i.test(workflow.goal) ? "Notepad" : /calculator/i.test(workflow.goal) ? "Calculator" : /edge|browser|website/i.test(workflow.goal) ? "Microsoft Edge" : "";
   const [steps, setSteps] = useState(workflow.steps);
-  const [application, setApplication] = useState("Microsoft Edge");
-  const [method, setMethod] = useState("browser.observe");
+  const [application, setApplication] = useState(initialApplication);
+  const [method, setMethod] = useState(initialApplication ? "launchApplication" : "observeWindow");
   const [target, setTarget] = useState("");
-  const [parameters, setParameters] = useState("{}");
+  const [parameters, setParameters] = useState(initialApplication ? JSON.stringify({ application: initialApplication }, null, 2) : "{}");
   const [providerLines, setProviderLines] = useState<string[]>([]);
   const [providerSession, setProviderSession] = useState("");
+  const [proposedSteps, setProposedSteps] = useState<WorkflowStep[]>([]);
+  const [proposedParameters, setProposedParameters] = useState<Record<string, string>>({});
+  const [recordingPlan, setRecordingPlan] = useState(false);
   const [error, setError] = useState("");
   const activeProvider = useRef("");
-  useEffect(() => { let dispose: (() => void) | undefined; listen<ProviderEvent>("alfred://provider-event", ({ payload }) => { if (payload.sessionId === activeProvider.current) setProviderLines(current => [...current.slice(-80), payload.line]); }).then(value => dispose = value); return () => dispose?.(); }, []);
+  const providerOutput = useRef<string[]>([]);
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    listen<ProviderEvent>("alfred://provider-event", ({ payload }) => {
+      if (payload.sessionId !== activeProvider.current) return;
+      providerOutput.current = [...providerOutput.current.slice(-199), payload.line];
+      setProviderLines(current => [...current.slice(-80), payload.line]);
+      if (payload.status === "completed") {
+        setProviderSession("");
+        invoke<WorkflowStep[]>("parse_provider_plan", { output: providerOutput.current })
+          .then(next => {
+            setProposedSteps(next);
+            setProposedParameters(Object.fromEntries(next.map(step => [step.id, JSON.stringify(step.payload ?? {}, null, 2)])));
+          })
+          .catch(caught => setError(`The provider finished, but its plan could not be reviewed: ${String(caught)}`));
+      } else if (payload.status === "failed") {
+        setProviderSession("");
+        setError("The selected brain could not complete the planning session. Review its output and try again.");
+      }
+    }).then(value => dispose = value);
+    return () => dispose?.();
+  }, []);
   const askProvider = async () => {
-    setError(""); setProviderLines([]);
-    const prompt = `Plan a safe desktop workflow for this goal: ${workflow.goal}. Return concise JSON steps only. Never propose deletion, trash, destructive overwrite, password entry, shell commands, or credential handling. Prefer semantic browser or Windows UI Automation actions.`;
-    try { const id = await invoke<string>("start_provider_run", { provider: settings.provider, prompt, workingDirectory: settings.libraryPath }); activeProvider.current = id; setProviderSession(id); }
-    catch (caught) { setError(String(caught)); }
+    setError(""); setProviderLines([]); setProposedSteps([]); providerOutput.current = [];
+    const prompt = `Plan a safe Windows desktop workflow for this goal: ${workflow.goal}
+Return ONLY one JSON object with this exact shape:
+{"steps":[{"title":"Human-readable action","application":"Notepad","method":"launchApplication","targetLabel":"Notepad","params":{}}]}
+Allowed methods: launchApplication, focusApplication, observeWindow, captureWindow, invokeElement, click, typeText, key, browser.observe, browser.navigate, browser.click, browser.type.
+For launchApplication use one of: Notepad, Calculator, Paint, File Explorer, Microsoft Edge, Google Chrome, Brave. Use {"text":"..."} for typeText. Never propose deletion, trash, purge, destructive overwrite, password entry, shell commands, credentials, or arbitrary executables.`;
+    const sessionId = crypto.randomUUID();
+    activeProvider.current = sessionId; setProviderSession(sessionId);
+    try { await invoke<string>("start_provider_run", { provider: settings.provider, prompt, workingDirectory: settings.libraryPath, sessionId }); }
+    catch (caught) { activeProvider.current = ""; setProviderSession(""); setError(String(caught)); }
+  };
+  const recordStep = async (step: WorkflowStep) => {
+    const saved = await invoke<Workflow>("record_action", { libraryPath: settings.libraryPath, workflowId: workflow.id, step });
+    if (step.effect !== "observe") await invoke("grant_permission", { application: step.kind.startsWith("browser.") ? "Installed browser" : step.application, allowedEffects: [step.effect], allowedIntents: [step.kind.split(".").at(-1)] });
+    setSteps(saved.steps);
+    return saved;
   };
   const addStep = async () => {
     setError("");
     try {
+      if (!application.trim()) throw new Error("Choose an application.");
       const payload = JSON.parse(parameters);
       const effect = method.endsWith("observe") || method === "observeWindow" || method === "captureWindow" ? "observe" : "modify_reversible";
-      const step = { id: crypto.randomUUID(), title: target || method, kind: method, effect, application, intent: `${method} ${target}`.trim(), targetLabel: target || undefined, payload, timeoutMs: 30000, retries: 1 };
-      const saved = await invoke<Workflow>("record_action", { libraryPath: settings.libraryPath, workflowId: workflow.id, step });
-      setSteps(saved.steps); setTarget(""); setParameters("{}");
-      if (effect !== "observe") await invoke("grant_permission", { application: method.startsWith("browser.") ? "Installed browser" : application, allowedEffects: [effect], allowedIntents: [method.split(".").at(-1)] });
+      await recordStep({ id: crypto.randomUUID(), title: target || method, kind: method, effect, application, intent: `${method} ${target}`.trim(), targetLabel: target || undefined, payload, timeoutMs: 30000, retries: 1 });
+      setTarget(""); setParameters("{}");
     } catch (caught) { setError(`Could not record action: ${String(caught)}`); }
+  };
+  const approvePlan = async () => {
+    setError(""); setRecordingPlan(true);
+    try {
+      const approved = proposedSteps.map(step => ({ ...step, intent: `${step.kind} ${step.targetLabel ?? ""}`.trim(), payload: JSON.parse(proposedParameters[step.id] ?? "{}") }));
+      const saved = await invoke<Workflow>("record_actions", { libraryPath: settings.libraryPath, workflowId: workflow.id, steps: approved });
+      for (const step of approved.filter(step => step.effect !== "observe")) {
+        await invoke("grant_permission", { application: step.kind.startsWith("browser.") ? "Installed browser" : step.application, allowedEffects: [step.effect], allowedIntents: [step.kind.split(".").at(-1)] });
+      }
+      setSteps(saved.steps);
+      setProposedSteps([]);
+    } catch (caught) { setError(`Could not record the approved plan: ${String(caught)}`); }
+    finally { setRecordingPlan(false); }
   };
   const finalize = async () => { try { await invoke("finalize_recording", { libraryPath: settings.libraryPath, workflowId: workflow.id }); await onWorkflowChanged(); onClose(); } catch (caught) { setError(String(caught)); } };
   return <div className="page workflow-studio"><section className="page-title"><div><button className="back-button" onClick={onClose}>‹</button><span className="eyebrow">WORKFLOW RECORDER</span><h1>{workflow.name}</h1><p>{workflow.goal}</p></div><button className="primary-button" disabled={!steps.length} onClick={finalize}>Finalize workflow</button></section>
-    <div className="studio-grid"><section className="settings-section"><h2>1. Ask the selected brain</h2><p>Alfred runs the installed {settings.provider} CLI in a supervised, read-only planning session.</p><div className="studio-actions"><button className="secondary-button" disabled={!!providerSession} onClick={askProvider}><Icon name="brain" size={17}/> Generate plan</button>{providerSession && <button className="secondary-button" onClick={async () => { await invoke("cancel_provider_run", { sessionId: providerSession }); setProviderSession(""); }}>Stop planner</button>}</div><pre className="provider-console">{providerLines.length ? providerLines.join("\n") : "Provider output appears here. Review it before recording actions."}</pre></section>
-      <section className="settings-section"><h2>2. Record an approved action</h2><p>Choose a narrow semantic method. Parameters are kept in the portable workflow YAML.</p><div className="record-form"><label>Application<input value={application} onChange={event => setApplication(event.target.value)}/></label><label>Method<select value={method} onChange={event => setMethod(event.target.value)}><option>browser.observe</option><option>browser.navigate</option><option>browser.click</option><option>browser.type</option><option>observeWindow</option><option>captureWindow</option><option>invokeElement</option><option>click</option><option>typeText</option><option>key</option></select></label><label>Target label<input value={target} onChange={event => setTarget(event.target.value)} placeholder="Invoice number field"/></label><label>Parameters (JSON)<textarea value={parameters} onChange={event => setParameters(event.target.value)} rows={4}/></label><button className="primary-button" onClick={addStep}>Record action</button></div></section></div>
+    <div className="studio-grid"><section className="settings-section"><h2>1. Ask the selected brain</h2><p>Alfred runs the installed {settings.provider} CLI in a supervised, read-only planning session.</p><div className="studio-actions"><button className="secondary-button" disabled={!!providerSession} onClick={askProvider}><Icon name="brain" size={17}/> {providerSession ? "Planning…" : "Generate plan"}</button>{providerSession && <button className="secondary-button" onClick={async () => { await invoke("cancel_provider_run", { sessionId: providerSession }); setProviderSession(""); }}>Stop planner</button>}</div><pre className="provider-console">{providerLines.length ? providerLines.join("\n") : "Provider output appears here. Alfred will extract safe actions for your review."}</pre></section>
+      <section className="settings-section"><h2>2. Add an action manually</h2><p>Use this only to refine the provider plan. Parameters stay in the portable workflow YAML.</p><div className="record-form"><label>Application<input value={application} onChange={event => setApplication(event.target.value)} placeholder="For example, Notepad"/></label><label>Method<select value={method} onChange={event => setMethod(event.target.value)}><option>launchApplication</option><option>focusApplication</option><option>observeWindow</option><option>captureWindow</option><option>invokeElement</option><option>click</option><option>typeText</option><option>key</option><option>browser.observe</option><option>browser.navigate</option><option>browser.click</option><option>browser.type</option></select></label><label>Target label<input value={target} onChange={event => setTarget(event.target.value)} placeholder="For example, Notepad editor"/></label><label>Parameters (JSON)<textarea value={parameters} onChange={event => setParameters(event.target.value)} rows={4}/></label><button className="primary-button" onClick={addStep}>Record action</button></div></section></div>
     {error && <div className="error-message">{error}</div>}
+    {proposedSteps.length > 0 && <section className="panel-surface proposed-plan"><div className="panel-heading"><span>Review the proposed plan</span><button className="primary-button" disabled={recordingPlan} onClick={approvePlan}>{recordingPlan ? "Recording…" : "Approve and record all"}</button></div><p>Every step has passed Alfred’s base safety policy. Edit any field before approving.</p>{proposedSteps.map((step, index) => <div className="proposed-step" key={step.id}><span className="step-marker">{index + 1}</span><div><input aria-label={`Step ${index + 1} title`} value={step.title} onChange={event => setProposedSteps(current => current.map(item => item.id === step.id ? { ...item, title: event.target.value } : item))}/><div className="proposed-step-fields"><input aria-label={`Step ${index + 1} application`} value={step.application ?? ""} onChange={event => setProposedSteps(current => current.map(item => item.id === step.id ? { ...item, application: event.target.value } : item))}/><select aria-label={`Step ${index + 1} method`} value={step.kind} onChange={event => setProposedSteps(current => current.map(item => item.id === step.id ? { ...item, kind: event.target.value, effect: event.target.value.endsWith("observe") || ["observeWindow","captureWindow"].includes(event.target.value) ? "observe" : "modify_reversible" } : item))}><option>launchApplication</option><option>focusApplication</option><option>observeWindow</option><option>captureWindow</option><option>invokeElement</option><option>click</option><option>typeText</option><option>key</option><option>browser.observe</option><option>browser.navigate</option><option>browser.click</option><option>browser.type</option></select></div><textarea aria-label={`Step ${index + 1} parameters`} value={proposedParameters[step.id] ?? "{}"} onChange={event => setProposedParameters(current => ({ ...current, [step.id]: event.target.value }))}/></div></div>)}</section>}
     <section className="panel-surface recorded-steps"><div className="panel-heading"><span>Recorded steps</span><b>{steps.length}</b></div>{steps.map((step, index) => <div className="plan-step done" key={step.id}><span className="step-marker">{index + 1}</span><div><strong>{step.title}</strong><small>{step.application} · {step.kind} · {step.effect}</small></div></div>)}{!steps.length && <p>No actions recorded yet.</p>}</section>
   </div>;
 }

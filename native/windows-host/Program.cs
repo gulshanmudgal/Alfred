@@ -14,6 +14,7 @@ internal sealed record HostRequest(
     string Method,
     string? CapabilityToken,
     JsonElement? Params,
+    string? Application,
     string? Intent,
     string? Target);
 
@@ -22,6 +23,16 @@ internal static class Program
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     private static readonly string ExpectedToken = Environment.GetEnvironmentVariable("ALFRED_CAPABILITY_TOKEN") ?? "";
     private static readonly string[] DestructiveWords = ["delete", "remove", "erase", "trash", "purge", "wipe", "shred", "overwrite", "empty recycle"];
+    private static readonly IReadOnlyDictionary<string, string> LaunchTargets = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Notepad"] = "notepad.exe",
+        ["Calculator"] = "calc.exe",
+        ["Paint"] = "mspaint.exe",
+        ["File Explorer"] = "explorer.exe",
+        ["Microsoft Edge"] = "msedge.exe",
+        ["Google Chrome"] = "chrome.exe",
+        ["Brave"] = "brave.exe"
+    };
 
     [STAThread]
     private static async Task Main(string[] args)
@@ -100,12 +111,14 @@ internal static class Program
     {
         "health" => new { host = "windows", version = "0.1.0", processId = Environment.ProcessId },
         "listApplications" => ListApplications(),
-        "observeWindow" => ObserveWindow(GetInt(request.Params, "processId")),
-        "captureWindow" => CaptureWindow(GetInt(request.Params, "processId")),
-        "invokeElement" => InvokeElement(request.Params),
-        "click" => Click(GetInt(request.Params, "x"), GetInt(request.Params, "y")),
-        "typeText" => TypeText(GetString(request.Params, "text")),
-        "key" => PressKey(GetInt(request.Params, "virtualKey")),
+        "launchApplication" => LaunchApplication(request),
+        "focusApplication" => FocusApplication(request),
+        "observeWindow" => ObserveWindow(ResolveProcess(request).Id),
+        "captureWindow" => CaptureWindow(ResolveProcess(request).Id),
+        "invokeElement" => InvokeElement(request),
+        "click" => Click(request, GetInt(request.Params, "x"), GetInt(request.Params, "y")),
+        "typeText" => TypeText(request, GetString(request.Params, "text")),
+        "key" => PressKey(request, GetInt(request.Params, "virtualKey")),
         _ => throw new InvalidOperationException($"Unsupported host method: {request.Method}")
     };
 
@@ -113,6 +126,74 @@ internal static class Program
         .Where(p => p.MainWindowHandle != IntPtr.Zero)
         .Select(p => new { processId = p.Id, name = p.ProcessName, title = p.MainWindowTitle })
         .OrderBy(p => p.name).ToArray();
+
+    private static object LaunchApplication(HostRequest request)
+    {
+        var application = GetApplication(request);
+        if (!LaunchTargets.TryGetValue(application, out var executable))
+            throw new UnauthorizedAccessException($"Alfred is not allowed to launch {application}.");
+        var process = Process.Start(new ProcessStartInfo(executable) { UseShellExecute = true })
+            ?? throw new InvalidOperationException($"Windows could not launch {application}.");
+        try { process.WaitForInputIdle(5000); } catch { }
+        for (var attempt = 0; attempt < 40 && process.MainWindowHandle == IntPtr.Zero; attempt++)
+        {
+            Thread.Sleep(100);
+            process.Refresh();
+        }
+        if (process.MainWindowHandle == IntPtr.Zero)
+            process = FindApplicationProcess(application)
+                ?? throw new InvalidOperationException($"{application} launched without an accessible window.");
+        FocusProcess(process);
+        return new { launched = true, application, processId = process.Id, title = process.MainWindowTitle };
+    }
+
+    private static object FocusApplication(HostRequest request)
+    {
+        var process = ResolveProcess(request);
+        FocusProcess(process);
+        return new { focused = true, application = GetApplication(request), processId = process.Id, title = process.MainWindowTitle };
+    }
+
+    private static void FocusProcess(Process process)
+    {
+        process.Refresh();
+        if (process.MainWindowHandle == IntPtr.Zero)
+            throw new InvalidOperationException("The application does not have an accessible window.");
+        ShowWindow(process.MainWindowHandle, SW_RESTORE);
+        var root = AutomationElement.FromHandle(process.MainWindowHandle);
+        var focused = false;
+        try { root?.SetFocus(); focused = root is not null; } catch { }
+        if (!SetForegroundWindow(process.MainWindowHandle) && !focused)
+            throw new InvalidOperationException("Windows would not focus the requested application.");
+        Thread.Sleep(150);
+    }
+
+    private static Process ResolveProcess(HostRequest request)
+    {
+        var processId = GetOptionalInt(request.Params, "processId");
+        if (processId.HasValue)
+            return Process.GetProcessById(processId.Value);
+        return FindApplicationProcess(GetApplication(request))
+            ?? throw new InvalidOperationException($"{GetApplication(request)} is not open.");
+    }
+
+    private static Process? FindApplicationProcess(string application)
+    {
+        LaunchTargets.TryGetValue(application, out var executable);
+        var expectedName = Path.GetFileNameWithoutExtension(executable ?? application);
+        return Process.GetProcesses()
+            .Where(process => process.MainWindowHandle != IntPtr.Zero)
+            .OrderByDescending(process => process.Id)
+            .FirstOrDefault(process =>
+                process.ProcessName.Equals(expectedName, StringComparison.OrdinalIgnoreCase)
+                || process.MainWindowTitle.Contains(application, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string GetApplication(HostRequest request) =>
+        string.IsNullOrWhiteSpace(request.Application)
+            ? GetOptionalString(request.Params, "application")
+                ?? throw new InvalidOperationException("Missing application.")
+            : request.Application.Trim();
 
     private static object ObserveWindow(int processId)
     {
@@ -155,11 +236,10 @@ internal static class Program
         return new { mimeType = "image/png", width, height, base64 = Convert.ToBase64String(output.ToArray()) };
     }
 
-    private static object InvokeElement(JsonElement? parameters)
+    private static object InvokeElement(HostRequest request)
     {
-        var processId = GetInt(parameters, "processId");
-        var automationId = GetString(parameters, "automationId");
-        var process = Process.GetProcessById(processId);
+        var automationId = GetString(request.Params, "automationId");
+        var process = ResolveProcess(request);
         var root = AutomationElement.FromHandle(process.MainWindowHandle);
         var element = root.FindFirst(TreeScope.Descendants,
             new PropertyCondition(AutomationElement.AutomationIdProperty, automationId))
@@ -170,30 +250,40 @@ internal static class Program
         return new { invoked = true, automationId };
     }
 
-    private static object Click(int x, int y)
+    private static object Click(HostRequest request, int x, int y)
     {
+        if (!string.IsNullOrWhiteSpace(request.Application))
+            FocusProcess(ResolveProcess(request));
         SetCursorPos(x, y);
         Send([MouseInput(MOUSEEVENTF_LEFTDOWN), MouseInput(MOUSEEVENTF_LEFTUP)]);
         return new { clicked = true, x, y };
     }
 
-    private static object TypeText(string text)
+    private static object TypeText(HostRequest request, string text)
     {
+        FocusProcess(ResolveProcess(request));
         foreach (var character in text)
             Send([KeyboardInput(character, false), KeyboardInput(character, true)]);
         return new { typed = true, characters = text.Length };
     }
 
-    private static object PressKey(int virtualKey)
+    private static object PressKey(HostRequest request, int virtualKey)
     {
+        if (virtualKey == VK_DELETE)
+            throw new UnauthorizedAccessException("The Delete key is blocked by Alfred's deletion policy.");
+        FocusProcess(ResolveProcess(request));
         Send([VirtualKeyInput((ushort)virtualKey, false), VirtualKeyInput((ushort)virtualKey, true)]);
         return new { pressed = true, virtualKey };
     }
 
     private static int GetInt(JsonElement? value, string property) =>
         value?.GetProperty(property).GetInt32() ?? throw new InvalidOperationException($"Missing {property}.");
+    private static int? GetOptionalInt(JsonElement? value, string property) =>
+        value.HasValue && value.Value.TryGetProperty(property, out var item) && item.TryGetInt32(out var result) ? result : null;
     private static string GetString(JsonElement? value, string property) =>
         value?.GetProperty(property).GetString() ?? throw new InvalidOperationException($"Missing {property}.");
+    private static string? GetOptionalString(JsonElement? value, string property) =>
+        value.HasValue && value.Value.TryGetProperty(property, out var item) ? item.GetString() : null;
     private static void Reply(object value) { Console.Out.WriteLine(JsonSerializer.Serialize(value, Json)); Console.Out.Flush(); }
 
     private static INPUT MouseInput(uint flags) => new() { type = INPUT_MOUSE, U = new InputUnion { mi = new MOUSEINPUT { dwFlags = flags } } };
@@ -207,6 +297,8 @@ internal static class Program
 
     private const uint INPUT_MOUSE = 0, INPUT_KEYBOARD = 1, MOUSEEVENTF_LEFTDOWN = 0x0002, MOUSEEVENTF_LEFTUP = 0x0004;
     private const uint KEYEVENTF_KEYUP = 0x0002, KEYEVENTF_UNICODE = 0x0004;
+    private const int VK_DELETE = 0x2E;
+    private const int SW_RESTORE = 9;
     [StructLayout(LayoutKind.Sequential)] private struct RECT { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)] private struct INPUT { public uint type; public InputUnion U; }
     [StructLayout(LayoutKind.Explicit)] private struct InputUnion { [FieldOffset(0)] public MOUSEINPUT mi; [FieldOffset(0)] public KEYBDINPUT ki; }
@@ -214,5 +306,7 @@ internal static class Program
     [StructLayout(LayoutKind.Sequential)] private struct KEYBDINPUT { public ushort wVk, wScan; public uint dwFlags, time; public IntPtr dwExtraInfo; }
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
     [DllImport("user32.dll")] private static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int command);
     [DllImport("user32.dll", SetLastError = true)] private static extern uint SendInput(uint count, INPUT[] inputs, int size);
 }
