@@ -8,6 +8,7 @@ $binaryDirectory = Join-Path $root "src-tauri\binaries"
 New-Item -ItemType Directory -Force -Path $binaryDirectory | Out-Null
 Copy-Item "native\windows-host\bin\Release\net10.0-windows\win-x64\publish\alfred-windows-host.exe" (Join-Path $binaryDirectory "alfred-windows-host-$triple.exe") -Force
 npm run tauri build -- --config src-tauri/tauri.windows.conf.json
+& "scripts\windows\verify-gui-subsystem.ps1" -Executable "src-tauri\target\release\alfred.exe"
 
 $distribution = Join-Path $root "dist\windows"
 $portable = Join-Path $distribution "portable"
