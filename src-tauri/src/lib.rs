@@ -526,12 +526,13 @@ async fn start_provider_run(
     state: State<'_, RuntimeState>,
     provider: String,
     prompt: String,
-    _working_directory: Option<String>,
+    working_directory: Option<String>,
     session_id: Option<String>,
 ) -> Result<String, String> {
     if prompt.trim().is_empty() {
         return Err("The provider prompt cannot be empty.".into());
     }
+    let _ = working_directory;
     let invocation = provider_invocation(&provider, &prompt)?;
     let resolved = resolve_provider_command(&invocation.command).ok_or_else(|| {
         format!(
