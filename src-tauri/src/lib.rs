@@ -10,6 +10,8 @@ use std::{
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{Arc, Mutex},
 };
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt as _;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
@@ -427,38 +429,66 @@ fn quote_windows_command_argument(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
+#[derive(Debug, PartialEq)]
+struct ResolvedProcess {
+    program: PathBuf,
+    args: Vec<String>,
+    windows_raw_argument: Option<String>,
+}
+
+fn windows_command_script_process(
+    path: &Path,
+    args: &[String],
+    allow_script_wrapper: bool,
+) -> Result<ResolvedProcess, String> {
+    if !allow_script_wrapper {
+        return Err(format!(
+            "{} is installed as a command script that Alfred cannot safely supervise. Install the provider's native Windows executable.",
+            path.display()
+        ));
+    }
+    let mut command_line = quote_windows_command_argument(&path.to_string_lossy());
+    for argument in args {
+        command_line.push(' ');
+        command_line.push_str(&quote_windows_command_argument(argument));
+    }
+    let shell = std::env::var_os("COMSPEC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("cmd.exe"));
+    Ok(ResolvedProcess {
+        program: shell,
+        args: vec!["/D".into(), "/S".into(), "/C".into()],
+        // cmd.exe does not use the C runtime's argument escaping rules. Appending
+        // this command text as a raw argument avoids turning its quotes into \".
+        windows_raw_argument: Some(format!("\"{command_line}\"")),
+    })
+}
+
 fn resolved_process(
     path: &Path,
     args: &[String],
     allow_script_wrapper: bool,
-) -> Result<(PathBuf, Vec<String>), String> {
+) -> Result<ResolvedProcess, String> {
     if cfg!(target_os = "windows") && is_windows_command_script(path) {
-        if !allow_script_wrapper {
-            return Err(format!(
-                "{} is installed as a command script that Alfred cannot safely supervise. Install the provider's native Windows executable.",
-                path.display()
-            ));
-        }
-        let mut command_line = quote_windows_command_argument(&path.to_string_lossy());
-        for argument in args {
-            command_line.push(' ');
-            command_line.push_str(&quote_windows_command_argument(argument));
-        }
-        let shell = std::env::var_os("COMSPEC")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("cmd.exe"));
-        return Ok((
-            shell,
-            vec!["/D".into(), "/S".into(), "/C".into(), command_line],
-        ));
+        return windows_command_script_process(path, args, allow_script_wrapper);
     }
-    Ok((path.to_path_buf(), args.to_vec()))
+    Ok(ResolvedProcess {
+        program: path.to_path_buf(),
+        args: args.to_vec(),
+        windows_raw_argument: None,
+    })
 }
 
 fn provider_version(path: &Path) -> Option<String> {
     let args = vec!["--version".to_string()];
-    let (program, args) = resolved_process(path, &args, true).ok()?;
-    let output = Command::new(program).args(args).output().ok()?;
+    let resolved = resolved_process(path, &args, true).ok()?;
+    let mut process = Command::new(resolved.program);
+    process.args(resolved.args);
+    #[cfg(target_os = "windows")]
+    if let Some(raw_argument) = resolved.windows_raw_argument {
+        process.raw_arg(raw_argument);
+    }
+    let output = process.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -540,10 +570,10 @@ async fn start_provider_run(
             invocation.command
         )
     })?;
-    let (program, args) = resolved_process(&resolved, &invocation.args, provider == "codex")?;
-    let mut process = tokio::process::Command::new(&program);
+    let resolved = resolved_process(&resolved, &invocation.args, provider == "codex")?;
+    let mut process = tokio::process::Command::new(&resolved.program);
     process
-        .args(args)
+        .args(resolved.args)
         .stdin(if invocation.stdin.is_some() {
             Stdio::piped()
         } else {
@@ -552,6 +582,10 @@ async fn start_provider_run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(target_os = "windows")]
+    if let Some(raw_argument) = resolved.windows_raw_argument {
+        process.as_std_mut().raw_arg(raw_argument);
+    }
     if let Ok(secret) = vault_entry(&provider)
         .and_then(|entry| entry.get_password().map_err(|error| error.to_string()))
     {
@@ -2131,6 +2165,51 @@ mod tests {
             selected.as_deref(),
             Some(Path::new("C:/Users/test/AppData/Roaming/npm/codex.cmd"))
         );
+    }
+    #[test]
+    fn builds_cmd_wrapper_without_c_runtime_quote_escaping() {
+        let resolved = windows_command_script_process(
+            Path::new("C:/Users/Test User/AppData/Roaming/npm/codex.cmd"),
+            &["exec".into(), "--json".into()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(resolved.args, ["/D", "/S", "/C"]);
+        assert_eq!(
+            resolved.windows_raw_argument.as_deref(),
+            Some(
+                "\"\"C:/Users/Test User/AppData/Roaming/npm/codex.cmd\" \"exec\" \"--json\"\""
+            )
+        );
+        assert!(!resolved
+            .windows_raw_argument
+            .as_deref()
+            .unwrap()
+            .contains("\\\""));
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn executes_cmd_wrapper_from_path_with_spaces() {
+        let directory = std::env::temp_dir().join(format!(
+            "Alfred provider wrapper {}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let script = directory.join("codex.cmd");
+        fs::write(&script, "@echo off\r\necho [%~1][%~2]\r\n").unwrap();
+        let resolved = windows_command_script_process(
+            &script,
+            &["alpha beta".into(), "gamma".into()],
+            true,
+        )
+        .unwrap();
+        let mut process = Command::new(resolved.program);
+        process.args(resolved.args);
+        process.raw_arg(resolved.windows_raw_argument.unwrap());
+        let output = process.output().unwrap();
+        let _ = fs::remove_dir_all(&directory);
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "[alpha beta][gamma]");
     }
     #[test]
     fn parses_codex_jsonl_plan() {

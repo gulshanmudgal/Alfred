@@ -109,7 +109,7 @@ internal static class Program
 
     private static object Dispatch(HostRequest request) => request.Method switch
     {
-        "health" => new { host = "windows", version = "0.1.2", processId = Environment.ProcessId },
+        "health" => new { host = "windows", version = "0.1.3", processId = Environment.ProcessId },
         "listApplications" => ListApplications(),
         "launchApplication" => LaunchApplication(request),
         "focusApplication" => FocusApplication(request),
