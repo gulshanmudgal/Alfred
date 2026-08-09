@@ -44,7 +44,7 @@ try {
   if ($blockedLaunch.ok -or $blockedLaunch.error -notmatch "not allowed") { throw "Application launch allowlist did not reject the test request." }
   Write-Host "PASS application launch allowlist"
 
-  $blockedDeleteKey = Invoke-AlfredHost "key" @{ virtualKey = 46 } "press key" "Delete" "Notepad"
+  $blockedDeleteKey = Invoke-AlfredHost "key" @{ virtualKey = 46 } "press key" "Keyboard input" "Notepad"
   if ($blockedDeleteKey.ok -or $blockedDeleteKey.error -notmatch "Delete key is blocked") { throw "Delete-key guard did not reject the test request." }
   Write-Host "PASS Delete-key defense in depth"
 
