@@ -133,7 +133,7 @@ Provider CLI flags and authentication behavior can change between releases. Veri
   -HostPath ".\native\windows-host\bin\Debug\net10.0-windows\win-x64\alfred-windows-host.exe"
 ```
 
-Restart the browser after registration. The extension supports tab listing, navigation, visible-page capture, semantic observation, clicking, and typing. It independently rejects destructive labels and password fields.
+Restart the browser after registration. The extension supports tab listing, navigation, visible-page capture, semantic observation, **page text reading** (`browser.read`), scroll/find/wait (Playwright-style skill surface), clicking, and typing. Goal runs inject a browser skill into the planner and auto-include a page-text preview each turn. The extension independently rejects destructive labels and password fields. See [`skills/browser.md`](skills/browser.md).
 
 ## Workflows and sharing
 

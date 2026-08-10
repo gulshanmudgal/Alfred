@@ -942,6 +942,8 @@ const ALLOWED_PLAN_METHODS: &[&str] = &[
     "browser.getText",
     "browser.read",
     "browser.scroll",
+    "browser.find",
+    "browser.wait",
 ];
 
 const SAFE_LAUNCH_APPLICATIONS: &[&str] = &[
@@ -1473,6 +1475,8 @@ fn kind_is_observe(kind: &str) -> bool {
             | "browser.gettext"
             | "browser.read"
             | "browser.scroll"
+            | "browser.find"
+            | "browser.wait"
             | "listapplications"
             | "resolveapplication"
             | "health"
@@ -2767,27 +2771,70 @@ fn planner_reply_from_text(text: &str) -> Option<PlannerReply> {
 }
 
 /// Distills an action result into a short history suffix so the planner can
-/// reason over what it just read (browser.getText/getValue payloads), not only
-/// that the action succeeded. Whitespace-collapsed and capped so a large page
-/// dump cannot flood the next prompt.
+/// reason over what it just read (browser.read/getText/getValue payloads), not
+/// only that the action succeeded. Whitespace-collapsed and capped so a large
+/// page dump cannot flood the next prompt. Preserves paging metadata so the
+/// planner can continue with browser.read { offset }.
 fn planner_result_digest(value: &Value) -> String {
     let result = value.get("result").cloned().unwrap_or(Value::Null);
-    let text = match &result {
-        Value::String(text) => Some(text.clone()),
-        Value::Object(map) => map
-            .get("text")
-            .or_else(|| map.get("value"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        _ => None,
-    };
-    match text {
-        Some(text) if !text.trim().is_empty() => {
+    let mut parts = Vec::new();
+    match &result {
+        Value::String(text) if !text.trim().is_empty() => {
             let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-            let snippet: String = collapsed.chars().take(400).collect();
-            format!(": {snippet}")
+            let snippet: String = collapsed.chars().take(500).collect();
+            parts.push(snippet);
         }
-        _ => String::new(),
+        Value::Object(map) => {
+            if let Some(text) = map
+                .get("text")
+                .or_else(|| map.get("value"))
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+            {
+                let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                let snippet: String = collapsed.chars().take(500).collect();
+                parts.push(snippet);
+            }
+            if map.get("hasMore").and_then(Value::as_bool) == Some(true) {
+                let next = map
+                    .get("nextOffset")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                parts.push(format!("[hasMore nextOffset={next}]"));
+            }
+            if let Some(count) = map.get("count").and_then(Value::as_u64) {
+                if map.get("matches").is_some() {
+                    parts.push(format!("[find count={count}]"));
+                }
+            }
+            if map.get("loginWall").and_then(Value::as_bool) == Some(true) {
+                parts.push("[loginWall]".into());
+            }
+            if map.get("captcha").and_then(Value::as_bool) == Some(true) {
+                parts.push("[captcha]".into());
+            }
+            if let Some(matches) = map.get("matches").and_then(Value::as_array) {
+                let preview: Vec<String> = matches
+                    .iter()
+                    .take(5)
+                    .filter_map(|item| {
+                        let reference = item.get("ref")?.as_str()?;
+                        let label = item.get("label").and_then(Value::as_str).unwrap_or("");
+                        let short: String = label.chars().take(60).collect();
+                        Some(format!("{reference}=\"{short}\""))
+                    })
+                    .collect();
+                if !preview.is_empty() {
+                    parts.push(format!("matches: {}", preview.join("; ")));
+                }
+            }
+        }
+        _ => {}
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", parts.join(" "))
     }
 }
 
@@ -2929,6 +2976,17 @@ fn summarize_browser_elements(result: &Value, out: &mut Vec<String>) {
     if let Some(url) = result.get("url").and_then(Value::as_str) {
         out.push(format!("page: {url}"));
     }
+    if let Some(title) = result.get("title").and_then(Value::as_str) {
+        if !title.is_empty() {
+            out.push(format!("title: {title}"));
+        }
+    }
+    if result.get("loginWall").and_then(Value::as_bool) == Some(true) {
+        out.push("signal: loginWall — user must sign in; do not invent page data".into());
+    }
+    if result.get("captcha").and_then(Value::as_bool) == Some(true) {
+        out.push("signal: captcha — park and ask the user to complete verification".into());
+    }
     if let Some(elements) = result.get("elements").and_then(Value::as_array) {
         for element in elements.iter().take(40) {
             let reference = element.get("ref").and_then(Value::as_str).unwrap_or("");
@@ -2943,6 +3001,75 @@ fn summarize_browser_elements(result: &Value, out: &mut Vec<String>) {
             out.push(format!("- {tag} {reference} \"{label}\""));
         }
     }
+}
+
+fn summarize_browser_read(result: &Value, out: &mut Vec<String>) {
+    out.push("page content (browser.read preview):".into());
+    if result.get("loginWall").and_then(Value::as_bool) == Some(true) {
+        out.push("signal: loginWall".into());
+    }
+    if result.get("captcha").and_then(Value::as_bool) == Some(true) {
+        out.push("signal: captcha".into());
+    }
+    if let Some(text) = result.get("text").and_then(Value::as_str) {
+        let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let snippet: String = collapsed.chars().take(2500).collect();
+        if snippet.is_empty() {
+            out.push("(no extractable text on this page)".into());
+        } else {
+            out.push(snippet);
+        }
+    }
+    if result.get("hasMore").and_then(Value::as_bool) == Some(true) {
+        let next = result
+            .get("nextOffset")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        out.push(format!(
+            "(more content available — browser.read {{\"offset\":{next}}} or browser.scroll)"
+        ));
+    }
+}
+
+/// Playwright-style browser playbook injected when the goal targets the web.
+/// Teaches the planner to read content (not invent it), page through long UIs,
+/// and stop cleanly on login/CAPTCHA walls.
+fn browser_skill_block() -> &'static str {
+    r#"
+
+BROWSER SKILL (use for any website / portal / dashboard task):
+You control the user's already-logged-in Chromium tab through Alfred — similar to Playwright, but every action is policy-gated.
+1. browser.navigate {"url":"..."} when the goal includes a link or you must change pages.
+2. browser.wait {"text":"visible fragment","timeoutMs":12000} after navigations while SPAs load.
+3. browser.observe lists interactive controls with refs (e1, e2, …). Use it before click/type when you need refs.
+4. browser.read {"offset":0} extracts PAGE TEXT (headings, tables, grids, articles, error lists). observe does NOT include article/table body text.
+5. Page long content: browser.scroll {"direction":"down"} or {"text":"Error"} then browser.read again; or browser.read {"offset":N} while history says hasMore.
+6. browser.find {"text":"RUM"} returns matching refs — then browser.click {"ref":"e3"}. Prefer find when labels are known.
+7. browser.getText {"ref"} for a single field; prefer browser.read for analysis of lists/tables.
+8. Login wall or CAPTCHA signals: reply {"done":true,"summary":"Blocked on login/CAPTCHA — user must complete it in the browser, then re-run."}. Never invent portal data.
+9. Analysis goals (Datadog RUM, logs, dashboards): navigate → wait → read → scroll/read more → summarize ONLY facts present in CURRENT DESKTOP STATE or ACTION HISTORY digests. If text is empty, say so; do not fabricate error rates or stack traces.
+10. One small action per reply. Prefer browser.find+click over coordinate clicks."#
+}
+
+fn goal_needs_browser_skill(goal: &str, applications: &[String]) -> bool {
+    if applications
+        .iter()
+        .any(|application| application.eq_ignore_ascii_case("Installed browser"))
+    {
+        return true;
+    }
+    let lower = goal.to_lowercase();
+    lower.contains("http://")
+        || lower.contains("https://")
+        || lower.contains("browser")
+        || lower.contains("website")
+        || lower.contains("portal")
+        || lower.contains("dashboard")
+        || lower.contains("datadog")
+        || lower.contains("reddit")
+        || lower.contains("docs.google")
+        || lower.contains("chrome")
+        || lower.contains("edge")
 }
 
 /// Infers target applications from the goal text when the user did not list
@@ -3028,8 +3155,13 @@ fn build_planner_prompt(
             .join("\n");
         format!("\n\nCURRENT PLAN (your outline; follow it, or return an updated plan):\n{outline}")
     };
+    let skill = if goal_needs_browser_skill(goal, applications) {
+        browser_skill_block()
+    } else {
+        ""
+    };
     format!(
-        "You are the planning brain of Alfred, a supervised desktop automation agent running on the user's machine. Propose the next single action toward the goal.\n\nGOAL: {goal}\n\nTARGET APPLICATIONS: {apps}\n\nCURRENT DESKTOP STATE:\n{observations}\n\nACTION HISTORY (oldest first):\n{history_text}{plan_text}\n\nReply with exactly one JSON object and nothing else (no markdown fences, no prose):\n{{\"done\": false, \"title\": \"short human label\", \"kind\": \"<method>\", \"application\": \"<exact app name>\", \"intent\": \"what and why\", \"effect\": \"observe|create|modify_reversible|external_write\", \"targetLabel\": \"<element label>\", \"payload\": {{...}}}}\nWhen the goal is fully complete, reply: {{\"done\": true, \"summary\": \"what was accomplished\"}}.\nIf the goal has multiple phases, you may instead reply {{\"plan\": [\"short phase\", ...]}} (no \"kind\") to outline or revise your approach; it is pinned below as CURRENT PLAN.\n\nMethods: listApplications (application \"Alfred\"; lists running app windows) | browser.observe | browser.navigate {{\"url\"}} | browser.click {{\"ref\"}} | browser.type {{\"ref\",\"text\"}} | browser.getText {{\"ref\"}} | browser.read {{\"offset\":0}} (reads page text — articles, tables, error lists; ~6000 chars per call, page through with offset while hasMore) | browser.scroll {{\"direction\":\"down\"}} or {{\"text\":\"find visible text\"}} | launchApplication (allow-list only: Notepad, Calculator, Paint, File Explorer, Microsoft Edge, Google Chrome, Brave) | focusApplication | activate {{}} | observeWindow | findElement {{\"automationId\"|\"name\"|\"controlType\"}} | getValue (same selectors) | invokeElement (same selectors) | setValue (selectors + \"value\") | click {{\"x\",\"y\"}} | typeText {{\"text\"}} | key {{\"virtualKey\": 13|9|27}} (Enter, Tab, Escape only).\n\nRules:\n- One small action per reply; observe before acting when unsure.\n- browser.observe lists only interactive elements; for page CONTENT (articles, tables, error lists) use browser.read, then browser.scroll or another browser.read offset to see more.\n- NEVER propose deletion, trash, purge, overwrite, password entry, shell commands, or credential handling. Alfred hard-blocks them regardless of what you return.\n- Prefer setValue/invokeElement (semantic, focus-independent) over click/typeText.\n- Never include processId; Alfred injects the live one.\n- {app_rule}\n- If the last action failed or changed nothing, try a different approach instead of repeating it.\n- If a target application is not running, propose launchApplication when it is on the allow-list; otherwise reply done with a summary of the blocker.\n- Never claim to have read or analyzed content that does not appear in CURRENT DESKTOP STATE or ACTION HISTORY; if you cannot access the content the goal needs, reply done with a summary explaining the blocker instead of inventing results.",
+        "You are the planning brain of Alfred, a supervised desktop automation agent running on the user's machine. Propose the next single action toward the goal.\n\nGOAL: {goal}\n\nTARGET APPLICATIONS: {apps}\n\nCURRENT DESKTOP STATE:\n{observations}\n\nACTION HISTORY (oldest first):\n{history_text}{plan_text}{skill}\n\nReply with exactly one JSON object and nothing else (no markdown fences, no prose):\n{{\"done\": false, \"title\": \"short human label\", \"kind\": \"<method>\", \"application\": \"<exact app name>\", \"intent\": \"what and why\", \"effect\": \"observe|create|modify_reversible|external_write\", \"targetLabel\": \"<element label>\", \"payload\": {{...}}}}\nWhen the goal is fully complete, reply: {{\"done\": true, \"summary\": \"what was accomplished\"}}.\nIf the goal has multiple phases, you may instead reply {{\"plan\": [\"short phase\", ...]}} (no \"kind\") to outline or revise your approach; it is pinned below as CURRENT PLAN.\n\nMethods: listApplications (application \"Alfred\"; lists running app windows) | browser.observe | browser.navigate {{\"url\"}} | browser.click {{\"ref\"}} | browser.type {{\"ref\",\"text\"}} | browser.getText {{\"ref\"}} | browser.read {{\"offset\":0}} (page text: headings/tables/grids/articles; ~6000 chars/chunk; page with offset while hasMore) | browser.scroll {{\"direction\":\"down\"}} or {{\"text\":\"find visible text\"}} | browser.find {{\"text\":\"label\"}} (returns refs) | browser.wait {{\"text\":\"fragment\",\"timeoutMs\":12000}} | launchApplication (allow-list only: Notepad, Calculator, Paint, File Explorer, Microsoft Edge, Google Chrome, Brave) | focusApplication | activate {{}} | observeWindow | findElement {{\"automationId\"|\"name\"|\"controlType\"}} | getValue (same selectors) | invokeElement (same selectors) | setValue (selectors + \"value\") | click {{\"x\",\"y\"}} | typeText {{\"text\"}} | key {{\"virtualKey\": 13|9|27}} (Enter, Tab, Escape only).\n\nRules:\n- One small action per reply; observe or find before click/type when unsure.\n- browser.observe lists interactive elements only; for page CONTENT use browser.read (auto-preview may already appear under CURRENT DESKTOP STATE).\n- NEVER propose deletion, trash, purge, overwrite, password entry, shell commands, or credential handling. Alfred hard-blocks them regardless of what you return.\n- Prefer setValue/invokeElement (semantic, focus-independent) over click/typeText.\n- Never include processId; Alfred injects the live one.\n- {app_rule}\n- If the last action failed or changed nothing, try a different approach instead of repeating it.\n- If a target application is not running, propose launchApplication when it is on the allow-list; otherwise reply done with a summary of the blocker.\n- Never claim to have read or analyzed content that does not appear in CURRENT DESKTOP STATE or ACTION HISTORY; if you cannot access the content the goal needs, reply done with a summary explaining the blocker instead of inventing results.",
         apps = planner_app_list(applications),
         app_rule = planner_app_rule(applications),
     )
@@ -3086,7 +3218,7 @@ fn gather_observations(
                     effect: "observe".into(),
                     intent: "observe the page before planning".into(),
                     target_label: None,
-                    params,
+                    params: params.clone(),
                 },
                 false,
             ) {
@@ -3097,6 +3229,41 @@ fn gather_observations(
                     }
                     let mut lines = vec!["Installed browser:".to_string()];
                     summarize_browser_elements(&result, &mut lines);
+                    // Auto page-text preview so analysis goals (portals, RUM,
+                    // dashboards) see content without relying on the planner to
+                    // remember browser.read on the first turn.
+                    let mut read_params = params;
+                    if let (Some(tab), Value::Object(ref mut map)) = (pinned, &mut read_params) {
+                        map.insert("tabId".to_string(), Value::from(tab));
+                    }
+                    if let Value::Object(ref mut map) = read_params {
+                        map.insert("offset".into(), Value::from(0));
+                    }
+                    match send_browser_command_inner(
+                        app.clone(),
+                        BrowserCommand {
+                            id: "goal-read".into(),
+                            method: "read".into(),
+                            effect: "observe".into(),
+                            intent: "read page content before planning".into(),
+                            target_label: None,
+                            params: read_params,
+                        },
+                        false,
+                    ) {
+                        Ok(read_value) => {
+                            let read_result =
+                                read_value.get("result").cloned().unwrap_or(Value::Null);
+                            if let Some(tab) = read_result.get("tabId").and_then(Value::as_i64) {
+                                pinned = Some(tab);
+                            }
+                            lines.push(String::new());
+                            summarize_browser_read(&read_result, &mut lines);
+                        }
+                        Err(error) => {
+                            lines.push(format!("page content: unavailable ({error})"));
+                        }
+                    }
                     observations.push_str(&lines.join("\n"));
                     observations.push('\n');
                 }
@@ -4665,8 +4832,50 @@ mod tests {
     fn browser_read_and_scroll_are_observe_class_methods() {
         assert_eq!(effective_effect("browser.read", "observe"), "observe");
         assert_eq!(effective_effect("browser.scroll", "observe"), "observe");
+        assert_eq!(effective_effect("browser.find", "observe"), "observe");
+        assert_eq!(effective_effect("browser.wait", "observe"), "observe");
         assert!(ALLOWED_PLAN_METHODS.contains(&"browser.read"));
         assert!(ALLOWED_PLAN_METHODS.contains(&"browser.scroll"));
+        assert!(ALLOWED_PLAN_METHODS.contains(&"browser.find"));
+        assert!(ALLOWED_PLAN_METHODS.contains(&"browser.wait"));
+    }
+    #[test]
+    fn browser_skill_attaches_for_portal_goals() {
+        assert!(goal_needs_browser_skill(
+            "Open our Datadog portal and analyse RUM errors",
+            &[]
+        ));
+        assert!(goal_needs_browser_skill(
+            "anything",
+            &["Installed browser".to_string()]
+        ));
+        assert!(!goal_needs_browser_skill("Open Notepad and type hello", &[]));
+        let prompt = build_planner_prompt(
+            "Open https://app.datadoghq.com and read RUM errors",
+            &["Installed browser".to_string()],
+            "Installed browser:\npage: https://app.datadoghq.com",
+            &[],
+            &[],
+        );
+        assert!(prompt.contains("BROWSER SKILL"));
+        assert!(prompt.contains("browser.find"));
+        assert!(prompt.contains("browser.wait"));
+        assert!(prompt.contains("Never invent portal data"));
+    }
+    #[test]
+    fn planner_digest_keeps_read_paging_metadata() {
+        let read = serde_json::json!({
+            "ok": true,
+            "result": {
+                "text": "Error rate spiked to 4.2%",
+                "hasMore": true,
+                "nextOffset": 6000
+            }
+        });
+        let digest = planner_result_digest(&read);
+        assert!(digest.contains("Error rate spiked"));
+        assert!(digest.contains("hasMore"));
+        assert!(digest.contains("6000"));
     }
     #[test]
     fn planner_prompt_carries_goal_observations_and_rules() {
