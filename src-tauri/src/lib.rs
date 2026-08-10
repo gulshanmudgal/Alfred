@@ -30,6 +30,9 @@ struct RuntimeState {
     /// unknown-effect steps that no permission grant could cover. hard_deny is
     /// never overridable.
     approved_overrides: Arc<Mutex<HashMap<String, String>>>,
+    /// Mid-run user guidance queued by the cockpit's steer bar: run_id ->
+    /// pending notes. The goal loop drains them into the planner's history.
+    steer_notes: Arc<Mutex<HashMap<String, Vec<String>>>>,
 }
 
 /// The host speaks newline-delimited JSON on stdio. A dedicated worker thread owns
@@ -937,6 +940,8 @@ const ALLOWED_PLAN_METHODS: &[&str] = &[
     "browser.click",
     "browser.type",
     "browser.getText",
+    "browser.read",
+    "browser.scroll",
 ];
 
 const SAFE_LAUNCH_APPLICATIONS: &[&str] = &[
@@ -1466,6 +1471,8 @@ fn kind_is_observe(kind: &str) -> bool {
             | "findelement"
             | "getvalue"
             | "browser.gettext"
+            | "browser.read"
+            | "browser.scroll"
             | "listapplications"
             | "resolveapplication"
             | "health"
@@ -2703,9 +2710,10 @@ async fn drive_workflow_run(app: AppHandle, run_id: String, workflow: Workflow, 
     );
 }
 
-/// One reply from the planner: either the next action or a completion signal.
-/// Deliberately mirrors the workflow-step shape so goal actions flow through the
-/// same policy gate, approval parking, and executors as recorded steps.
+/// One reply from the planner: the next action, a completion signal, or a plan
+/// outline. Deliberately mirrors the workflow-step shape so goal actions flow
+/// through the same policy gate, approval parking, and executors as recorded
+/// steps.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct PlannerReply {
@@ -2727,13 +2735,20 @@ struct PlannerReply {
     target_label: Option<String>,
     #[serde(default)]
     payload: Option<Value>,
+    /// Multi-phase goals: an outline the planner can set or revise instead of
+    /// acting. The loop pins it into every later prompt as CURRENT PLAN.
+    #[serde(default)]
+    plan: Option<Vec<String>>,
 }
 
 /// Parses one candidate text into a planner reply: direct JSON first (markdown
 /// fences stripped), then the widest brace span for prose-wrapped answers.
 fn planner_reply_from_text(text: &str) -> Option<PlannerReply> {
     let candidate = strip_json_fence(text);
-    let accept = |reply: PlannerReply| (reply.done || reply.kind.is_some()).then_some(reply);
+    let accept = |reply: PlannerReply| {
+        let has_plan = reply.plan.as_ref().map(|plan| !plan.is_empty()).unwrap_or(false);
+        (reply.done || reply.kind.is_some() || has_plan).then_some(reply)
+    };
     if let Ok(reply) = serde_json::from_str::<PlannerReply>(candidate) {
         if let Some(reply) = accept(reply) {
             return Some(reply);
@@ -2749,6 +2764,31 @@ fn planner_reply_from_text(text: &str) -> Option<PlannerReply> {
         }
     }
     None
+}
+
+/// Distills an action result into a short history suffix so the planner can
+/// reason over what it just read (browser.getText/getValue payloads), not only
+/// that the action succeeded. Whitespace-collapsed and capped so a large page
+/// dump cannot flood the next prompt.
+fn planner_result_digest(value: &Value) -> String {
+    let result = value.get("result").cloned().unwrap_or(Value::Null);
+    let text = match &result {
+        Value::String(text) => Some(text.clone()),
+        Value::Object(map) => map
+            .get("text")
+            .or_else(|| map.get("value"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        _ => None,
+    };
+    match text {
+        Some(text) if !text.trim().is_empty() => {
+            let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let snippet: String = collapsed.chars().take(400).collect();
+            format!(": {snippet}")
+        }
+        _ => String::new(),
+    }
 }
 
 fn parse_planner_action(output: &str) -> Result<PlannerReply, String> {
@@ -2793,6 +2833,8 @@ async fn run_planner_turn(
     provider: &str,
     prompt: &str,
     images: &[PathBuf],
+    step_index: usize,
+    progress: u8,
 ) -> Result<String, String> {
     let (mut process, prompt_input) = provider_command(provider, prompt, images)?;
     let mut child = process
@@ -2808,7 +2850,9 @@ async fn run_planner_turn(
     }
     let wait = child.wait_with_output();
     tokio::pin!(wait);
-    let deadline = std::time::Instant::now() + Duration::from_secs(PLANNER_TURN_TIMEOUT_SECS);
+    let started = std::time::Instant::now();
+    let deadline = started + Duration::from_secs(PLANNER_TURN_TIMEOUT_SECS);
+    let mut last_heartbeat = started;
     loop {
         if run_mode(app, run_id) == "stop" {
             return Err("stopped".into());
@@ -2821,8 +2865,26 @@ async fn run_planner_turn(
             }
             Ok(Err(error)) => return Err(format!("The planner process failed: {error}")),
             Err(_) => {
-                if std::time::Instant::now() >= deadline {
+                let now = std::time::Instant::now();
+                if now >= deadline {
                     return Err("The planner did not answer within 180 seconds.".into());
+                }
+                // A CLI turn can legitimately take minutes; keep the cockpit
+                // informed instead of going silent until the timeout.
+                if now.duration_since(last_heartbeat) >= Duration::from_secs(15) {
+                    last_heartbeat = now;
+                    emit_goal_event(
+                        app,
+                        run_id,
+                        step_index,
+                        "Planning the next action",
+                        &format!(
+                            "{provider} is still thinking ({}s elapsed).",
+                            now.duration_since(started).as_secs()
+                        ),
+                        "running",
+                        progress,
+                    );
                 }
             }
         }
@@ -2898,7 +2960,7 @@ fn infer_applications_from_goal(goal: &str) -> Vec<String> {
         (&["microsoft edge", "edge"], "Microsoft Edge"),
         (&["google chrome", "chrome"], "Google Chrome"),
         (&["brave"], "Brave"),
-        (&["browser", "website", "web page", "webpage"], "Installed browser"),
+        (&["browser", "website", "web page", "webpage", "portal", "dashboard", "site"], "Installed browser"),
         (&["excel", "spreadsheet", "workbook"], "Microsoft Excel"),
         (&["ms word", "word document", "word"], "Microsoft Word"),
         (&["powerpoint", "presentation"], "Microsoft PowerPoint"),
@@ -2948,14 +3010,26 @@ fn build_planner_prompt(
     applications: &[String],
     observations: &str,
     history: &[String],
+    plan: &[String],
 ) -> String {
     let history_text = if history.is_empty() {
         "(none yet)".to_string()
     } else {
         history.join("\n")
     };
+    let plan_text = if plan.is_empty() {
+        String::new()
+    } else {
+        let outline = plan
+            .iter()
+            .enumerate()
+            .map(|(index, phase)| format!("{}. {}", index + 1, phase))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("\n\nCURRENT PLAN (your outline; follow it, or return an updated plan):\n{outline}")
+    };
     format!(
-        "You are the planning brain of Alfred, a supervised desktop automation agent running on the user's machine. Propose the next single action toward the goal.\n\nGOAL: {goal}\n\nTARGET APPLICATIONS: {apps}\n\nCURRENT DESKTOP STATE:\n{observations}\n\nACTION HISTORY (oldest first):\n{history_text}\n\nReply with exactly one JSON object and nothing else (no markdown fences, no prose):\n{{\"done\": false, \"title\": \"short human label\", \"kind\": \"<method>\", \"application\": \"<exact app name>\", \"intent\": \"what and why\", \"effect\": \"observe|create|modify_reversible|external_write\", \"targetLabel\": \"<element label>\", \"payload\": {{...}}}}\nWhen the goal is fully complete, reply: {{\"done\": true, \"summary\": \"what was accomplished\"}}.\n\nMethods: listApplications (application \"Alfred\"; lists running app windows) | browser.observe | browser.navigate {{\"url\"}} | browser.click {{\"ref\"}} | browser.type {{\"ref\",\"text\"}} | browser.getText {{\"ref\"}} | launchApplication (allow-list only: Notepad, Calculator, Paint, File Explorer, Microsoft Edge, Google Chrome, Brave) | focusApplication | activate {{}} | observeWindow | findElement {{\"automationId\"|\"name\"|\"controlType\"}} | getValue (same selectors) | invokeElement (same selectors) | setValue (selectors + \"value\") | click {{\"x\",\"y\"}} | typeText {{\"text\"}} | key {{\"virtualKey\": 13|9|27}} (Enter, Tab, Escape only).\n\nRules:\n- One small action per reply; observe before acting when unsure.\n- NEVER propose deletion, trash, purge, overwrite, password entry, shell commands, or credential handling. Alfred hard-blocks them regardless of what you return.\n- Prefer setValue/invokeElement (semantic, focus-independent) over click/typeText.\n- Never include processId; Alfred injects the live one.\n- {app_rule}\n- If the last action failed or changed nothing, try a different approach instead of repeating it.\n- If a target application is not running, propose launchApplication when it is on the allow-list; otherwise reply done with a summary of the blocker.",
+        "You are the planning brain of Alfred, a supervised desktop automation agent running on the user's machine. Propose the next single action toward the goal.\n\nGOAL: {goal}\n\nTARGET APPLICATIONS: {apps}\n\nCURRENT DESKTOP STATE:\n{observations}\n\nACTION HISTORY (oldest first):\n{history_text}{plan_text}\n\nReply with exactly one JSON object and nothing else (no markdown fences, no prose):\n{{\"done\": false, \"title\": \"short human label\", \"kind\": \"<method>\", \"application\": \"<exact app name>\", \"intent\": \"what and why\", \"effect\": \"observe|create|modify_reversible|external_write\", \"targetLabel\": \"<element label>\", \"payload\": {{...}}}}\nWhen the goal is fully complete, reply: {{\"done\": true, \"summary\": \"what was accomplished\"}}.\nIf the goal has multiple phases, you may instead reply {{\"plan\": [\"short phase\", ...]}} (no \"kind\") to outline or revise your approach; it is pinned below as CURRENT PLAN.\n\nMethods: listApplications (application \"Alfred\"; lists running app windows) | browser.observe | browser.navigate {{\"url\"}} | browser.click {{\"ref\"}} | browser.type {{\"ref\",\"text\"}} | browser.getText {{\"ref\"}} | browser.read {{\"offset\":0}} (reads page text — articles, tables, error lists; ~6000 chars per call, page through with offset while hasMore) | browser.scroll {{\"direction\":\"down\"}} or {{\"text\":\"find visible text\"}} | launchApplication (allow-list only: Notepad, Calculator, Paint, File Explorer, Microsoft Edge, Google Chrome, Brave) | focusApplication | activate {{}} | observeWindow | findElement {{\"automationId\"|\"name\"|\"controlType\"}} | getValue (same selectors) | invokeElement (same selectors) | setValue (selectors + \"value\") | click {{\"x\",\"y\"}} | typeText {{\"text\"}} | key {{\"virtualKey\": 13|9|27}} (Enter, Tab, Escape only).\n\nRules:\n- One small action per reply; observe before acting when unsure.\n- browser.observe lists only interactive elements; for page CONTENT (articles, tables, error lists) use browser.read, then browser.scroll or another browser.read offset to see more.\n- NEVER propose deletion, trash, purge, overwrite, password entry, shell commands, or credential handling. Alfred hard-blocks them regardless of what you return.\n- Prefer setValue/invokeElement (semantic, focus-independent) over click/typeText.\n- Never include processId; Alfred injects the live one.\n- {app_rule}\n- If the last action failed or changed nothing, try a different approach instead of repeating it.\n- If a target application is not running, propose launchApplication when it is on the allow-list; otherwise reply done with a summary of the blocker.\n- Never claim to have read or analyzed content that does not appear in CURRENT DESKTOP STATE or ACTION HISTORY; if you cannot access the content the goal needs, reply done with a summary explaining the blocker instead of inventing results.",
         apps = planner_app_list(applications),
         app_rule = planner_app_rule(applications),
     )
@@ -3108,6 +3182,8 @@ async fn drive_goal_run(
     let lock_path = run_lock_path(&app).ok();
     let mut pinned_tab: Option<i64> = None;
     let mut history: Vec<String> = Vec::new();
+    // The planner's own outline for multi-phase goals; pinned into each prompt.
+    let mut working_plan: Vec<String> = Vec::new();
     let mut consecutive_failures = 0u32;
     let mut since_check_in = 0u32;
     for step_index in 0..max_steps {
@@ -3117,6 +3193,18 @@ async fn drive_goal_run(
         }
         if let Some(path) = &lock_path {
             write_run_lock(path, &run_id);
+        }
+        // Mid-run user guidance from the cockpit's steer bar joins the history
+        // the planner reasons over on this turn.
+        if let Ok(mut notes) = app.state::<RuntimeState>().steer_notes.lock() {
+            if let Some(mut queued) = notes.remove(&run_id) {
+                for note in queued.drain(..) {
+                    history.push(format!("user guidance: {note}"));
+                }
+                while history.len() > MAX_PLANNER_HISTORY {
+                    history.remove(0);
+                }
+            }
         }
         let progress = ((step_index * 100) / max_steps.max(1)) as u8;
         emit_goal_event(
@@ -3138,7 +3226,7 @@ async fn drive_goal_run(
             &app, &run_id, step_index as usize, "Planning the next action",
             &format!("{provider} is deciding the next step."), "running", progress,
         );
-        let mut prompt = build_planner_prompt(&goal, &applications, &observations, &history);
+        let mut prompt = build_planner_prompt(&goal, &applications, &observations, &history, &working_plan);
         // Flag providers receive the files as CLI attachments; path providers get
         // the file list in the prompt and their file reader supplies the vision.
         let delivery = provider_image_delivery(&provider);
@@ -3161,7 +3249,7 @@ async fn drive_goal_run(
                 None => {}
             }
         }
-        let output = match run_planner_turn(&app, &run_id, &provider, &prompt, flag_images).await {
+        let output = match run_planner_turn(&app, &run_id, &provider, &prompt, flag_images, step_index as usize, progress).await {
             Ok(output) => output,
             Err(error) if error == "stopped" => {
                 stop_run(&app, &run_id, &goal, step_index as usize);
@@ -3212,6 +3300,24 @@ async fn drive_goal_run(
             });
             emit_goal_event(&app, &run_id, step_index as usize, "Goal completed", &summary, "completed", 100);
             return;
+        }
+        // Multi-phase goals: the planner may outline or revise its approach
+        // instead of acting. The outline is pinned into every later prompt and
+        // shown in the cockpit timeline.
+        if !reply.done && reply.kind.is_none() {
+            if let Some(plan) = reply.plan.clone().filter(|plan| !plan.is_empty()) {
+                working_plan = plan;
+                consecutive_failures = 0;
+                let outline = working_plan.join(" → ");
+                emit_goal_event(
+                    &app, &run_id, step_index as usize, "Plan outlined", &outline, "running", progress,
+                );
+                history.push(format!("plan: {outline}"));
+                if history.len() > MAX_PLANNER_HISTORY {
+                    history.remove(0);
+                }
+                continue;
+            }
         }
         // 3. Execute through the same policy-gated path as recorded workflows.
         let kind = reply.kind.clone().unwrap_or_default();
@@ -3336,7 +3442,9 @@ async fn drive_goal_run(
         };
         match result {
             Ok(value) => {
-                history.push(format!("{title} ({kind}) — ok"));
+                // Read actions (getText/getValue) put what they read into the
+                // history — without the digest the planner only learns "ok".
+                history.push(format!("{title} ({kind}) — ok{}", planner_result_digest(&value)));
                 if history.len() > MAX_PLANNER_HISTORY {
                     history.remove(0);
                 }
@@ -3548,6 +3656,9 @@ async fn start_goal_run(
         if let Ok(mut controls) = app_for_run.state::<RuntimeState>().run_controls.lock() {
             controls.remove(&emitted_run);
         }
+        if let Ok(mut notes) = app_for_run.state::<RuntimeState>().steer_notes.lock() {
+            notes.remove(&emitted_run);
+        }
     });
     Ok(run_id)
 }
@@ -3726,6 +3837,37 @@ fn set_run_control(
         return Err("The run is no longer active.".into());
     }
     controls.insert(run_id, control);
+    Ok(())
+}
+
+/// Queues mid-run user guidance for an active goal run. The agent loop drains
+/// the queue into the next planner turn's history, so the user can redirect
+/// Alfred without pausing or stopping the run.
+#[tauri::command]
+fn steer_run(app: AppHandle, run_id: String, note: String) -> Result<(), String> {
+    let note: String = note.trim().chars().take(500).collect();
+    if note.is_empty() {
+        return Err("Say something first.".into());
+    }
+    let state = app.state::<RuntimeState>();
+    {
+        let controls = state
+            .run_controls
+            .lock()
+            .map_err(|_| "Run control state is unavailable.")?;
+        if !controls.contains_key(&run_id) {
+            return Err("The run is no longer active.".into());
+        }
+    }
+    let mut notes = state
+        .steer_notes
+        .lock()
+        .map_err(|_| "Steer state is unavailable.")?;
+    let queue = notes.entry(run_id).or_default();
+    if queue.len() >= 20 {
+        queue.remove(0);
+    }
+    queue.push(note);
     Ok(())
 }
 
@@ -4043,6 +4185,7 @@ pub fn run() {
             start_workflow_run,
             start_goal_run,
             set_run_control,
+            steer_run,
             approve_run_step,
             list_schedules,
             save_schedule,
@@ -4475,13 +4618,55 @@ mod tests {
         let apps = infer_applications_from_goal("Copy the table from the website into Excel");
         assert!(apps.contains(&"Installed browser".to_string()));
         assert!(apps.contains(&"Microsoft Excel".to_string()));
+        assert_eq!(
+            infer_applications_from_goal("Open our Datadog portal and check the RUM errors"),
+            vec!["Installed browser".to_string()]
+        );
         assert!(infer_applications_from_goal("organize my thoughts").is_empty());
     }
     #[test]
     fn planner_prompt_guides_app_choice_when_none_listed() {
-        let prompt = build_planner_prompt("Type hello somewhere safe", &[], "(no observations available)", &[]);
+        let prompt = build_planner_prompt("Type hello somewhere safe", &[], "(no observations available)", &[], &[]);
         assert!(prompt.contains("infer them from the goal"));
         assert!(prompt.contains("listApplications"));
+    }
+    #[test]
+    fn accepts_planner_plan_outline_replies() {
+        let reply = parse_planner_action(
+            "{\"plan\": [\"Open Datadog\", \"Open RUM\", \"Read the error list\", \"Summarize\"]}",
+        )
+        .unwrap();
+        assert!(!reply.done);
+        assert!(reply.kind.is_none());
+        assert_eq!(reply.plan.as_ref().map(|plan| plan.len()), Some(4));
+    }
+    #[test]
+    fn planner_history_digests_read_results() {
+        let read = serde_json::json!({"ok": true, "result": {"text": "Error rate spiked\n  to 4.2% of sessions"}});
+        assert_eq!(planner_result_digest(&read), ": Error rate spiked to 4.2% of sessions");
+        let click = serde_json::json!({"ok": true, "result": {"clicked": true}});
+        assert_eq!(planner_result_digest(&click), "");
+    }
+    #[test]
+    fn planner_prompt_pins_the_working_plan() {
+        let prompt = build_planner_prompt(
+            "Analyse the RUM errors",
+            &["Installed browser".to_string()],
+            "Installed browser:\npage: https://app.datadoghq.test",
+            &[],
+            &["Open Datadog".to_string(), "Open RUM".to_string()],
+        );
+        assert!(prompt.contains("CURRENT PLAN"));
+        assert!(prompt.contains("2. Open RUM"));
+        assert!(prompt.contains("\"plan\""));
+        assert!(prompt.contains("browser.read"));
+    }
+    #[test]
+    fn browser_read_and_scroll_are_observe_class_methods() {
+        assert_eq!(effective_effect("browser.read", "observe"), "observe");
+        assert_eq!(effective_effect("browser.scroll", "observe"), "observe");
+        assert!(ALLOWED_PLAN_METHODS.contains(&"browser.read"));
+        assert!(ALLOWED_PLAN_METHODS.contains(&"browser.scroll"));
     }
     #[test]
     fn planner_prompt_carries_goal_observations_and_rules() {
@@ -4490,6 +4675,7 @@ mod tests {
             &["Installed browser".to_string(), "Notepad".to_string()],
             "Installed browser:\npage: https://example.test",
             &["browser.navigate — ok".to_string()],
+            &[],
         );
         assert!(prompt.contains("Copy the total into Notepad"));
         assert!(prompt.contains("https://example.test"));

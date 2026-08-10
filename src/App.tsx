@@ -415,9 +415,9 @@ For launchApplication use one of: Notepad, Calculator, Paint, File Explorer, Mic
   const finalize = async () => { try { await invoke("finalize_recording", { libraryPath: settings.libraryPath, workflowId: workflow.id }); await onWorkflowChanged(); onClose(); } catch (caught) { setError(String(caught)); } };
   return <div className="page workflow-studio"><section className="page-title"><div><button className="back-button" onClick={onClose}>‹</button><span className="eyebrow">WORKFLOW RECORDER</span><h1>{workflow.name}</h1><p>{workflow.goal}</p></div><button className="primary-button" disabled={!steps.length} onClick={finalize}>Finalize workflow</button></section>
     <div className="studio-grid"><section className="settings-section"><h2>1. Ask the selected brain</h2><p>Alfred runs the installed {settings.provider} CLI in a supervised, read-only planning session.</p><div className="studio-actions"><button className="secondary-button" disabled={!!providerSession} onClick={askProvider}><Icon name="brain" size={17}/> {providerSession ? "Planning…" : "Generate plan"}</button>{providerSession && <button className="secondary-button" onClick={async () => { await invoke("cancel_provider_run", { sessionId: providerSession }); setProviderSession(""); }}>Stop planner</button>}</div><pre className="provider-console">{providerLines.length ? providerLines.join("\n") : "Provider output appears here. Alfred will extract safe actions for your review."}</pre></section>
-      <section className="settings-section"><h2>2. Add an action manually</h2><p>Use this only to refine the provider plan. Parameters stay in the portable workflow YAML.</p><div className="record-form"><label>Application<input value={application} onChange={event => setApplication(event.target.value)} placeholder="For example, Notepad"/></label><label>Method<select value={method} onChange={event => setMethod(event.target.value)}><option>launchApplication</option><option>focusApplication</option><option>observeWindow</option><option>captureWindow</option><option>findElement</option><option>getValue</option><option>invokeElement</option><option>setValue</option><option>click</option><option>typeText</option><option>key</option><option>browser.observe</option><option>browser.navigate</option><option>browser.click</option><option>browser.type</option><option>browser.getText</option></select></label><label>Target label<input value={target} onChange={event => setTarget(event.target.value)} placeholder="For example, Notepad editor"/></label><label>Parameters (JSON)<textarea value={parameters} onChange={event => setParameters(event.target.value)} rows={4}/></label><label>Wait for (optional label)<input value={waitFor} onChange={event => setWaitFor(event.target.value)} placeholder="Results table"/></label><label>Expect after (optional label)<input value={expect} onChange={event => setExpect(event.target.value)} placeholder="Saved confirmation"/></label><label>Save result as (optional variable)<input value={saveAs} onChange={event => setSaveAs(event.target.value)} placeholder="invoiceNumber"/></label><button className="primary-button" onClick={addStep}>Record action</button></div></section></div>
+      <section className="settings-section"><h2>2. Add an action manually</h2><p>Use this only to refine the provider plan. Parameters stay in the portable workflow YAML.</p><div className="record-form"><label>Application<input value={application} onChange={event => setApplication(event.target.value)} placeholder="For example, Notepad"/></label><label>Method<select value={method} onChange={event => setMethod(event.target.value)}><option>launchApplication</option><option>focusApplication</option><option>observeWindow</option><option>captureWindow</option><option>findElement</option><option>getValue</option><option>invokeElement</option><option>setValue</option><option>click</option><option>typeText</option><option>key</option><option>browser.observe</option><option>browser.navigate</option><option>browser.click</option><option>browser.type</option><option>browser.getText</option><option>browser.read</option><option>browser.scroll</option></select></label><label>Target label<input value={target} onChange={event => setTarget(event.target.value)} placeholder="For example, Notepad editor"/></label><label>Parameters (JSON)<textarea value={parameters} onChange={event => setParameters(event.target.value)} rows={4}/></label><label>Wait for (optional label)<input value={waitFor} onChange={event => setWaitFor(event.target.value)} placeholder="Results table"/></label><label>Expect after (optional label)<input value={expect} onChange={event => setExpect(event.target.value)} placeholder="Saved confirmation"/></label><label>Save result as (optional variable)<input value={saveAs} onChange={event => setSaveAs(event.target.value)} placeholder="invoiceNumber"/></label><button className="primary-button" onClick={addStep}>Record action</button></div></section></div>
     {error && <div className="error-message">{error}</div>}
-    {proposedSteps.length > 0 && <section className="panel-surface proposed-plan"><div className="panel-heading"><span>Review the proposed plan</span><button className="primary-button" disabled={recordingPlan} onClick={approvePlan}>{recordingPlan ? "Recording…" : "Approve and record all"}</button></div><p>Every step has passed Alfred’s base safety policy. Edit any field before approving.</p>{proposedSteps.map((step, index) => <div className="proposed-step" key={step.id}><span className="step-marker">{index + 1}</span><div><input aria-label={`Step ${index + 1} title`} value={step.title} onChange={event => setProposedSteps(current => current.map(item => item.id === step.id ? { ...item, title: event.target.value } : item))}/><div className="proposed-step-fields"><input aria-label={`Step ${index + 1} application`} value={step.application ?? ""} onChange={event => setProposedSteps(current => current.map(item => item.id === step.id ? { ...item, application: event.target.value } : item))}/><select aria-label={`Step ${index + 1} method`} value={step.kind} onChange={event => setProposedSteps(current => current.map(item => item.id === step.id ? { ...item, kind: event.target.value, effect: event.target.value.endsWith("observe") || ["observeWindow","captureWindow"].includes(event.target.value) ? "observe" : "modify_reversible" } : item))}><option>launchApplication</option><option>focusApplication</option><option>observeWindow</option><option>captureWindow</option><option>invokeElement</option><option>click</option><option>typeText</option><option>key</option><option>browser.observe</option><option>browser.navigate</option><option>browser.click</option><option>browser.type</option></select></div><textarea aria-label={`Step ${index + 1} parameters`} value={proposedParameters[step.id] ?? "{}"} onChange={event => setProposedParameters(current => ({ ...current, [step.id]: event.target.value }))}/></div></div>)}</section>}
+    {proposedSteps.length > 0 && <section className="panel-surface proposed-plan"><div className="panel-heading"><span>Review the proposed plan</span><button className="primary-button" disabled={recordingPlan} onClick={approvePlan}>{recordingPlan ? "Recording…" : "Approve and record all"}</button></div><p>Every step has passed Alfred’s base safety policy. Edit any field before approving.</p>{proposedSteps.map((step, index) => <div className="proposed-step" key={step.id}><span className="step-marker">{index + 1}</span><div><input aria-label={`Step ${index + 1} title`} value={step.title} onChange={event => setProposedSteps(current => current.map(item => item.id === step.id ? { ...item, title: event.target.value } : item))}/><div className="proposed-step-fields"><input aria-label={`Step ${index + 1} application`} value={step.application ?? ""} onChange={event => setProposedSteps(current => current.map(item => item.id === step.id ? { ...item, application: event.target.value } : item))}/><select aria-label={`Step ${index + 1} method`} value={step.kind} onChange={event => setProposedSteps(current => current.map(item => item.id === step.id ? { ...item, kind: event.target.value, effect: event.target.value.endsWith("observe") || ["observeWindow","captureWindow"].includes(event.target.value) ? "observe" : "modify_reversible" } : item))}><option>launchApplication</option><option>focusApplication</option><option>observeWindow</option><option>captureWindow</option><option>invokeElement</option><option>click</option><option>typeText</option><option>key</option><option>browser.observe</option><option>browser.navigate</option><option>browser.click</option><option>browser.type</option><option>browser.read</option><option>browser.scroll</option></select></div><textarea aria-label={`Step ${index + 1} parameters`} value={proposedParameters[step.id] ?? "{}"} onChange={event => setProposedParameters(current => ({ ...current, [step.id]: event.target.value }))}/></div></div>)}</section>}
     <section className="panel-surface recorded-steps"><div className="panel-heading"><span>Recorded steps</span><b>{steps.length}</b></div>{steps.map((step, index) => <div className="plan-step done" key={step.id}><span className="step-marker">{index + 1}</span><div><strong>{step.title}</strong><small>{step.application} · {step.kind} · {step.effect}</small></div></div>)}{!steps.length && <p>No actions recorded yet.</p>}</section>
   </div>;
 }
@@ -428,6 +428,7 @@ function ExecutionCockpit({ workflow, settings, onClose }: { workflow: Workflow;
   const [paused, setPaused] = useState(false);
   const [takeover, setTakeover] = useState(false);
   const [startError, setStartError] = useState("");
+  const [steer, setSteer] = useState("");
   const queued = useRef<RunEvent[]>([]);
   const activeRun = useRef("");
   // The backend starts emitting run events as soon as the run spawns, which can
@@ -527,12 +528,33 @@ function ExecutionCockpit({ workflow, settings, onClose }: { workflow: Workflow;
     try { await invoke("approve_run_step", { runId }); }
     catch (caught) { setStartError(String(caught)); }
   };
+  const sendSteer = async () => {
+    const note = steer.trim();
+    if (!note) return;
+    setSteer("");
+    let title = "You steered the run";
+    if (workflow.status === "example") {
+      title = "Simulations can't change course";
+    } else if (workflow.status !== "goal") {
+      title = "Steering is only available for live goal runs";
+    } else if (!runId) {
+      title = "The run is still starting — send again in a moment";
+    } else {
+      try { await invoke("steer_run", { runId, note: note.slice(0, 500) }); }
+      catch (caught) { setStartError(String(caught)); return; }
+    }
+    const echo: RunEvent = { runId, sequence: 9999, stepId: `steer-${Date.now()}`, title, detail: note, application: "You", status: "running", progress: events.at(-1)?.progress ?? 3, timestamp: new Date().toISOString() };
+    if (pausedRef.current || takeoverRef.current) queued.current.push(echo);
+    else setEvents((current) => [...current, echo]);
+  };
+
   const current = events.at(-1);
   const progress = current?.progress ?? 3;
   const complete = progress === 100 && current?.status !== "failed";
   const waitingApproval = current?.status === "waiting";
+  const completedSteps = workflow.status === "goal" ? events.filter((event) => event.status === "completed").slice(-8) : [];
   const planned = workflow.status === "goal"
-    ? (events.length ? events.filter((event) => event.status === "completed").map((event) => event.title).slice(-8) : ["The planner decides each step live — actions appear here as they happen."])
+    ? (completedSteps.length ? completedSteps.map((event) => event.title) : ["The planner decides each step live — actions appear here as they happen."])
     : workflow.steps.length ? workflow.steps.map(step => step.title) : ["Prepare workspace", "Open approved website", "Read invoice table", "Check safety policy", "Append workbook rows", "Verify the result"];
 
   return (
@@ -554,7 +576,9 @@ function ExecutionCockpit({ workflow, settings, onClose }: { workflow: Workflow;
           <div className="panel-heading"><span>Workflow</span><b>{progress}%</b></div>
           <div className="plan-list">
             {planned.map((step, index) => {
-              const event = workflow.steps.length ? [...events].reverse().find(item => item.stepId === workflow.steps[index]?.id) : events.find(item => item.sequence === index);
+              const event = workflow.status === "goal"
+                ? completedSteps[index]
+                : workflow.steps.length ? [...events].reverse().find(item => item.stepId === workflow.steps[index]?.id) : events.find(item => item.sequence === index);
               const done = event?.status === "completed"; const active = event?.status === "running" || event?.status === "failed" || (!event && index === 0);
               return <div key={`${step}-${index}`} className={`plan-step ${done ? "done" : active ? "current" : ""}`}><span className="step-marker">{done ? <Icon name="check" size={13} /> : index + 1}</span><div><strong>{step}</strong><small>{event ? `${event.application} · ${event.status}` : active ? "In progress" : "Waiting"}</small></div></div>;
             })}
@@ -583,12 +607,12 @@ function ExecutionCockpit({ workflow, settings, onClose }: { workflow: Workflow;
           <div className="panel-heading"><span>Activity</span><button>Evidence</button></div>
           <div className="event-list">
             {events.length === 0 && <div className="event-placeholder"><div className="mini-spinner" />Waiting for the first action…</div>}
-            {[...events].reverse().map((event, index) => <div className="event-item" key={`${event.stepId}-${event.sequence}`}><span className={index === 0 && !complete ? "event-status active" : "event-status"}><Icon name={event.status === "completed" ? "check" : "sparkle"} size={13} /></span><div><strong>{event.title}</strong><p>{event.detail}</p><small>{new Date(event.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })} · {event.application}</small></div></div>)}
+            {[...events].reverse().map((event, index) => <div className="event-item" key={`${event.stepId}-${event.sequence}-${index}`}><span className={index === 0 && !complete ? "event-status active" : "event-status"}><Icon name={event.status === "completed" ? "check" : "sparkle"} size={13} /></span><div><strong>{event.title}</strong><p>{event.detail}</p><small>{new Date(event.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })} · {event.application}</small></div></div>)}
           </div>
           <div className="run-id">Run {runId ? runId.slice(0, 8) : "starting"} · Local only</div>
         </section>
       </div>
-      <div className="steer-bar"><Icon name="sparkle" size={18} /><input placeholder="Tell Alfred something while it works…" /><span>Enter to send</span></div>
+      <div className="steer-bar"><Icon name="sparkle" size={18} /><input value={steer} onChange={(event) => setSteer(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") sendSteer(); }} placeholder="Tell Alfred something while it works…" /><span onClick={sendSteer} style={{ cursor: "pointer" }}>Enter to send</span></div>
     </div>
   );
 }
