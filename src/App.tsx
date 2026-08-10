@@ -207,7 +207,7 @@ function GoalLauncher({ onRun }: { onRun: (workflow: Workflow) => void }) {
   const [apps, setApps] = useState("");
   const start = () => {
     const applications = apps.split(",").map((app) => app.trim()).filter(Boolean);
-    if (!goal.trim() || !applications.length) return;
+    if (!goal.trim()) return;
     const now = new Date().toISOString();
     onRun({
       id: `goal-${crypto.randomUUID()}`,
@@ -228,9 +228,9 @@ function GoalLauncher({ onRun }: { onRun: (workflow: Workflow) => void }) {
         <strong>Run a goal with the live planner</strong>
         <span>The planner observes your apps and acts step by step, with Alfred's safety engine and your approvals supervising every action.</span>
         <input value={goal} onChange={(event) => setGoal(event.target.value)} placeholder="Goal, e.g. Copy the invoice total from the open Edge page into Notepad" />
-        <input value={apps} onChange={(event) => setApps(event.target.value)} placeholder="Target apps, comma separated — e.g. Installed browser, Notepad" />
+        <input value={apps} onChange={(event) => setApps(event.target.value)} placeholder="Target apps (optional) — leave blank and Alfred infers them from your goal" />
       </div>
-      <button disabled={!goal.trim() || !apps.trim()} onClick={start}>Run goal <Icon name="arrow" size={17} /></button>
+      <button disabled={!goal.trim()} onClick={start}>Run goal <Icon name="arrow" size={17} /></button>
     </section>
   );
 }

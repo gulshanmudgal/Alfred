@@ -1071,7 +1071,7 @@ fn collect_provider_text(value: &Value, output: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
             for (key, item) in map {
-                if matches!(key.as_str(), "text" | "output_text" | "content") {
+                if matches!(key.as_str(), "text" | "output_text" | "content" | "result") {
                     if let Some(text) = item.as_str() {
                         output.push(text.to_string());
                     }
@@ -2729,27 +2729,52 @@ struct PlannerReply {
     payload: Option<Value>,
 }
 
+/// Parses one candidate text into a planner reply: direct JSON first (markdown
+/// fences stripped), then the widest brace span for prose-wrapped answers.
+fn planner_reply_from_text(text: &str) -> Option<PlannerReply> {
+    let candidate = strip_json_fence(text);
+    let accept = |reply: PlannerReply| (reply.done || reply.kind.is_some()).then_some(reply);
+    if let Ok(reply) = serde_json::from_str::<PlannerReply>(candidate) {
+        if let Some(reply) = accept(reply) {
+            return Some(reply);
+        }
+    }
+    if let (Some(start), Some(end)) = (candidate.find('{'), candidate.rfind('}')) {
+        if start < end {
+            if let Ok(reply) = serde_json::from_str::<PlannerReply>(&candidate[start..=end]) {
+                if let Some(reply) = accept(reply) {
+                    return Some(reply);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn parse_planner_action(output: &str) -> Result<PlannerReply, String> {
-    // Provider CLIs wrap answers differently (JSONL events, prose around the JSON,
-    // markdown fences). Try the whole output, then JSON-looking lines from the
-    // end, then the widest brace span. The first candidate that is valid JSON with
-    // a recognizable shape wins.
-    let mut candidates: Vec<String> = vec![output.trim().to_string()];
+    // Provider CLIs wrap answers differently: bare JSON, prose around the JSON,
+    // markdown fences, or JSONL event envelopes with the reply nested as a
+    // string (Codex item.text; Grok/Cursor stream-json content/result blocks).
+    // Try the whole output, then event lines from the end — answers come
+    // last — unwrapping envelopes with the same machinery as plan extraction.
+    if let Some(reply) = planner_reply_from_text(output) {
+        return Ok(reply);
+    }
     for line in output.lines().rev() {
         let trimmed = line.trim();
-        if trimmed.starts_with('{') && trimmed.ends_with('}') {
-            candidates.push(trimmed.to_string());
+        if !(trimmed.starts_with('{') && trimmed.ends_with('}')) {
+            continue;
         }
-    }
-    if let (Some(start), Some(end)) = (output.find('{'), output.rfind('}')) {
-        if end > start {
-            candidates.push(output[start..=end].to_string());
+        if let Some(reply) = planner_reply_from_text(trimmed) {
+            return Ok(reply);
         }
-    }
-    for candidate in candidates {
-        if let Ok(reply) = serde_json::from_str::<PlannerReply>(&candidate) {
-            if reply.done || reply.kind.is_some() {
-                return Ok(reply);
+        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+            let mut embedded = Vec::new();
+            collect_provider_text(&value, &mut embedded);
+            for text in embedded.iter().rev() {
+                if let Some(reply) = planner_reply_from_text(text) {
+                    return Ok(reply);
+                }
             }
         }
     }
@@ -2858,6 +2883,66 @@ fn summarize_browser_elements(result: &Value, out: &mut Vec<String>) {
     }
 }
 
+/// Infers target applications from the goal text when the user did not list
+/// any. Aliases cover the launch allow-list plus common apps Alfred can observe
+/// once they are running. Word-boundary matching avoids hits like "alleged"
+/// containing "edge". An empty result is fine — the planner then picks the
+/// applications itself (the prompt tells it how).
+fn infer_applications_from_goal(goal: &str) -> Vec<String> {
+    const ALIASES: &[(&[&str], &str)] = &[
+        (&["notepad++"], "Notepad++"),
+        (&["notepad"], "Notepad"),
+        (&["calculator", "calc"], "Calculator"),
+        (&["paint"], "Paint"),
+        (&["file explorer", "explorer"], "File Explorer"),
+        (&["microsoft edge", "edge"], "Microsoft Edge"),
+        (&["google chrome", "chrome"], "Google Chrome"),
+        (&["brave"], "Brave"),
+        (&["browser", "website", "web page", "webpage"], "Installed browser"),
+        (&["excel", "spreadsheet", "workbook"], "Microsoft Excel"),
+        (&["ms word", "word document", "word"], "Microsoft Word"),
+        (&["powerpoint", "presentation"], "Microsoft PowerPoint"),
+        (&["outlook"], "Microsoft Outlook"),
+    ];
+    let normalized = goal.to_lowercase();
+    let words: std::collections::HashSet<&str> = normalized
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let mut applications: Vec<&str> = Vec::new();
+    for (aliases, application) in ALIASES {
+        let mentioned = aliases.iter().any(|alias| {
+            if alias.chars().any(|character| !character.is_alphanumeric()) {
+                normalized.contains(alias)
+            } else {
+                words.contains(alias)
+            }
+        });
+        if mentioned && !applications.contains(application) {
+            applications.push(application);
+        }
+    }
+    applications.into_iter().map(str::to_string).collect()
+}
+
+/// TARGET APPLICATIONS line for the planner prompt: the chosen apps, or — when
+/// the user left the list empty — instructions to pick them from the goal.
+fn planner_app_list(applications: &[String]) -> String {
+    if applications.is_empty() {
+        "(none chosen — infer them from the goal: use listApplications with application \"Alfred\" to see what is running, then launchApplication for allow-listed apps)".to_string()
+    } else {
+        applications.join(", ")
+    }
+}
+
+fn planner_app_rule(applications: &[String]) -> &'static str {
+    if applications.is_empty() {
+        "Name the target application yourself in every action, based on the goal; browser actions use \"Installed browser\"."
+    } else {
+        "Use application names exactly as listed; browser actions use \"Installed browser\"."
+    }
+}
+
 fn build_planner_prompt(
     goal: &str,
     applications: &[String],
@@ -2870,8 +2955,9 @@ fn build_planner_prompt(
         history.join("\n")
     };
     format!(
-        "You are the planning brain of Alfred, a supervised desktop automation agent running on the user's machine. Propose the next single action toward the goal.\n\nGOAL: {goal}\n\nTARGET APPLICATIONS: {apps}\n\nCURRENT DESKTOP STATE:\n{observations}\n\nACTION HISTORY (oldest first):\n{history_text}\n\nReply with exactly one JSON object and nothing else (no markdown fences, no prose):\n{{\"done\": false, \"title\": \"short human label\", \"kind\": \"<method>\", \"application\": \"<exact app name>\", \"intent\": \"what and why\", \"effect\": \"observe|create|modify_reversible|external_write\", \"targetLabel\": \"<element label>\", \"payload\": {{...}}}}\nWhen the goal is fully complete, reply: {{\"done\": true, \"summary\": \"what was accomplished\"}}.\n\nMethods: browser.observe | browser.navigate {{\"url\"}} | browser.click {{\"ref\"}} | browser.type {{\"ref\",\"text\"}} | browser.getText {{\"ref\"}} | launchApplication (allow-list only: Notepad, Calculator, Paint, File Explorer, Microsoft Edge, Google Chrome, Brave) | focusApplication | activate {{}} | observeWindow | findElement {{\"automationId\"|\"name\"|\"controlType\"}} | getValue (same selectors) | invokeElement (same selectors) | setValue (selectors + \"value\") | click {{\"x\",\"y\"}} | typeText {{\"text\"}} | key {{\"virtualKey\": 13|9|27}} (Enter, Tab, Escape only).\n\nRules:\n- One small action per reply; observe before acting when unsure.\n- NEVER propose deletion, trash, purge, overwrite, password entry, shell commands, or credential handling. Alfred hard-blocks them regardless of what you return.\n- Prefer setValue/invokeElement (semantic, focus-independent) over click/typeText.\n- Never include processId; Alfred injects the live one.\n- Use application names exactly as listed; browser actions use \"Installed browser\".\n- If the last action failed or changed nothing, try a different approach instead of repeating it.\n- If a target application is not running, propose launchApplication when it is on the allow-list; otherwise reply done with a summary of the blocker.",
-        apps = applications.join(", "),
+        "You are the planning brain of Alfred, a supervised desktop automation agent running on the user's machine. Propose the next single action toward the goal.\n\nGOAL: {goal}\n\nTARGET APPLICATIONS: {apps}\n\nCURRENT DESKTOP STATE:\n{observations}\n\nACTION HISTORY (oldest first):\n{history_text}\n\nReply with exactly one JSON object and nothing else (no markdown fences, no prose):\n{{\"done\": false, \"title\": \"short human label\", \"kind\": \"<method>\", \"application\": \"<exact app name>\", \"intent\": \"what and why\", \"effect\": \"observe|create|modify_reversible|external_write\", \"targetLabel\": \"<element label>\", \"payload\": {{...}}}}\nWhen the goal is fully complete, reply: {{\"done\": true, \"summary\": \"what was accomplished\"}}.\n\nMethods: listApplications (application \"Alfred\"; lists running app windows) | browser.observe | browser.navigate {{\"url\"}} | browser.click {{\"ref\"}} | browser.type {{\"ref\",\"text\"}} | browser.getText {{\"ref\"}} | launchApplication (allow-list only: Notepad, Calculator, Paint, File Explorer, Microsoft Edge, Google Chrome, Brave) | focusApplication | activate {{}} | observeWindow | findElement {{\"automationId\"|\"name\"|\"controlType\"}} | getValue (same selectors) | invokeElement (same selectors) | setValue (selectors + \"value\") | click {{\"x\",\"y\"}} | typeText {{\"text\"}} | key {{\"virtualKey\": 13|9|27}} (Enter, Tab, Escape only).\n\nRules:\n- One small action per reply; observe before acting when unsure.\n- NEVER propose deletion, trash, purge, overwrite, password entry, shell commands, or credential handling. Alfred hard-blocks them regardless of what you return.\n- Prefer setValue/invokeElement (semantic, focus-independent) over click/typeText.\n- Never include processId; Alfred injects the live one.\n- {app_rule}\n- If the last action failed or changed nothing, try a different approach instead of repeating it.\n- If a target application is not running, propose launchApplication when it is on the allow-list; otherwise reply done with a summary of the blocker.",
+        apps = planner_app_list(applications),
+        app_rule = planner_app_rule(applications),
     )
 }
 
@@ -3084,6 +3170,9 @@ async fn drive_goal_run(
             Err(error) => {
                 consecutive_failures += 1;
                 history.push(format!("planner error: {error}"));
+                if history.len() > MAX_PLANNER_HISTORY {
+                    history.remove(0);
+                }
                 if consecutive_failures >= GOAL_RUN_MAX_CONSECUTIVE_FAILURES {
                     fail_goal_run(&app, &run_id, &goal, step_index as usize, progress, format!("The planner is unreachable: {error}"));
                     return;
@@ -3095,7 +3184,13 @@ async fn drive_goal_run(
             Ok(reply) => reply,
             Err(error) => {
                 consecutive_failures += 1;
-                history.push(error.to_string());
+                // Show the planner what its unusable output looked like so the
+                // next turn can fix the format instead of repeating it.
+                let snippet: String = output.trim().chars().take(280).collect();
+                history.push(format!("{error} Output began: {snippet}"));
+                if history.len() > MAX_PLANNER_HISTORY {
+                    history.remove(0);
+                }
                 if consecutive_failures >= GOAL_RUN_MAX_CONSECUTIVE_FAILURES {
                     fail_goal_run(&app, &run_id, &goal, step_index as usize, progress, "The planner kept returning unusable output.".into());
                     return;
@@ -3366,13 +3461,16 @@ async fn start_goal_run(
     if goal.is_empty() {
         return Err("Describe the goal first.".into());
     }
-    let applications: Vec<String> = applications
+    let mut applications: Vec<String> = applications
         .into_iter()
         .map(|application| application.trim().to_string())
         .filter(|application| !application.is_empty())
         .collect();
     if applications.is_empty() {
-        return Err("Choose at least one target application.".into());
+        // No apps listed: infer them from the goal text. When nothing matches,
+        // the list stays empty and the planner picks the applications itself —
+        // the prompt tells it how (listApplications / launchApplication).
+        applications = infer_applications_from_goal(&goal);
     }
     let settings = get_settings(app.clone())?;
     // Fail fast when the planner CLI cannot be supervised on this machine;
@@ -4341,6 +4439,49 @@ mod tests {
     fn rejects_planner_output_without_an_action() {
         assert!(parse_planner_action("I cannot help with that.").is_err());
         assert!(parse_planner_action("{\"message\": \"no action here\"}").is_err());
+    }
+    #[test]
+    fn parses_planner_reply_inside_grok_streaming_json_envelope() {
+        // Grok/Cursor stream-json: the answer is a string inside content blocks,
+        // surrounded by init/result event lines.
+        let answer = "{\"done\": false, \"kind\": \"launchApplication\", \"application\": \"Notepad\", \"effect\": \"create\", \"payload\": {}}";
+        let output = format!(
+            "{}\n{}\n{}",
+            serde_json::json!({"type": "system", "subtype": "init", "model": "grok-code-fast-1"}),
+            serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": answer}]}}),
+            serde_json::json!({"type": "result", "subtype": "success", "result": "Done."})
+        );
+        let reply = parse_planner_action(&output).unwrap();
+        assert_eq!(reply.kind.as_deref(), Some("launchApplication"));
+        assert_eq!(reply.application.as_deref(), Some("Notepad"));
+    }
+    #[test]
+    fn parses_planner_reply_inside_codex_jsonl_envelope() {
+        let output = serde_json::json!({
+            "type": "item.completed",
+            "item": { "type": "agent_message", "text": "{\"done\": true, \"summary\": \"Typed the greeting.\"}" }
+        })
+        .to_string();
+        let reply = parse_planner_action(&output).unwrap();
+        assert!(reply.done);
+        assert_eq!(reply.summary.as_deref(), Some("Typed the greeting."));
+    }
+    #[test]
+    fn infers_target_applications_from_goal_text() {
+        assert_eq!(
+            infer_applications_from_goal("Can you open Notepad and type Hello From Alfred"),
+            vec!["Notepad".to_string()]
+        );
+        let apps = infer_applications_from_goal("Copy the table from the website into Excel");
+        assert!(apps.contains(&"Installed browser".to_string()));
+        assert!(apps.contains(&"Microsoft Excel".to_string()));
+        assert!(infer_applications_from_goal("organize my thoughts").is_empty());
+    }
+    #[test]
+    fn planner_prompt_guides_app_choice_when_none_listed() {
+        let prompt = build_planner_prompt("Type hello somewhere safe", &[], "(no observations available)", &[]);
+        assert!(prompt.contains("infer them from the goal"));
+        assert!(prompt.contains("listApplications"));
     }
     #[test]
     fn planner_prompt_carries_goal_observations_and_rules() {
