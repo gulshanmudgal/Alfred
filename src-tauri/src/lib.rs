@@ -657,7 +657,10 @@ fn provider_invocation(
         ], Some(prompt.to_string())),
         "copilot" => (vec!["-p", prompt, "-s"], None),
         "cursor" => (vec!["-p", "--output-format", "stream-json", prompt], None),
-        "grok" => (vec!["-p", prompt, "--output-format", "streaming-json"], None),
+        // Prefer whole-message JSON: streaming-json emits token-level
+        // {"type":"text","data":"…"} fragments that must be reassembled. The
+        // `json` format returns one object with a complete `text` field.
+        "grok" => (vec!["-p", prompt, "--output-format", "json"], None),
         _ => return Err(format!("Unknown provider: {provider}")),
     };
     let mut args: Vec<String> = args.into_iter().map(str::to_string).collect();
@@ -1078,7 +1081,20 @@ fn collect_provider_text(value: &Value, output: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
             for (key, item) in map {
-                if matches!(key.as_str(), "text" | "output_text" | "content" | "result") {
+                if matches!(
+                    key.as_str(),
+                    "text"
+                        | "output_text"
+                        | "content"
+                        | "result"
+                        | "message"
+                        | "delta"
+                        | "completion"
+                        | "response"
+                        | "answer"
+                        | "output"
+                        | "partial_response"
+                ) {
                     if let Some(text) = item.as_str() {
                         output.push(text.to_string());
                     }
@@ -2717,7 +2733,7 @@ async fn drive_workflow_run(app: AppHandle, run_id: String, workflow: Workflow, 
 /// One reply from the planner: the next action, a completion signal, or a plan
 /// outline. Deliberately mirrors the workflow-step shape so goal actions flow
 /// through the same policy gate, approval parking, and executors as recorded
-/// steps.
+/// steps. Aliases cover common CLI/model drift (snake_case, `method` vs `kind`).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct PlannerReply {
@@ -2727,17 +2743,17 @@ struct PlannerReply {
     title: Option<String>,
     #[serde(default)]
     summary: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "method", alias = "action")]
     kind: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "app")]
     application: Option<String>,
     #[serde(default)]
     intent: Option<String>,
     #[serde(default)]
     effect: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "target_label", alias = "target")]
     target_label: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "params", alias = "arguments", alias = "args")]
     payload: Option<Value>,
     /// Multi-phase goals: an outline the planner can set or revise instead of
     /// acting. The loop pins it into every later prompt as CURRENT PLAN.
@@ -2745,29 +2761,221 @@ struct PlannerReply {
     plan: Option<Vec<String>>,
 }
 
+fn accept_planner_reply(mut reply: PlannerReply) -> Option<PlannerReply> {
+    if let Some(kind) = reply.kind.as_mut() {
+        *kind = kind.trim().to_string();
+        if kind.is_empty() {
+            reply.kind = None;
+        }
+    }
+    let has_plan = reply
+        .plan
+        .as_ref()
+        .map(|plan| !plan.is_empty())
+        .unwrap_or(false);
+    (reply.done || reply.kind.is_some() || has_plan).then_some(reply)
+}
+
+/// Windows `cmd.exe` and many CLI argv paths choke on huge planner prompts
+/// (browser.read previews + skill + history). Cap the desktop-state section so
+/// Grok/Cursor still get a usable argv; they can browser.read for more text.
+fn compact_planner_observations(observations: &str) -> String {
+    const MAX_CHARS: usize = 3500;
+    let trimmed = observations.trim();
+    if trimmed.chars().count() <= MAX_CHARS {
+        return trimmed.to_string();
+    }
+    let kept: String = trimmed.chars().take(MAX_CHARS).collect();
+    format!("{kept}\n…(observation truncated; call browser.read or browser.scroll for more page content)")
+}
+
+/// Grok/Cursor take the prompt as a CLI argument. Beyond ~6–8k characters Windows
+/// command lines truncate or fail, producing empty/garbled stream output. Spill
+/// the full prompt to a temp file and pass a short instruction that points at it.
+fn materialize_planner_prompt(
+    app: &AppHandle,
+    provider: &str,
+    prompt: &str,
+) -> Result<(String, Option<PathBuf>), String> {
+    const MAX_ARGV_PROMPT: usize = 5500;
+    if !matches!(provider, "grok" | "cursor" | "copilot") || prompt.len() <= MAX_ARGV_PROMPT {
+        return Ok((prompt.to_string(), None));
+    }
+    let dir = app_data_dir(app)?.join("planner-prompts");
+    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let path = dir.join(format!("{}.txt", Uuid::new_v4()));
+    fs::write(&path, prompt).map_err(|error| error.to_string())?;
+    let short = format!(
+        "You are Alfred's desktop planner. Read the FULL task file at this absolute path with your file-reading tool, then respond with EXACTLY one JSON object as that file instructs (done/kind/plan). No markdown fences, no prose outside the JSON.\n\nTASK FILE:\n{}\n\nIf you cannot read the file, reply only: {{\"done\":true,\"summary\":\"Could not read the planner task file.\"}}",
+        path.display()
+    );
+    Ok((short, Some(path)))
+}
+
+/// Normalizes common LLM JSON shapes before deserializing into PlannerReply:
+/// `method` → `kind`, snake_case keys, and stringified nested JSON payloads.
+fn normalize_planner_json_value(mut value: Value) -> Value {
+    if let Value::Object(map) = &mut value {
+        // Promote nested action objects first: { "action": { "kind": ... } }
+        // Must run before treating a string "action"/"method" as the kind name.
+        if !map.contains_key("kind") {
+            for key in ["action", "step", "next", "command"] {
+                if matches!(map.get(key), Some(Value::Object(_))) {
+                    if let Some(Value::Object(inner)) = map.remove(key) {
+                        return normalize_planner_json_value(Value::Object(inner));
+                    }
+                }
+            }
+        }
+        if !map.contains_key("kind") {
+            if let Some(method) = map.get("method").cloned().or_else(|| map.get("action").cloned())
+            {
+                if method.is_string() {
+                    map.insert("kind".into(), method);
+                    map.remove("method");
+                }
+            }
+        }
+        if !map.contains_key("targetLabel") {
+            if let Some(target) = map
+                .remove("target_label")
+                .or_else(|| map.remove("target"))
+            {
+                map.insert("targetLabel".into(), target);
+            }
+        }
+        if !map.contains_key("payload") {
+            if let Some(params) = map
+                .remove("params")
+                .or_else(|| map.remove("arguments"))
+                .or_else(|| map.remove("args"))
+            {
+                map.insert("payload".into(), params);
+            }
+        }
+        if let Some(Value::String(raw)) = map.get("payload").cloned() {
+            if let Ok(parsed) = serde_json::from_str::<Value>(&raw) {
+                map.insert("payload".into(), parsed);
+            }
+        }
+    }
+    value
+}
+
+fn planner_reply_from_value(value: Value) -> Option<PlannerReply> {
+    let normalized = normalize_planner_json_value(value);
+    serde_json::from_value::<PlannerReply>(normalized)
+        .ok()
+        .and_then(accept_planner_reply)
+}
+
+/// Balanced-brace extraction of every top-level JSON object in a blob. Streaming
+/// CLIs interleave events; the action may not sit at the first `{` … last `}`.
+fn extract_json_objects(text: &str) -> Vec<String> {
+    let mut objects = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escape = false;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if in_string {
+                if escape {
+                    escape = false;
+                } else if c == b'\\' {
+                    escape = true;
+                } else if c == b'"' {
+                    in_string = false;
+                }
+            } else if c == b'"' {
+                in_string = true;
+            } else if c == b'{' {
+                depth += 1;
+            } else if c == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    if let Ok(slice) = std::str::from_utf8(&bytes[start..=i]) {
+                        objects.push(slice.to_string());
+                    }
+                    break;
+                }
+            }
+            i += 1;
+        }
+        i += 1;
+    }
+    objects
+}
+
 /// Parses one candidate text into a planner reply: direct JSON first (markdown
-/// fences stripped), then the widest brace span for prose-wrapped answers.
+/// fences stripped), then every balanced JSON object (prose-wrapped / stream).
 fn planner_reply_from_text(text: &str) -> Option<PlannerReply> {
     let candidate = strip_json_fence(text);
-    let accept = |reply: PlannerReply| {
-        let has_plan = reply.plan.as_ref().map(|plan| !plan.is_empty()).unwrap_or(false);
-        (reply.done || reply.kind.is_some() || has_plan).then_some(reply)
-    };
-    if let Ok(reply) = serde_json::from_str::<PlannerReply>(candidate) {
-        if let Some(reply) = accept(reply) {
+    if let Ok(value) = serde_json::from_str::<Value>(candidate) {
+        if let Some(reply) = planner_reply_from_value(value) {
             return Some(reply);
         }
     }
-    if let (Some(start), Some(end)) = (candidate.find('{'), candidate.rfind('}')) {
-        if start < end {
-            if let Ok(reply) = serde_json::from_str::<PlannerReply>(&candidate[start..=end]) {
-                if let Some(reply) = accept(reply) {
-                    return Some(reply);
-                }
+    // Prefer later objects — stream answers usually arrive last.
+    for object in extract_json_objects(candidate).into_iter().rev() {
+        if let Ok(value) = serde_json::from_str::<Value>(&object) {
+            if let Some(reply) = planner_reply_from_value(value) {
+                return Some(reply);
             }
         }
     }
     None
+}
+
+/// When the model refuses in prose (no JSON), end the goal run cleanly instead of
+/// spinning three "unusable output" turns. Only triggers on clear refusal language.
+fn planner_refusal_as_done(output: &str) -> Option<PlannerReply> {
+    let lower = output.to_lowercase();
+    let refused = [
+        "i can't help",
+        "i cannot help",
+        "i can't assist",
+        "i cannot assist",
+        "i'm not able to",
+        "i am not able to",
+        "can't help with that",
+        "cannot help with that",
+        "against my guidelines",
+        "against my policies",
+        "not able to post",
+        "cannot post",
+        "can't post",
+        "won't post",
+        "will not post",
+        "refuse to",
+        "unable to comply",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if !refused {
+        return None;
+    }
+    let summary: String = output
+        .split_whitespace()
+        .take(40)
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(PlannerReply {
+        done: true,
+        summary: Some(if summary.is_empty() {
+            "The planner declined this goal.".into()
+        } else {
+            summary.chars().take(280).collect()
+        }),
+        ..PlannerReply::default()
+    })
 }
 
 /// Distills an action result into a short history suffix so the planner can
@@ -2838,20 +3046,90 @@ fn planner_result_digest(value: &Value) -> String {
     }
 }
 
+/// Grok Build's `streaming-json` mode emits the assistant answer as many
+/// token events: `{"type":"text","data":"{\"done\""}` … `{"type":"text","data":"}"}`.
+/// Concatenate every text `data` field (in order) to recover the full message.
+/// Non-stream formats are unaffected (no such events → empty string).
+fn assemble_streaming_text_chunks(output: &str) -> String {
+    let mut assembled = String::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        let Some(map) = value.as_object() else {
+            continue;
+        };
+        let is_text = map
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind == "text" || kind == "assistant_text" || kind == "content");
+        if !is_text {
+            continue;
+        }
+        if let Some(chunk) = map.get("data").and_then(Value::as_str) {
+            assembled.push_str(chunk);
+        } else if let Some(chunk) = map.get("text").and_then(Value::as_str) {
+            assembled.push_str(chunk);
+        } else if let Some(chunk) = map
+            .get("delta")
+            .and_then(|delta| delta.get("text"))
+            .and_then(Value::as_str)
+        {
+            assembled.push_str(chunk);
+        }
+    }
+    assembled
+}
+
 fn parse_planner_action(output: &str) -> Result<PlannerReply, String> {
     // Provider CLIs wrap answers differently: bare JSON, prose around the JSON,
-    // markdown fences, or JSONL event envelopes with the reply nested as a
-    // string (Codex item.text; Grok/Cursor stream-json content/result blocks).
-    // Try the whole output, then event lines from the end — answers come
-    // last — unwrapping envelopes with the same machinery as plan extraction.
+    // markdown fences, JSONL token streams (Grok streaming-json), or whole-message
+    // envelopes (Grok --output-format json with a `text` field; Codex item.text).
     if let Some(reply) = planner_reply_from_text(output) {
         return Ok(reply);
     }
+    // Reassemble token-streamed assistant text BEFORE line-level scraping.
+    let streamed = assemble_streaming_text_chunks(output);
+    if !streamed.trim().is_empty() {
+        if let Some(reply) = planner_reply_from_text(&streamed) {
+            return Ok(reply);
+        }
+        if let Some(reply) = planner_refusal_as_done(&streamed) {
+            return Ok(reply);
+        }
+    }
+    // Whole document as one JSON value (pretty-printed multi-line envelopes).
+    if let Ok(value) = serde_json::from_str::<Value>(output.trim()) {
+        if let Some(reply) = planner_reply_from_value(value.clone()) {
+            return Ok(reply);
+        }
+        let mut embedded = Vec::new();
+        collect_provider_text(&value, &mut embedded);
+        for text in embedded.iter().rev() {
+            if let Some(reply) = planner_reply_from_text(text) {
+                return Ok(reply);
+            }
+        }
+    }
+    // Whole-stream embedded strings (JSONL event lines).
+    let mut embedded_all = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+            collect_provider_text(&value, &mut embedded_all);
+        }
+    }
+    for text in embedded_all.iter().rev() {
+        if let Some(reply) = planner_reply_from_text(text) {
+            return Ok(reply);
+        }
+    }
     for line in output.lines().rev() {
         let trimmed = line.trim();
-        if !(trimmed.starts_with('{') && trimmed.ends_with('}')) {
-            continue;
-        }
         if let Some(reply) = planner_reply_from_text(trimmed) {
             return Ok(reply);
         }
@@ -2864,6 +3142,24 @@ fn parse_planner_action(output: &str) -> Result<PlannerReply, String> {
                 }
             }
         }
+    }
+    // Balanced objects anywhere in the raw stream (including multi-line JSON).
+    for object in extract_json_objects(output).into_iter().rev() {
+        if let Ok(value) = serde_json::from_str::<Value>(&object) {
+            if let Some(reply) = planner_reply_from_value(value.clone()) {
+                return Ok(reply);
+            }
+            let mut embedded = Vec::new();
+            collect_provider_text(&value, &mut embedded);
+            for text in embedded.iter().rev() {
+                if let Some(reply) = planner_reply_from_text(text) {
+                    return Ok(reply);
+                }
+            }
+        }
+    }
+    if let Some(reply) = planner_refusal_as_done(output) {
+        return Ok(reply);
     }
     Err("The planner did not return a usable action.".into())
 }
@@ -3393,7 +3689,8 @@ async fn drive_goal_run(
             &app, &run_id, step_index as usize, "Planning the next action",
             &format!("{provider} is deciding the next step."), "running", progress,
         );
-        let mut prompt = build_planner_prompt(&goal, &applications, &observations, &history, &working_plan);
+        let compact_obs = compact_planner_observations(&observations);
+        let mut prompt = build_planner_prompt(&goal, &applications, &compact_obs, &history, &working_plan);
         // Flag providers receive the files as CLI attachments; path providers get
         // the file list in the prompt and their file reader supplies the vision.
         let delivery = provider_image_delivery(&provider);
@@ -3416,18 +3713,54 @@ async fn drive_goal_run(
                 None => {}
             }
         }
-        let output = match run_planner_turn(&app, &run_id, &provider, &prompt, flag_images, step_index as usize, progress).await {
-            Ok(output) => output,
+        // Grok/Cursor argv length: spill oversized prompts to a temp file.
+        let (prompt_for_cli, spilled_prompt) =
+            match materialize_planner_prompt(&app, &provider, &prompt) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    fail_goal_run(
+                        &app,
+                        &run_id,
+                        &goal,
+                        step_index as usize,
+                        progress,
+                        format!("Could not prepare the planner prompt: {error}"),
+                    );
+                    return;
+                }
+            };
+        let output = match run_planner_turn(&app, &run_id, &provider, &prompt_for_cli, flag_images, step_index as usize, progress).await {
+            Ok(output) => {
+                if let Some(path) = spilled_prompt.as_ref() {
+                    let _ = fs::remove_file(path);
+                }
+                output
+            }
             Err(error) if error == "stopped" => {
+                if let Some(path) = spilled_prompt.as_ref() {
+                    let _ = fs::remove_file(path);
+                }
                 stop_run(&app, &run_id, &goal, step_index as usize);
                 return;
             }
             Err(error) => {
+                if let Some(path) = spilled_prompt.as_ref() {
+                    let _ = fs::remove_file(path);
+                }
                 consecutive_failures += 1;
                 history.push(format!("planner error: {error}"));
                 if history.len() > MAX_PLANNER_HISTORY {
                     history.remove(0);
                 }
+                emit_goal_event(
+                    &app,
+                    &run_id,
+                    step_index as usize,
+                    "Planner error",
+                    &error,
+                    "running",
+                    progress,
+                );
                 if consecutive_failures >= GOAL_RUN_MAX_CONSECUTIVE_FAILURES {
                     fail_goal_run(&app, &run_id, &goal, step_index as usize, progress, format!("The planner is unreachable: {error}"));
                     return;
@@ -3440,14 +3773,39 @@ async fn drive_goal_run(
             Err(error) => {
                 consecutive_failures += 1;
                 // Show the planner what its unusable output looked like so the
-                // next turn can fix the format instead of repeating it.
-                let snippet: String = output.trim().chars().take(280).collect();
+                // next turn can fix the format instead of repeating it — and
+                // surface a short snippet in the cockpit so the user can see why.
+                let snippet: String = output.trim().chars().take(400).collect();
                 history.push(format!("{error} Output began: {snippet}"));
                 if history.len() > MAX_PLANNER_HISTORY {
                     history.remove(0);
                 }
+                let detail = if snippet.is_empty() {
+                    format!("{error} (empty planner output — often a CLI/argv or auth failure)")
+                } else {
+                    format!("{error} Snippet: {snippet}")
+                };
+                emit_goal_event(
+                    &app,
+                    &run_id,
+                    step_index as usize,
+                    "Unusable planner output",
+                    &detail.chars().take(500).collect::<String>(),
+                    "running",
+                    progress,
+                );
                 if consecutive_failures >= GOAL_RUN_MAX_CONSECUTIVE_FAILURES {
-                    fail_goal_run(&app, &run_id, &goal, step_index as usize, progress, "The planner kept returning unusable output.".into());
+                    fail_goal_run(
+                        &app,
+                        &run_id,
+                        &goal,
+                        step_index as usize,
+                        progress,
+                        format!(
+                            "The planner kept returning unusable output. Last snippet: {}",
+                            snippet.chars().take(200).collect::<String>()
+                        ),
+                    );
                     return;
                 }
                 continue;
@@ -4747,8 +5105,42 @@ mod tests {
     }
     #[test]
     fn rejects_planner_output_without_an_action() {
-        assert!(parse_planner_action("I cannot help with that.").is_err());
+        assert!(parse_planner_action("Sure, here is some unrelated chatter.").is_err());
         assert!(parse_planner_action("{\"message\": \"no action here\"}").is_err());
+    }
+    #[test]
+    fn accepts_method_alias_and_snake_case_planner_json() {
+        let reply = parse_planner_action(
+            r#"{"done": false, "method": "launchApplication", "application": "Microsoft Edge", "effect": "create", "params": {}}"#,
+        )
+        .unwrap();
+        assert_eq!(reply.kind.as_deref(), Some("launchApplication"));
+        assert_eq!(reply.application.as_deref(), Some("Microsoft Edge"));
+    }
+    #[test]
+    fn accepts_nested_action_object_from_stream() {
+        let reply = parse_planner_action(
+            r#"{"type":"assistant","action":{"done":false,"kind":"browser.navigate","application":"Installed browser","effect":"modify_reversible","payload":{"url":"https://x.com"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(reply.kind.as_deref(), Some("browser.navigate"));
+    }
+    #[test]
+    fn prose_refusal_ends_goal_cleanly_instead_of_spinning() {
+        let reply = parse_planner_action(
+            "I'm sorry, I can't help with posting automated tweets on social media.",
+        )
+        .unwrap();
+        assert!(reply.done);
+        assert!(reply.summary.as_ref().unwrap().to_lowercase().contains("can't help")
+            || reply.summary.as_ref().unwrap().to_lowercase().contains("posting"));
+    }
+    #[test]
+    fn compacts_oversized_observations_for_cli_planners() {
+        let huge = "x".repeat(5000);
+        let compact = compact_planner_observations(&huge);
+        assert!(compact.chars().count() < 5000);
+        assert!(compact.contains("truncated"));
     }
     #[test]
     fn parses_planner_reply_inside_grok_streaming_json_envelope() {
@@ -4765,6 +5157,91 @@ mod tests {
         assert_eq!(reply.kind.as_deref(), Some("launchApplication"));
         assert_eq!(reply.application.as_deref(), Some("Notepad"));
     }
+    #[test]
+    fn reassembles_grok_token_streamed_text_events() {
+        // Real Grok Build streaming-json: the action JSON is split across dozens
+        // of {"type":"text","data":"…"} token events (captured in a live run).
+        let chunks = [
+            "{\"done\": false, ",
+            "\"title\": \"Launch Microsoft Edge\", ",
+            "\"kind\": \"launchApplication\", ",
+            "\"application\": \"Microsoft Edge\", ",
+            "\"intent\": \"Open Edge\", ",
+            "\"effect\": \"create\", ",
+            "\"targetLabel\": null, ",
+            "\"payload\": {}}",
+        ];
+        let mut output = String::from(
+            r#"{"type":"available_commands","tools":[]}
+{"type":"thought","data":"planning"}
+"#,
+        );
+        for chunk in chunks {
+            output.push_str(&serde_json::json!({"type": "text", "data": chunk}).to_string());
+            output.push('\n');
+        }
+        output.push_str(r#"{"type":"end","stopReason":"end_turn"}"#);
+        let reply = parse_planner_action(&output).unwrap();
+        assert_eq!(reply.kind.as_deref(), Some("launchApplication"));
+        assert_eq!(reply.application.as_deref(), Some("Microsoft Edge"));
+        assert!(!reply.done);
+    }
+    #[test]
+    fn parses_grok_whole_message_json_envelope() {
+        // grok --output-format json: one object with a complete `text` field.
+        let output = r#"{
+  "text": "{\"done\": false, \"kind\": \"browser.navigate\", \"application\": \"Installed browser\", \"effect\": \"modify_reversible\", \"payload\": {\"url\": \"https://x.com\"}}",
+  "stopReason": "end_turn",
+  "usage": {"input_tokens": 100}
+}"#;
+        let reply = parse_planner_action(output).unwrap();
+        assert_eq!(reply.kind.as_deref(), Some("browser.navigate"));
+        assert_eq!(
+            reply
+                .payload
+                .as_ref()
+                .and_then(|value| value.get("url"))
+                .and_then(Value::as_str),
+            Some("https://x.com")
+        );
+    }
+    #[test]
+    fn parses_live_captured_grok_streaming_tweet_goal() {
+        // Captured from a real `grok -p … --output-format streaming-json` run for
+        // "launch edge browser and post a tweet on x.com" (token-chunk stream).
+        let output = include_str!("../tests/fixtures/grok-streaming-json-tweet-goal.jsonl");
+        let reply = parse_planner_action(output).expect("should reassemble live Grok stream");
+        assert_eq!(reply.kind.as_deref(), Some("launchApplication"));
+        assert_eq!(reply.application.as_deref(), Some("Microsoft Edge"));
+    }
+    #[test]
+    fn parses_live_captured_grok_json_tweet_goal() {
+        let output = include_str!("../tests/fixtures/grok-json-tweet-goal.json");
+        let reply = parse_planner_action(output).expect("should parse live Grok json envelope");
+        assert_eq!(reply.kind.as_deref(), Some("launchApplication"));
+        assert_eq!(reply.application.as_deref(), Some("Microsoft Edge"));
+    }
+    #[test]
+    fn grok_provider_uses_whole_message_json_format() {
+        let invocation = provider_invocation("grok", "plan", &[]).unwrap();
+        assert!(invocation.args.iter().any(|arg| arg == "json"));
+        assert!(!invocation.args.iter().any(|arg| arg == "streaming-json"));
+    }
+    #[test]
+    fn retest_post_fix_live_grok_json_and_stream() {
+        let json = include_str!("../tests/fixtures/retest-live-json.out");
+        let reply = parse_planner_action(json).expect("NEW format json must parse after fix");
+        assert_eq!(reply.kind.as_deref(), Some("launchApplication"));
+        assert_eq!(reply.application.as_deref(), Some("Microsoft Edge"));
+        assert!(!reply.done);
+
+        let stream = include_str!("../tests/fixtures/retest-live-stream.out");
+        let reply2 = parse_planner_action(stream).expect("streaming-json must reassemble after fix");
+        assert_eq!(reply2.kind.as_deref(), Some("launchApplication"));
+        assert!(reply2.application.as_deref() == Some("Microsoft Edge")
+            || reply2.application.as_deref() == Some("Installed browser"));
+    }
+
     #[test]
     fn parses_planner_reply_inside_codex_jsonl_envelope() {
         let output = serde_json::json!({

@@ -1,0 +1,28 @@
+{
+  "text": "{\"done\":false,\"kind\":\"launchApplication\",\"application\":\"Microsoft Edge\",\"effect\":\"create\",\"payload\":{}}",
+  "stopReason": "end_turn",
+  "sessionId": "019fec7d-cf1f-7443-af79-cca0287fe87f",
+  "requestId": "a3e90913-f16e-4b00-a90c-09dd9a4ab46d",
+  "thought": "The user wants me to act as \"Alfred planner\" and respond with exactly one JSON action to launch Edge and post a tweet on x.com. They prefer launching Microsoft Edge first.\n",
+  "usage": {
+    "input_tokens": 6469,
+    "cache_read_input_tokens": 11264,
+    "cache_creation_input_tokens": 0,
+    "output_tokens": 257,
+    "reasoning_tokens": 227,
+    "total_tokens": 17990
+  },
+  "num_turns": 1,
+  "total_cost_usd": 0.0178592,
+  "total_cost_usd_ticks": 178592000,
+  "modelUsage": {
+    "grok-4.5-build": {
+      "inputTokens": 6469,
+      "outputTokens": 257,
+      "cacheReadInputTokens": 11264,
+      "cacheCreationInputTokens": 0,
+      "modelCalls": 1,
+      "costUSD": 0.0178592
+    }
+  }
+}

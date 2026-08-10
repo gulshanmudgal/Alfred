@@ -1,0 +1,107 @@
+{"type":"available_commands","tools":["run_terminal_command","read_file","search_replace","list_dir","grep","kill_command_or_subagent","todo_write","get_command_or_subagent_output","spawn_subagent","scheduler_create","scheduler_delete","scheduler_list","monitor","search_tool","use_tool","workflow","enter_plan_mode","exit_plan_mode","ask_user_question","web_search","web_fetch","image_gen","image_edit","image_to_video","reference_to_video","write"],"commands":["compact","always-approve","context","session-info","feedback","deep-research","workflow","goal","loop","check-work","code-review","create-skill","docx","user:help","user:imagine","pptx","xlsx","airunway-aks-setup","appinsights-instrumentation","azure-ai","azure-aigateway","azure-cloud-migrate","azure-compliance","azure-compute","azure-cost","azure-deploy","azure-diagnostics","azure-enterprise-infra-planner","azure-hosted-copilot-sdk","azure-kubernetes","azure-kubernetes-automatic-readiness","azure-kusto","azure-messaging","azure-prepare","azure-quotas","azure-rbac","azure-reliability","azure-resource-lookup","azure-resource-visualizer","azure-storage","azure-upgrade","azure-validate","council","entra-agent-id","entra-app-registration","microsoft-foundry","finetuning","deploy-model","capacity","customize","preset","python-appservice-deploy","build-with-ai","create-workflow","design","execute-plan","implement","pr-babysit","resume-claude","resume-codex","resume-cursor","review","skill-design-principles"]}
+{"type":"available_commands","tools":["run_terminal_command","read_file","search_replace","list_dir","grep","kill_command_or_subagent","todo_write","get_command_or_subagent_output","spawn_subagent","scheduler_create","scheduler_delete","scheduler_list","monitor","search_tool","use_tool","workflow","enter_plan_mode","exit_plan_mode","ask_user_question","web_search","web_fetch","image_gen","image_edit","image_to_video","reference_to_video","write"],"commands":["compact","always-approve","context","session-info","feedback","deep-research","workflow","goal","loop","check-work","code-review","create-skill","docx","user:help","user:imagine","pptx","xlsx","airunway-aks-setup","appinsights-instrumentation","azure-ai","azure-aigateway","azure-cloud-migrate","azure-compliance","azure-compute","azure-cost","azure-deploy","azure-diagnostics","azure-enterprise-infra-planner","azure-hosted-copilot-sdk","azure-kubernetes","azure-kubernetes-automatic-readiness","azure-kusto","azure-messaging","azure-prepare","azure-quotas","azure-rbac","azure-reliability","azure-resource-lookup","azure-resource-visualizer","azure-storage","azure-upgrade","azure-validate","council","entra-agent-id","entra-app-registration","microsoft-foundry","finetuning","deploy-model","capacity","customize","preset","python-appservice-deploy","build-with-ai","create-workflow","design","execute-plan","implement","pr-babysit","resume-claude","resume-codex","resume-cursor","review","skill-design-principles"]}
+{"type":"thought","data":"The"}
+{"type":"thought","data":" user"}
+{"type":"thought","data":" wants"}
+{"type":"thought","data":" me"}
+{"type":"thought","data":" to"}
+{"type":"thought","data":" act"}
+{"type":"thought","data":" as"}
+{"type":"thought","data":" the"}
+{"type":"thought","data":" planning"}
+{"type":"thought","data":" brain"}
+{"type":"thought","data":" of"}
+{"type":"thought","data":" Alfred"}
+{"type":"thought","data":" and"}
+{"type":"thought","data":" propose"}
+{"type":"thought","data":" the"}
+{"type":"thought","data":" next"}
+{"type":"thought","data":" single"}
+{"type":"thought","data":" action"}
+{"type":"thought","data":" to"}
+{"type":"thought","data":" launch"}
+{"type":"thought","data":" Edge"}
+{"type":"thought","data":" browser"}
+{"type":"thought","data":" and"}
+{"type":"thought","data":" post"}
+{"type":"thought","data":" a"}
+{"type":"thought","data":" tweet"}
+{"type":"thought","data":" on"}
+{"type":"thought","data":" x"}
+{"type":"thought","data":".com"}
+{"type":"thought","data":"."}
+{"type":"thought","data":" They"}
+{"type":"thought","data":" want"}
+{"type":"thought","data":" exactly"}
+{"type":"thought","data":" one"}
+{"type":"thought","data":" JSON"}
+{"type":"thought","data":" object"}
+{"type":"thought","data":" with"}
+{"type":"thought","data":" no"}
+{"type":"thought","data":" other"}
+{"type":"thought","data":" text"}
+{"type":"thought","data":".\n"}
+{"type":"text","data":"{\""}
+{"type":"text","data":"done"}
+{"type":"text","data":"\":"}
+{"type":"text","data":" false"}
+{"type":"text","data":","}
+{"type":"text","data":" \""}
+{"type":"text","data":"title"}
+{"type":"text","data":"\":"}
+{"type":"text","data":" \""}
+{"type":"text","data":"Launch"}
+{"type":"text","data":" Microsoft"}
+{"type":"text","data":" Edge"}
+{"type":"text","data":"\","}
+{"type":"text","data":" \""}
+{"type":"text","data":"kind"}
+{"type":"text","data":"\":"}
+{"type":"text","data":" \""}
+{"type":"text","data":"launch"}
+{"type":"text","data":"Application"}
+{"type":"text","data":"\","}
+{"type":"text","data":" \""}
+{"type":"text","data":"application"}
+{"type":"text","data":"\":"}
+{"type":"text","data":" \""}
+{"type":"text","data":"Microsoft"}
+{"type":"text","data":" Edge"}
+{"type":"text","data":"\","}
+{"type":"text","data":" \""}
+{"type":"text","data":"intent"}
+{"type":"text","data":"\":"}
+{"type":"text","data":" \""}
+{"type":"text","data":"Open"}
+{"type":"text","data":" Edge"}
+{"type":"text","data":" so"}
+{"type":"text","data":" we"}
+{"type":"text","data":" can"}
+{"type":"text","data":" navigate"}
+{"type":"text","data":" to"}
+{"type":"text","data":" x"}
+{"type":"text","data":".com"}
+{"type":"text","data":" and"}
+{"type":"text","data":" post"}
+{"type":"text","data":" a"}
+{"type":"text","data":" tweet"}
+{"type":"text","data":"\","}
+{"type":"text","data":" \""}
+{"type":"text","data":"effect"}
+{"type":"text","data":"\":"}
+{"type":"text","data":" \""}
+{"type":"text","data":"create"}
+{"type":"text","data":"\","}
+{"type":"text","data":" \""}
+{"type":"text","data":"target"}
+{"type":"text","data":"Label"}
+{"type":"text","data":"\":"}
+{"type":"text","data":" null"}
+{"type":"text","data":","}
+{"type":"text","data":" \""}
+{"type":"text","data":"payload"}
+{"type":"text","data":"\":"}
+{"type":"text","data":" {}}"}
+{"type":"available_commands","tools":["run_terminal_command","read_file","search_replace","list_dir","grep","kill_command_or_subagent","todo_write","get_command_or_subagent_output","spawn_subagent","scheduler_create","scheduler_delete","scheduler_list","monitor","search_tool","use_tool","workflow","enter_plan_mode","exit_plan_mode","ask_user_question","web_search","web_fetch","image_gen","image_edit","image_to_video","reference_to_video","write"],"commands":["compact","always-approve","context","session-info","feedback","deep-research","workflow","goal","loop","check-work","code-review","create-skill","docx","user:help","user:imagine","pptx","xlsx","airunway-aks-setup","appinsights-instrumentation","azure-ai","azure-aigateway","azure-cloud-migrate","azure-compliance","azure-compute","azure-cost","azure-deploy","azure-diagnostics","azure-enterprise-infra-planner","azure-hosted-copilot-sdk","azure-kubernetes","azure-kubernetes-automatic-readiness","azure-kusto","azure-messaging","azure-prepare","azure-quotas","azure-rbac","azure-reliability","azure-resource-lookup","azure-resource-visualizer","azure-storage","azure-upgrade","azure-validate","council","entra-agent-id","entra-app-registration","microsoft-foundry","finetuning","deploy-model","capacity","customize","preset","python-appservice-deploy","build-with-ai","create-workflow","design","execute-plan","implement","pr-babysit","resume-claude","resume-codex","resume-cursor","review","skill-design-principles"]}
+{"type":"usage","usage":{"input_tokens":6736,"output_tokens":156,"cache_read_input_tokens":11136,"cache_creation_input_tokens":0,"reasoning_tokens":91},"signature":"m6+W1Qrz6p4ZEagrljZUNd0+iTCMR4fvAG3UPolpJGxN+uDg56+UicxY5vUPkKxQ1KcDlmfGdt2cIiJowQUGz7V7tVO78dTJOCt4mrf7rCIw2ZDA/FwpZ5qOTf6NKnotpiarSapvwNNoX9cNsHcbK4m7GFiPt80vXr7/CN7FkMtfs17xRuDUlIq5bZtNEj8GuklkKgQWMDl6HVaOJqCD8byoTxtoaSLxFRWiEBf+CtwyxVRku+frxlTXxEGw/TtkiasI5U2In9j8KRpMqLavYDQYUzoPBkeerta1ZHcbYW00/rMp+vcM46LV6SgcshhKAM7F+jbFRRvYHxsFMkRMA84uNkKXYWJt5gnx2F3fWzRSar2LJqiRvAHMFC1C4M3cnC3ZxtzN+hfNsMTdNXMr52vBY9zsItDeZo2hCc/C6p0zI2MAfeeQvRbK6K35oP0qjEUP7P40de5WpgEqa959mdX6G0lpQKjQkerF7JUd/jafvjvdRxykbVhtrZ+UwHd1PoxVXUFbobuIzI1JHwfHFxPdKRVSD/6Mwnbd0YQZr09hJRheq9cbAz+Zfz0ZRMCVCbZYGyvw2f4VtGymrmsVlrg2s/WN"}
+{"type":"end","stopReason":"end_turn","sessionId":"019fec7b-c699-7a01-87f0-df3668fc8d7c","requestId":"2fabd10a-86a3-4849-9acc-47b669dc4769","usage":{"input_tokens":6736,"cache_read_input_tokens":11136,"cache_creation_input_tokens":0,"output_tokens":156,"reasoning_tokens":91,"total_tokens":18028},"num_turns":1,"total_cost_usd":0.0177488,"total_cost_usd_ticks":177488000,"modelUsage":{"grok-4.5-build":{"inputTokens":6736,"outputTokens":156,"cacheReadInputTokens":11136,"cacheCreationInputTokens":0,"modelCalls":1,"costUSD":0.0177488}}}
