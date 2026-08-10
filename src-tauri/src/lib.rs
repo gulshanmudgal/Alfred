@@ -3396,14 +3396,14 @@ async fn start_goal_run(
     let start = (|| {
         try_acquire_run_lock(&lock_path, &run_id)?;
         if cfg!(windows) {
-            let runtime = app.state::<RuntimeState>();
-            for required in &applications {
-                if required == "Alfred" || required == "Installed browser" {
-                    continue;
-                }
-                resolve_application_process_id(&app, &runtime, required)
-                    .map_err(|error| format!("{required} is not ready: {error}"))?;
-            }
+            // Only the automation host itself must exist up front. Target apps
+            // deliberately do NOT have to be running here: observations report
+            // them as unavailable and the planner can then propose an
+            // allow-listed launchApplication — recovering from closed apps is
+            // exactly what the agent loop is for. (Recorded-workflow replay
+            // keeps the stricter apps-running preflight because it has no
+            // planner to recover from a missing app.)
+            native_host_executable(&app)?;
         }
         save_checkpoint(
             &app,
