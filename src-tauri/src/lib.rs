@@ -1830,6 +1830,13 @@ fn execute_native_action_inner(
 /// Re-resolve a recorded application name to the process that owns its window
 /// right now. Recorded PIDs go stale and can even be reused by other programs,
 /// so replay always re-binds identity through this lookup.
+/// Per-attempt PID rebinding applies to every native step EXCEPT launches: the
+/// point of launchApplication is that the application is not running yet, so
+/// pre-resolving it would always fail and the launch would never happen.
+fn needs_process_resolution(kind: &str, application: &str) -> bool {
+    kind != "launchApplication" && application != "Alfred"
+}
+
 fn resolve_application_process_id(
     app: &AppHandle,
     state: &RuntimeState,
@@ -2450,7 +2457,7 @@ async fn drive_workflow_run(app: AppHandle, run_id: String, workflow: Workflow, 
             }
             // Every attempt re-resolves the application to a live process, so a
             // stale recorded PID can never steer input into the wrong window.
-            if !is_browser && application != "Alfred" && cfg!(windows) {
+            if !is_browser && cfg!(windows) && needs_process_resolution(&step.kind, &application) {
                 let runtime = app.state::<RuntimeState>();
                 match resolve_application_process_id(&app, &runtime, &application) {
                     Ok(pid) => {
@@ -3119,7 +3126,7 @@ async fn drive_goal_run(
             save_as: None,
         };
         let mut payload = step.payload.clone().unwrap_or_else(|| serde_json::json!({}));
-        if !is_browser && application != "Alfred" && cfg!(windows) {
+        if !is_browser && cfg!(windows) && needs_process_resolution(&kind, &application) {
             let runtime = app.state::<RuntimeState>();
             match resolve_application_process_id(&app, &runtime, &application) {
                 Ok(pid) => {
@@ -4179,6 +4186,14 @@ mod tests {
             provider_image_delivery("cursor"),
             Some(ImageDelivery::PromptPaths)
         ));
+    }
+    #[test]
+    fn launches_skip_process_resolution() {
+        // The app is intentionally not running when a launch step executes.
+        assert!(!needs_process_resolution("launchApplication", "Notepad"));
+        assert!(needs_process_resolution("typeText", "Notepad"));
+        assert!(needs_process_resolution("focusApplication", "Notepad"));
+        assert!(!needs_process_resolution("typeText", "Alfred"));
     }
     #[test]
     fn mutating_methods_cannot_masquerade_as_observe() {
