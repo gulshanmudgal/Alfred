@@ -8,6 +8,10 @@ $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 Set-Location $root
 npm ci
 dotnet publish native/windows-host/Alfred.WindowsHost.csproj -c Release -r $hostRid --self-contained true
+# The sidecar ships inside the installer, so it must be signed before bundling;
+# Tauri's signCommand only signs Tauri-produced binaries. No-op until a
+# certificate is configured (see sign.ps1).
+& (Join-Path $PSScriptRoot "sign.ps1") -FilePath "native\windows-host\bin\Release\net10.0-windows\$hostRid\publish\alfred-windows-host.exe"
 $binaryDirectory = Join-Path $root "src-tauri\binaries"
 New-Item -ItemType Directory -Force -Path $binaryDirectory | Out-Null
 Copy-Item "native\windows-host\bin\Release\net10.0-windows\$hostRid\publish\alfred-windows-host.exe" (Join-Path $binaryDirectory "alfred-windows-host-$Triple.exe") -Force
