@@ -11,8 +11,10 @@ use std::{
     sync::{mpsc, Arc, Mutex},
     time::Duration,
 };
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt as _;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
 const PROTOCOL_VERSION: &str = "1.0";
@@ -313,6 +315,37 @@ struct ProviderEvent {
     timestamp: DateTime<Utc>,
 }
 
+#[derive(Debug)]
+struct ProviderInvocation {
+    command: String,
+    args: Vec<String>,
+    stdin: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderPlan {
+    steps: Vec<ProviderPlanStep>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderPlanStep {
+    #[serde(default)]
+    title: String,
+    application: String,
+    #[serde(alias = "kind")]
+    method: String,
+    #[serde(default)]
+    target_label: Option<String>,
+    #[serde(default = "empty_json_object", alias = "payload")]
+    params: Value,
+}
+
+fn empty_json_object() -> Value {
+    serde_json::json!({})
+}
+
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let path = app
         .path()
@@ -444,26 +477,130 @@ fn provider_definitions() -> [(&'static str, &'static str, &'static str); 4] {
     ]
 }
 
+fn select_resolved_command(paths: Vec<PathBuf>, windows: bool) -> Option<PathBuf> {
+    if !windows {
+        return paths.into_iter().next();
+    }
+    paths
+        .iter()
+        .find(|path| {
+            path.extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.eq_ignore_ascii_case("exe") || value.eq_ignore_ascii_case("com"))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .or_else(|| paths.into_iter().find(|path| is_windows_command_script(path)))
+}
+
+fn resolve_provider_command(command: &str) -> Option<PathBuf> {
+    let finder = if cfg!(target_os = "windows") {
+        "where.exe"
+    } else {
+        "which"
+    };
+    let output = Command::new(finder).arg(command).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let paths = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    select_resolved_command(paths, cfg!(target_os = "windows"))
+}
+
+fn is_windows_command_script(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("cmd") || value.eq_ignore_ascii_case("bat"))
+        .unwrap_or(false)
+}
+
+fn quote_windows_command_argument(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+#[derive(Debug, PartialEq)]
+struct ResolvedProcess {
+    program: PathBuf,
+    args: Vec<String>,
+    windows_raw_argument: Option<String>,
+}
+
+fn windows_command_script_process(
+    path: &Path,
+    args: &[String],
+    allow_script_wrapper: bool,
+) -> Result<ResolvedProcess, String> {
+    if !allow_script_wrapper {
+        return Err(format!(
+            "{} is installed as a command script that Alfred cannot safely supervise. Install the provider's native Windows executable.",
+            path.display()
+        ));
+    }
+    let mut command_line = quote_windows_command_argument(&path.to_string_lossy());
+    for argument in args {
+        command_line.push(' ');
+        command_line.push_str(&quote_windows_command_argument(argument));
+    }
+    let shell = std::env::var_os("COMSPEC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("cmd.exe"));
+    Ok(ResolvedProcess {
+        program: shell,
+        args: vec!["/D".into(), "/S".into(), "/C".into()],
+        // cmd.exe does not use the C runtime's argument escaping rules. Appending
+        // this command text as a raw argument avoids turning its quotes into \".
+        windows_raw_argument: Some(format!("\"{command_line}\"")),
+    })
+}
+
+fn resolved_process(
+    path: &Path,
+    args: &[String],
+    allow_script_wrapper: bool,
+) -> Result<ResolvedProcess, String> {
+    if cfg!(target_os = "windows") && is_windows_command_script(path) {
+        return windows_command_script_process(path, args, allow_script_wrapper);
+    }
+    Ok(ResolvedProcess {
+        program: path.to_path_buf(),
+        args: args.to_vec(),
+        windows_raw_argument: None,
+    })
+}
+
+fn provider_version(path: &Path) -> Option<String> {
+    let args = vec!["--version".to_string()];
+    let resolved = resolved_process(path, &args, true).ok()?;
+    let mut process = Command::new(resolved.program);
+    process.args(resolved.args);
+    #[cfg(target_os = "windows")]
+    if let Some(raw_argument) = resolved.windows_raw_argument {
+        process.raw_arg(raw_argument);
+    }
+    let output = process.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    (!stdout.is_empty())
+        .then_some(stdout)
+        .or_else(|| (!stderr.is_empty()).then_some(stderr))
+}
+
 #[tauri::command]
 fn detect_providers() -> Vec<ProviderStatus> {
     provider_definitions()
         .into_iter()
         .map(|(id, name, command)| {
-            let finder = if cfg!(target_os = "windows") {
-                "where"
-            } else {
-                "which"
-            };
-            let installed = Command::new(finder)
-                .arg(command)
-                .output()
-                .map(|output| output.status.success())
-                .unwrap_or(false);
-            let version = installed
-                .then(|| Command::new(command).arg("--version").output().ok())
-                .flatten()
-                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-                .filter(|value| !value.is_empty());
+            let resolved = resolve_provider_command(command);
+            let installed = resolved.is_some();
+            let version = resolved.as_deref().and_then(provider_version);
             ProviderStatus {
                 id: id.into(),
                 name: name.into(),
@@ -501,20 +638,23 @@ fn provider_invocation(
     provider: &str,
     prompt: &str,
     images: &[PathBuf],
-) -> Result<(String, Vec<String>), String> {
-    let args = match provider {
-        "codex" => vec![
+) -> Result<ProviderInvocation, String> {
+    let (args, stdin) = match provider {
+        "codex" => (vec![
             "exec",
             "--json",
             "--ephemeral",
+            "--ignore-user-config",
+            "--ask-for-approval",
+            "never",
             "--skip-git-repo-check",
             "--sandbox",
             "read-only",
-            prompt,
-        ],
-        "copilot" => vec!["-p", prompt, "-s"],
-        "cursor" => vec!["-p", "--output-format", "stream-json", prompt],
-        "grok" => vec!["-p", prompt, "--output-format", "streaming-json"],
+            "-",
+        ], Some(prompt.to_string())),
+        "copilot" => (vec!["-p", prompt, "-s"], None),
+        "cursor" => (vec!["-p", "--output-format", "stream-json", prompt], None),
+        "grok" => (vec!["-p", prompt, "--output-format", "streaming-json"], None),
         _ => return Err(format!("Unknown provider: {provider}")),
     };
     let mut args: Vec<String> = args.into_iter().map(str::to_string).collect();
@@ -551,24 +691,46 @@ fn provider_invocation(
         .find(|item| item.0 == provider)
         .map(|item| item.2)
         .ok_or_else(|| format!("Unknown provider: {provider}"))?;
-    Ok((command.into(), args))
+    Ok(ProviderInvocation {
+        command: command.into(),
+        args,
+        stdin,
+    })
 }
 
-/// Builds a supervised provider CLI invocation: non-interactive, sandboxed, with
-/// the OS-vault credential injected into the environment. Shared by design-time
+/// Builds a supervised provider CLI invocation: resolved executable path (with the
+/// Windows command-script wrapper where a provider installs as .cmd), sandboxed
+/// arguments, stdin payload when the CLI reads prompts from stdin, and the
+/// OS-vault credential injected into the environment. Shared by design-time
 /// planning sessions and runtime agent-loop turns.
 fn provider_command(
     provider: &str,
     prompt: &str,
     images: &[PathBuf],
-) -> Result<tokio::process::Command, String> {
-    let (command, args) = provider_invocation(provider, prompt, images)?;
-    let mut process = tokio::process::Command::new(command);
+) -> Result<(tokio::process::Command, Option<String>), String> {
+    let invocation = provider_invocation(provider, prompt, images)?;
+    let resolved = resolve_provider_command(&invocation.command).ok_or_else(|| {
+        format!(
+            "{} is not available to Alfred. Install it, sign in, then restart Alfred.",
+            invocation.command
+        )
+    })?;
+    let resolved = resolved_process(&resolved, &invocation.args, provider == "codex")?;
+    let mut process = tokio::process::Command::new(&resolved.program);
     process
-        .args(args)
+        .args(resolved.args)
+        .stdin(if invocation.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(target_os = "windows")]
+    if let Some(raw_argument) = resolved.windows_raw_argument {
+        process.as_std_mut().raw_arg(raw_argument);
+    }
     if let Ok(secret) = vault_entry(provider)
         .and_then(|entry| entry.get_password().map_err(|error| error.to_string()))
     {
@@ -588,7 +750,7 @@ fn provider_command(
             _ => {}
         }
     }
-    Ok(process)
+    Ok((process, invocation.stdin))
 }
 
 #[tauri::command]
@@ -598,18 +760,36 @@ async fn start_provider_run(
     provider: String,
     prompt: String,
     working_directory: Option<String>,
+    session_id: Option<String>,
 ) -> Result<String, String> {
     if prompt.trim().is_empty() {
         return Err("The provider prompt cannot be empty.".into());
     }
-    let mut process = provider_command(&provider, &prompt, &[])?;
-    if let Some(directory) = working_directory.filter(|value| !value.trim().is_empty()) {
-        process.current_dir(directory);
-    }
+    let _ = working_directory;
+    let (mut process, prompt_input) = provider_command(&provider, &prompt, &[])?;
+    let planning_directory = app_data_dir(&app)?.join("planner");
+    fs::create_dir_all(&planning_directory).map_err(|error| error.to_string())?;
+    process.current_dir(planning_directory);
     let mut child = process
         .spawn()
         .map_err(|error| format!("Could not start {provider}: {error}"))?;
-    let session_id = Uuid::new_v4().to_string();
+    if let Some(prompt_input) = prompt_input {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| format!("Could not open {provider} input."))?;
+        stdin
+            .write_all(prompt_input.as_bytes())
+            .await
+            .map_err(|error| format!("Could not send the plan request to {provider}: {error}"))?;
+        stdin
+            .shutdown()
+            .await
+            .map_err(|error| format!("Could not finish the plan request to {provider}: {error}"))?;
+    }
+    let session_id = session_id
+        .filter(|value| Uuid::parse_str(value).is_ok())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     if let Some(pid) = child.id() {
         state
             .provider_pids
@@ -723,6 +903,277 @@ fn cancel_provider_run(state: State<'_, RuntimeState>, session_id: String) -> Re
     })
 }
 
+const ALLOWED_PLAN_METHODS: &[&str] = &[
+    "launchApplication",
+    "focusApplication",
+    "observeWindow",
+    "captureWindow",
+    "findElement",
+    "getValue",
+    "invokeElement",
+    "setValue",
+    "click",
+    "typeText",
+    "key",
+    "browser.observe",
+    "browser.navigate",
+    "browser.click",
+    "browser.type",
+    "browser.getText",
+];
+
+const SAFE_LAUNCH_APPLICATIONS: &[&str] = &[
+    "Notepad",
+    "Calculator",
+    "Paint",
+    "File Explorer",
+    "Microsoft Edge",
+    "Google Chrome",
+    "Brave",
+];
+
+fn method_effect(method: &str) -> &'static str {
+    if method.ends_with("observe") || matches!(method, "observeWindow" | "captureWindow") {
+        "observe"
+    } else {
+        "modify_reversible"
+    }
+}
+
+fn validate_workflow_step(step: &WorkflowStep) -> Result<(), String> {
+    if !ALLOWED_PLAN_METHODS.contains(&step.kind.as_str()) {
+        return Err(format!("Unsupported workflow method: {}", step.kind));
+    }
+    let application = step
+        .application
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Every workflow step must name an application.".to_string())?;
+    if step.kind == "launchApplication"
+        && !SAFE_LAUNCH_APPLICATIONS
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(application))
+    {
+        return Err(format!("Alfred cannot safely launch {application}."));
+    }
+    let params = step
+        .payload
+        .as_ref()
+        .ok_or_else(|| format!("Parameters for {} must be a JSON object.", step.kind))?;
+    if !params.is_object() {
+        return Err(format!("Parameters for {} must be a JSON object.", step.kind));
+    }
+    if step.kind == "typeText"
+        && params
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::is_empty)
+            .unwrap_or(true)
+    {
+        return Err("A typeText step must include non-empty text.".into());
+    }
+    if step.kind == "key"
+        && params.get("virtualKey").and_then(Value::as_u64) == Some(0x2e)
+    {
+        return Err("The Delete key is blocked by Alfred's deletion policy.".into());
+    }
+    if matches!(
+        step.kind.as_str(),
+        "invokeElement" | "click" | "browser.click" | "browser.type"
+    ) && step
+        .target_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        return Err(format!("{} requires a visible target label.", step.kind));
+    }
+    if step.effect != method_effect(&step.kind) {
+        return Err(format!("The effect for {} does not match its method.", step.kind));
+    }
+    Ok(())
+}
+
+fn strip_json_fence(value: &str) -> &str {
+    let trimmed = value.trim();
+    let without_start = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```JSON"))
+        .or_else(|| trimmed.strip_prefix("```"))
+        .unwrap_or(trimmed)
+        .trim();
+    without_start
+        .strip_suffix("```")
+        .unwrap_or(without_start)
+        .trim()
+}
+
+fn plan_from_json_value(value: Value) -> Option<ProviderPlan> {
+    if value.is_array() {
+        return serde_json::from_value::<Vec<ProviderPlanStep>>(value)
+            .ok()
+            .map(|steps| ProviderPlan { steps });
+    }
+    serde_json::from_value(value).ok()
+}
+
+fn plan_from_text(value: &str) -> Option<ProviderPlan> {
+    let candidate = strip_json_fence(value);
+    if let Ok(parsed) = serde_json::from_str::<Value>(candidate) {
+        if let Some(plan) = plan_from_json_value(parsed) {
+            return Some(plan);
+        }
+    }
+    let object_start = candidate.find('{');
+    let object_end = candidate.rfind('}');
+    if let (Some(start), Some(end)) = (object_start, object_end) {
+        if start < end {
+            if let Ok(parsed) = serde_json::from_str::<Value>(&candidate[start..=end]) {
+                if let Some(plan) = plan_from_json_value(parsed) {
+                    return Some(plan);
+                }
+            }
+        }
+    }
+    let array_start = candidate.find('[');
+    let array_end = candidate.rfind(']');
+    if let (Some(start), Some(end)) = (array_start, array_end) {
+        if start < end {
+            if let Ok(parsed) = serde_json::from_str::<Value>(&candidate[start..=end]) {
+                return plan_from_json_value(parsed);
+            }
+        }
+    }
+    None
+}
+
+fn collect_provider_text(value: &Value, output: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, item) in map {
+                if matches!(key.as_str(), "text" | "output_text" | "content") {
+                    if let Some(text) = item.as_str() {
+                        output.push(text.to_string());
+                    }
+                }
+                collect_provider_text(item, output);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_provider_text(item, output);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn validate_provider_plan(plan: ProviderPlan) -> Result<Vec<WorkflowStep>, String> {
+    if plan.steps.is_empty() {
+        return Err("The provider returned an empty plan.".into());
+    }
+    if plan.steps.len() > 100 {
+        return Err("The provider returned too many workflow steps.".into());
+    }
+    plan.steps
+        .into_iter()
+        .map(|item| {
+            let method = item.method.trim().to_string();
+            let application = item.application.trim().to_string();
+            if !ALLOWED_PLAN_METHODS.contains(&method.as_str()) {
+                return Err(format!("The provider proposed an unsupported method: {method}"));
+            }
+            if application.is_empty() {
+                return Err("Every provider step must name an application.".into());
+            }
+            if method == "launchApplication"
+                && !SAFE_LAUNCH_APPLICATIONS
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(&application))
+            {
+                return Err(format!("Alfred cannot safely launch {application}."));
+            }
+            if !item.params.is_object() {
+                return Err(format!("Parameters for {method} must be a JSON object."));
+            }
+            if method == "typeText"
+                && item
+                    .params
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::is_empty)
+                    .unwrap_or(true)
+            {
+                return Err("A typeText step must include non-empty text.".into());
+            }
+            let effect = method_effect(&method).to_string();
+            let title = if item.title.trim().is_empty() {
+                item.target_label
+                    .clone()
+                    .unwrap_or_else(|| method.clone())
+            } else {
+                item.title.trim().to_string()
+            };
+            let step = WorkflowStep {
+                id: Uuid::new_v4().to_string(),
+                title,
+                kind: method.clone(),
+                effect: effect.clone(),
+                application: Some(application.clone()),
+                intent: Some(format!("{method} {}", item.target_label.clone().unwrap_or_default()).trim().to_string()),
+                target_label: item.target_label,
+                payload: Some(item.params),
+                timeout_ms: default_timeout(),
+                retries: default_retries(),
+                wait_for: None,
+                expect: None,
+                save_as: None,
+            };
+            validate_workflow_step(&step)?;
+            let decision = evaluate_base_policy(&ActionRequest {
+                protocol_version: protocol_version(),
+                run_id: "planning".into(),
+                workflow_step: step.id.clone(),
+                application,
+                intent: step.intent.clone().unwrap_or_default(),
+                effect,
+                target_label: step.target_label.clone(),
+                payload: step.payload.clone(),
+            });
+            if decision.decision != "allow" {
+                return Err(decision.reason);
+            }
+            Ok(step)
+        })
+        .collect()
+}
+
+fn parse_provider_plan_output(output: &[String]) -> Result<Vec<WorkflowStep>, String> {
+    let mut candidates = Vec::new();
+    for line in output.iter().rev() {
+        if let Ok(value) = serde_json::from_str::<Value>(line) {
+            if let Some(plan) = plan_from_json_value(value.clone()) {
+                return validate_provider_plan(plan);
+            }
+            collect_provider_text(&value, &mut candidates);
+        }
+        candidates.push(line.clone());
+    }
+    for candidate in candidates.iter().rev() {
+        if let Some(plan) = plan_from_text(candidate) {
+            return validate_provider_plan(plan);
+        }
+    }
+    Err("Alfred could not find a valid JSON workflow plan in the provider output.".into())
+}
+
+#[tauri::command]
+fn parse_provider_plan(output: Vec<String>) -> Result<Vec<WorkflowStep>, String> {
+    parse_provider_plan_output(&output)
+}
+
 fn workflow_path(library_path: &str, workflow: &Workflow) -> PathBuf {
     let safe_name: String = workflow
         .name
@@ -819,6 +1270,7 @@ fn record_action(
     workflow_id: String,
     mut step: WorkflowStep,
 ) -> Result<Workflow, String> {
+    validate_workflow_step(&step)?;
     let application = step.application.clone().unwrap_or_else(|| "Alfred".into());
     let request = ActionRequest {
         protocol_version: protocol_version(),
@@ -842,6 +1294,49 @@ fn record_action(
         step.id = Uuid::new_v4().to_string();
     }
     workflow.steps.push(step);
+    workflow.updated_at = Utc::now();
+    workflow.status = "recording".into();
+    save_workflow(&path, &workflow)?;
+    Ok(workflow)
+}
+
+#[tauri::command]
+fn record_actions(
+    library_path: String,
+    workflow_id: String,
+    mut steps: Vec<WorkflowStep>,
+) -> Result<Workflow, String> {
+    if steps.is_empty() {
+        return Err("The approved plan is empty.".into());
+    }
+    for step in &steps {
+        validate_workflow_step(step)?;
+        let application = step.application.clone().unwrap_or_else(|| "Alfred".into());
+        let decision = evaluate_base_policy(&ActionRequest {
+            protocol_version: protocol_version(),
+            run_id: "recording".into(),
+            workflow_step: step.id.clone(),
+            application,
+            intent: step.intent.clone().unwrap_or_else(|| step.title.clone()),
+            effect: step.effect.clone(),
+            target_label: step.target_label.clone(),
+            payload: step.payload.clone(),
+        });
+        if decision.decision == "hard_deny" {
+            return Err(decision.reason);
+        }
+    }
+    let (path, mut workflow) = load_workflow(&library_path, &workflow_id)?;
+    for step in &mut steps {
+        let application = step.application.clone().unwrap_or_else(|| "Alfred".into());
+        if !workflow.required_apps.contains(&application) {
+            workflow.required_apps.push(application);
+        }
+        if step.id.trim().is_empty() {
+            step.id = Uuid::new_v4().to_string();
+        }
+    }
+    workflow.steps.extend(steps);
     workflow.updated_at = Utc::now();
     workflow.status = "recording".into();
     save_workflow(&path, &workflow)?;
@@ -1292,7 +1787,7 @@ fn execute_native_action_inner(
     let message = serde_json::json!({
         "id": if request.workflow_step.is_empty() { Uuid::new_v4().to_string() } else { request.workflow_step.clone() },
         "method": method, "capabilityToken": host.capability_token, "params": request.payload.clone().unwrap_or_else(|| serde_json::json!({})),
-        "intent": request.intent, "target": request.target_label
+        "application": request.application, "intent": request.intent, "target": request.target_label
     });
     if host.to_host.send(message.to_string()).is_err() {
         *guard = None;
@@ -1755,6 +2250,9 @@ fn start_workflow_run(
     resume_run_id: Option<String>,
 ) -> Result<String, String> {
     let (_, workflow) = load_workflow(&library_path, &workflow_id)?;
+    for step in &workflow.steps {
+        validate_workflow_step(step)?;
+    }
     let run_id = resume_run_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let start_index = get_checkpoint(app.clone(), run_id.clone())?
         .map(|item| item.next_step_index)
@@ -2243,9 +2741,18 @@ async fn run_planner_turn(
     prompt: &str,
     images: &[PathBuf],
 ) -> Result<String, String> {
-    let child = provider_command(provider, prompt, images)?
+    let (mut process, prompt_input) = provider_command(provider, prompt, images)?;
+    let mut child = process
         .spawn()
         .map_err(|error| format!("Could not start {provider}: {error}"))?;
+    // Providers that read the prompt from stdin (Codex) receive it now.
+    if let Some(input) = prompt_input {
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(input.as_bytes()).await;
+            let _ = stdin.shutdown().await;
+        }
+    }
     let wait = child.wait_with_output();
     tokio::pin!(wait);
     let deadline = std::time::Instant::now() + Duration::from_secs(PLANNER_TURN_TIMEOUT_SECS);
@@ -3389,9 +3896,11 @@ pub fn run() {
             has_provider_secret,
             start_provider_run,
             cancel_provider_run,
+            parse_provider_plan,
             list_workflows,
             create_workflow,
             record_action,
+            record_actions,
             finalize_recording,
             list_permissions,
             grant_permission,
@@ -3482,35 +3991,177 @@ mod tests {
     }
     #[test]
     fn provider_commands_are_restricted() {
-        let (_, args) = provider_invocation("codex", "plan", &[]).unwrap();
-        assert!(args.contains(&"read-only".to_string()));
-        assert!(args.contains(&"--skip-git-repo-check".to_string()));
+        let invocation = provider_invocation("codex", "plan", &[]).unwrap();
+        assert!(invocation.args.contains(&"read-only".to_string()));
+        assert!(invocation
+            .args
+            .contains(&"--skip-git-repo-check".to_string()));
+        assert!(invocation.args.contains(&"--ignore-user-config".to_string()));
+        assert!(invocation.args.contains(&"never".to_string()));
+        assert_eq!(invocation.args.last().map(String::as_str), Some("-"));
+        assert_eq!(invocation.stdin.as_deref(), Some("plan"));
+    }
+    #[test]
+    fn recognizes_windows_command_wrappers() {
+        assert!(is_windows_command_script(Path::new("C:/npm/codex.cmd")));
+        assert!(is_windows_command_script(Path::new("C:/npm/codex.BAT")));
+        assert!(!is_windows_command_script(Path::new("C:/bin/codex.exe")));
+    }
+    #[test]
+    fn ignores_extensionless_windows_npm_shim() {
+        let selected = select_resolved_command(
+            vec![
+                PathBuf::from("C:/Users/test/AppData/Roaming/npm/codex"),
+                PathBuf::from("C:/Users/test/AppData/Roaming/npm/codex.cmd"),
+            ],
+            true,
+        );
+        assert_eq!(
+            selected.as_deref(),
+            Some(Path::new("C:/Users/test/AppData/Roaming/npm/codex.cmd"))
+        );
+    }
+    #[test]
+    fn builds_cmd_wrapper_without_c_runtime_quote_escaping() {
+        let resolved = windows_command_script_process(
+            Path::new("C:/Users/Test User/AppData/Roaming/npm/codex.cmd"),
+            &["exec".into(), "--json".into()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(resolved.args, ["/D", "/S", "/C"]);
+        assert_eq!(
+            resolved.windows_raw_argument.as_deref(),
+            Some(
+                "\"\"C:/Users/Test User/AppData/Roaming/npm/codex.cmd\" \"exec\" \"--json\"\""
+            )
+        );
+        assert!(!resolved
+            .windows_raw_argument
+            .as_deref()
+            .unwrap()
+            .contains("\\\""));
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn executes_cmd_wrapper_from_path_with_spaces() {
+        let directory = std::env::temp_dir().join(format!(
+            "Alfred provider wrapper {}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let script = directory.join("codex.cmd");
+        fs::write(&script, "@echo off\r\necho [%~1][%~2]\r\n").unwrap();
+        let resolved = windows_command_script_process(
+            &script,
+            &["alpha beta".into(), "gamma".into()],
+            true,
+        )
+        .unwrap();
+        let mut process = Command::new(resolved.program);
+        process.args(resolved.args);
+        process.raw_arg(resolved.windows_raw_argument.unwrap());
+        let output = process.output().unwrap();
+        let _ = fs::remove_dir_all(&directory);
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "[alpha beta][gamma]");
+    }
+    #[test]
+    fn parses_codex_jsonl_plan() {
+        let output = vec![serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": "{\"steps\":[{\"title\":\"Open Notepad\",\"application\":\"Notepad\",\"method\":\"launchApplication\",\"targetLabel\":\"Notepad\",\"params\":{}},{\"title\":\"Type greeting\",\"application\":\"Notepad\",\"method\":\"typeText\",\"targetLabel\":\"Editor\",\"params\":{\"text\":\"Hello from Alfred\"}}]}"
+            }
+        })
+        .to_string()];
+        let steps = parse_provider_plan_output(&output).unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].kind, "launchApplication");
+        assert_eq!(steps[1].kind, "typeText");
+    }
+    #[test]
+    fn rejects_destructive_provider_plan() {
+        let output = vec![
+            "{\"steps\":[{\"title\":\"Delete note\",\"application\":\"Notepad\",\"method\":\"invokeElement\",\"targetLabel\":\"Delete\",\"params\":{}}]}".into(),
+        ];
+        assert!(parse_provider_plan_output(&output)
+            .unwrap_err()
+            .contains("blocked"));
+    }
+    #[test]
+    fn rejects_edited_unsafe_launch_and_delete_key() {
+        let unsafe_launch = WorkflowStep {
+            id: "one".into(),
+            title: "Open PowerShell".into(),
+            kind: "launchApplication".into(),
+            effect: "modify_reversible".into(),
+            application: Some("PowerShell".into()),
+            intent: Some("launch application".into()),
+            target_label: Some("PowerShell".into()),
+            payload: Some(serde_json::json!({})),
+            timeout_ms: default_timeout(),
+            retries: default_retries(),
+            wait_for: None,
+            expect: None,
+            save_as: None,
+        };
+        assert!(validate_workflow_step(&unsafe_launch)
+            .unwrap_err()
+            .contains("cannot safely launch"));
+
+        let delete_key = WorkflowStep {
+            id: "two".into(),
+            title: "Press Delete".into(),
+            kind: "key".into(),
+            effect: "modify_reversible".into(),
+            application: Some("Notepad".into()),
+            intent: Some("press key".into()),
+            target_label: Some("Editor".into()),
+            payload: Some(serde_json::json!({"virtualKey": 46})),
+            timeout_ms: default_timeout(),
+            retries: default_retries(),
+            wait_for: None,
+            expect: None,
+            save_as: None,
+        };
+        assert!(validate_workflow_step(&delete_key)
+            .unwrap_err()
+            .contains("Delete key"));
     }
     #[test]
     fn codex_attaches_images_before_the_prompt() {
         let images = vec![PathBuf::from("/tmp/a.png"), PathBuf::from("/tmp/b.png")];
-        let (_, args) = provider_invocation("codex", "plan", &images).unwrap();
-        let flag = args.iter().position(|arg| arg == "--image").unwrap();
-        assert_eq!(args[flag + 1], "/tmp/a.png,/tmp/b.png");
-        assert_eq!(args.last().map(String::as_str), Some("plan"));
+        let invocation = provider_invocation("codex", "plan", &images).unwrap();
+        let flag = invocation
+            .args
+            .iter()
+            .position(|arg| arg == "--image")
+            .unwrap();
+        assert_eq!(invocation.args[flag + 1], "/tmp/a.png,/tmp/b.png");
+        // The prompt travels over stdin; "-" stays the final argument.
+        assert_eq!(invocation.args.last().map(String::as_str), Some("-"));
+        assert_eq!(invocation.stdin.as_deref(), Some("plan"));
         // No images, no flag.
-        let (_, plain) = provider_invocation("codex", "plan", &[]).unwrap();
-        assert!(!plain.iter().any(|arg| arg == "--image"));
+        let plain = provider_invocation("codex", "plan", &[]).unwrap();
+        assert!(!plain.args.iter().any(|arg| arg == "--image"));
     }
     #[test]
     fn copilot_attaches_images_as_attachments() {
         let images = vec![PathBuf::from("/tmp/a.png"), PathBuf::from("/tmp/b.png")];
-        let (_, args) = provider_invocation("copilot", "plan", &images).unwrap();
-        let flags: Vec<_> = args
+        let invocation = provider_invocation("copilot", "plan", &images).unwrap();
+        let flags: Vec<_> = invocation
+            .args
             .iter()
             .filter(|arg| arg.as_str() == "--attachment")
             .collect();
         assert_eq!(flags.len(), 2);
-        assert!(args.iter().any(|arg| arg == "/tmp/a.png"));
-        assert!(args.iter().any(|arg| arg == "/tmp/b.png"));
+        assert!(invocation.args.iter().any(|arg| arg == "/tmp/a.png"));
+        assert!(invocation.args.iter().any(|arg| arg == "/tmp/b.png"));
         // Path-delivery providers keep clean args; their pipe is the prompt text.
-        let (_, grok) = provider_invocation("grok", "plan", &images).unwrap();
-        assert!(!grok.iter().any(|arg| arg.contains("a.png")));
+        let grok = provider_invocation("grok", "plan", &images).unwrap();
+        assert!(!grok.args.iter().any(|arg| arg.contains("a.png")));
         assert!(matches!(
             provider_image_delivery("codex"),
             Some(ImageDelivery::Flag)

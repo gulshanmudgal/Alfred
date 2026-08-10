@@ -14,6 +14,7 @@ internal sealed record HostRequest(
     string Method,
     string? CapabilityToken,
     JsonElement? Params,
+    string? Application,
     string? Intent,
     string? Target);
 
@@ -22,6 +23,18 @@ internal static class Program
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     private static readonly string ExpectedToken = Environment.GetEnvironmentVariable("ALFRED_CAPABILITY_TOKEN") ?? "";
     private static readonly string[] DestructiveWords = ["delete", "remove", "erase", "trash", "purge", "wipe", "shred", "overwrite", "empty recycle"];
+
+    // Only these applications may be launched by name; everything else is refused.
+    private static readonly IReadOnlyDictionary<string, string> LaunchTargets = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Notepad"] = "notepad.exe",
+        ["Calculator"] = "calc.exe",
+        ["Paint"] = "mspaint.exe",
+        ["File Explorer"] = "explorer.exe",
+        ["Microsoft Edge"] = "msedge.exe",
+        ["Google Chrome"] = "chrome.exe",
+        ["Brave"] = "brave.exe"
+    };
 
     // Keystrokes Alfred may send: Backspace, Tab, Enter, Escape, Space, PageUp/Down,
     // End, Home, arrow keys, and F1-F12. Deletion (VK_DELETE) and every unlisted key
@@ -116,16 +129,18 @@ internal static class Program
         "health" => new { host = "windows", version = "0.2.0", processId = Environment.ProcessId },
         "listApplications" => ListApplications(),
         "resolveApplication" => ResolveApplication(GetString(request.Params, "name")),
-        "observeWindow" => ObserveWindow(GetInt(request.Params, "processId")),
-        "captureWindow" => CaptureWindow(GetInt(request.Params, "processId")),
-        "activate" => Activate(GetInt(request.Params, "processId")),
-        "invokeElement" => InvokeElement(request.Params),
-        "setValue" => SetElementValue(request.Params),
-        "findElement" => FindElementInfo(request.Params),
-        "getValue" => GetElementValue(request.Params),
-        "click" => Click(GetInt(request.Params, "x"), GetInt(request.Params, "y"), GetOptionalInt(request.Params, "processId")),
-        "typeText" => TypeText(GetString(request.Params, "text"), GetOptionalInt(request.Params, "processId")),
-        "key" => PressKey(GetInt(request.Params, "virtualKey"), GetOptionalInt(request.Params, "processId")),
+        "launchApplication" => LaunchApplication(request),
+        "focusApplication" => FocusApplication(request),
+        "activate" => Activate(ResolveProcess(request).Id),
+        "observeWindow" => ObserveWindow(ResolveProcess(request).Id),
+        "captureWindow" => CaptureWindow(ResolveProcess(request).Id),
+        "findElement" => FindElementInfo(request),
+        "getValue" => GetElementValue(request),
+        "invokeElement" => InvokeElement(request),
+        "setValue" => SetElementValue(request),
+        "click" => Click(request, GetInt(request.Params, "x"), GetInt(request.Params, "y")),
+        "typeText" => TypeText(request, GetString(request.Params, "text")),
+        "key" => PressKey(request, GetInt(request.Params, "virtualKey")),
         _ => throw new InvalidOperationException($"Unsupported host method: {request.Method}")
     };
 
@@ -137,7 +152,7 @@ internal static class Program
             try
             {
                 if (process.MainWindowHandle == IntPtr.Zero) continue;
-                items.Add((process.Id, process.ProcessName, process.MainWindowTitle ?? ""));
+                items.Add((process.Id, process.ProcessName ?? "", process.MainWindowTitle ?? ""));
             }
             catch { /* The process exited or denies access; skip it. */ }
         }
@@ -146,6 +161,8 @@ internal static class Program
             .ToArray();
     }
 
+    // Token-scored name-to-window resolution used by Alfred Core for preflight and
+    // state conditions. LaunchTargets names resolve through their executable name.
     private static object ResolveApplication(string name)
     {
         var tokens = name.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
@@ -180,13 +197,49 @@ internal static class Program
         return new { processId = best.Value.id, name = best.Value.name, title = best.Value.title, matched = name };
     }
 
+    private static object LaunchApplication(HostRequest request)
+    {
+        var application = GetApplication(request);
+        if (!LaunchTargets.TryGetValue(application, out var executable))
+            throw new UnauthorizedAccessException($"Alfred is not allowed to launch {application}.");
+        var process = Process.Start(new ProcessStartInfo(executable) { UseShellExecute = true })
+            ?? throw new InvalidOperationException($"Windows could not launch {application}.");
+        try { process.WaitForInputIdle(5000); } catch { }
+        for (var attempt = 0; attempt < 40 && process.MainWindowHandle == IntPtr.Zero; attempt++)
+        {
+            Thread.Sleep(100);
+            process.Refresh();
+        }
+        if (process.MainWindowHandle == IntPtr.Zero)
+            process = FindApplicationProcess(application)
+                ?? throw new InvalidOperationException($"{application} launched without an accessible window.");
+        FocusProcess(process);
+        return new { launched = true, application, processId = process.Id, title = process.MainWindowTitle };
+    }
+
+    private static object FocusApplication(HostRequest request)
+    {
+        var process = ResolveProcess(request);
+        FocusProcess(process);
+        return new { focused = true, application = GetApplication(request), processId = process.Id, title = process.MainWindowTitle };
+    }
+
     private static object Activate(int processId)
     {
         var process = Process.GetProcessById(processId);
+        FocusProcess(process);
+        return new { activated = true, processId, title = process.MainWindowTitle };
+    }
+
+    // Brings the target window to the foreground and proves it stayed there before
+    // any input is sent. UIA SetFocus is attempted first; SetForegroundWindow is
+    // retried while Windows settles.
+    private static void FocusProcess(Process process)
+    {
         process.Refresh();
         var handle = process.MainWindowHandle;
         if (handle == IntPtr.Zero)
-            throw new InvalidOperationException("The application has no visible main window.");
+            throw new InvalidOperationException("The application does not have an accessible window.");
         if (IsIconic(handle)) ShowWindow(handle, SW_RESTORE);
         var deadline = DateTime.UtcNow.AddSeconds(5);
         var lastAttempt = DateTime.MinValue;
@@ -194,10 +247,14 @@ internal static class Program
         {
             var foreground = GetForegroundWindow();
             GetWindowThreadProcessId(foreground, out var foregroundPid);
-            if (foreground == handle || foregroundPid == (uint)processId)
-                return new { activated = true, processId, title = process.MainWindowTitle };
+            if (foreground == handle || foregroundPid == (uint)process.Id)
+            {
+                Thread.Sleep(150);
+                return;
+            }
             if ((DateTime.UtcNow - lastAttempt).TotalMilliseconds > 750)
             {
+                try { AutomationElement.FromHandle(handle)?.SetFocus(); } catch { }
                 SetForegroundWindow(handle);
                 BringWindowToTop(handle);
                 lastAttempt = DateTime.UtcNow;
@@ -207,22 +264,38 @@ internal static class Program
         throw new InvalidOperationException("Could not bring the target window to the foreground.");
     }
 
-    private static void RequireForeground(int processId)
+    private static Process ResolveProcess(HostRequest request)
     {
-        var foreground = GetForegroundWindow();
-        GetWindowThreadProcessId(foreground, out var foregroundPid);
-        if (foregroundPid == (uint)processId) return;
-        Activate(processId);
+        var processId = GetOptionalInt(request.Params, "processId");
+        if (processId.HasValue)
+            return Process.GetProcessById(processId.Value);
+        return FindApplicationProcess(GetApplication(request))
+            ?? throw new InvalidOperationException($"{GetApplication(request)} is not open.");
     }
 
-    private static void RequireInsideWindow(int processId, int x, int y)
+    private static Process? FindApplicationProcess(string application)
     {
-        var process = Process.GetProcessById(processId);
-        if (!GetWindowRect(process.MainWindowHandle, out var rect))
-            throw new InvalidOperationException("Could not read the target window bounds.");
-        if (x < rect.Left || x >= rect.Right || y < rect.Top || y >= rect.Bottom)
-            throw new InvalidOperationException("The recorded point is outside the target window; re-record this step.");
+        LaunchTargets.TryGetValue(application, out var executable);
+        var expectedName = Path.GetFileNameWithoutExtension(executable ?? application);
+        return Process.GetProcesses()
+            .Where(process => process.MainWindowHandle != IntPtr.Zero)
+            .OrderByDescending(process => process.Id)
+            .FirstOrDefault(process =>
+            {
+                try
+                {
+                    return process.ProcessName.Equals(expectedName, StringComparison.OrdinalIgnoreCase)
+                        || (process.MainWindowTitle ?? "").Contains(application, StringComparison.OrdinalIgnoreCase);
+                }
+                catch { return false; }
+            });
     }
+
+    private static string GetApplication(HostRequest request) =>
+        string.IsNullOrWhiteSpace(request.Application)
+            ? GetOptionalString(request.Params, "application")
+                ?? throw new InvalidOperationException("Missing application.")
+            : request.Application.Trim();
 
     private static object ObserveWindow(int processId)
     {
@@ -318,46 +391,16 @@ internal static class Program
         return field?.GetValue(null) as ControlType;
     }
 
-    private static object InvokeElement(JsonElement? parameters)
-    {
-        var processId = GetInt(parameters, "processId");
-        var process = Process.GetProcessById(processId);
-        var element = FindElement(process,
-            GetOptionalString(parameters, "automationId"),
-            GetOptionalString(parameters, "name"),
-            GetOptionalString(parameters, "controlType"));
-        if (!element.TryGetCurrentPattern(InvokePattern.Pattern, out var pattern))
-            throw new InvalidOperationException("The UI element is not invokable.");
-        ((InvokePattern)pattern).Invoke();
-        return new { invoked = true };
-    }
-
-    private static object SetElementValue(JsonElement? parameters)
-    {
-        var processId = GetInt(parameters, "processId");
-        var value = GetString(parameters, "value");
-        var process = Process.GetProcessById(processId);
-        var element = FindElement(process,
-            GetOptionalString(parameters, "automationId"),
-            GetOptionalString(parameters, "name"),
-            GetOptionalString(parameters, "controlType"));
-        if (!element.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern))
-            throw new InvalidOperationException("The UI element does not accept direct values; use activate plus typeText.");
-        ((ValuePattern)pattern).SetValue(value);
-        return new { set = true, characters = value.Length };
-    }
-
     // Never throws for a missing element: presence checks drive wait/precondition logic.
-    private static object FindElementInfo(JsonElement? parameters)
+    private static object FindElementInfo(HostRequest request)
     {
-        var processId = GetInt(parameters, "processId");
         try
         {
-            var process = Process.GetProcessById(processId);
+            var process = ResolveProcess(request);
             var element = FindElement(process,
-                GetOptionalString(parameters, "automationId"),
-                GetOptionalString(parameters, "name"),
-                GetOptionalString(parameters, "controlType"));
+                GetOptionalString(request.Params, "automationId"),
+                GetOptionalString(request.Params, "name"),
+                GetOptionalString(request.Params, "controlType"));
             var bounds = element.Current.BoundingRectangle;
             return new
             {
@@ -374,14 +417,13 @@ internal static class Program
         }
     }
 
-    private static object GetElementValue(JsonElement? parameters)
+    private static object GetElementValue(HostRequest request)
     {
-        var processId = GetInt(parameters, "processId");
-        var process = Process.GetProcessById(processId);
+        var process = ResolveProcess(request);
         var element = FindElement(process,
-            GetOptionalString(parameters, "automationId"),
-            GetOptionalString(parameters, "name"),
-            GetOptionalString(parameters, "controlType"));
+            GetOptionalString(request.Params, "automationId"),
+            GetOptionalString(request.Params, "name"),
+            GetOptionalString(request.Params, "controlType"));
         if (element.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern))
             return new { value = ((ValuePattern)pattern).Current.Value };
         var name = element.Current.Name;
@@ -389,49 +431,82 @@ internal static class Program
         throw new InvalidOperationException("The UI element exposes no readable value.");
     }
 
-    private static object Click(int x, int y, int? processId)
+    private static object InvokeElement(HostRequest request)
     {
-        if (processId is int target)
+        var process = ResolveProcess(request);
+        var element = FindElement(process,
+            GetOptionalString(request.Params, "automationId"),
+            GetOptionalString(request.Params, "name"),
+            GetOptionalString(request.Params, "controlType"));
+        if (!element.TryGetCurrentPattern(InvokePattern.Pattern, out var pattern))
+            throw new InvalidOperationException("The UI element is not invokable.");
+        ((InvokePattern)pattern).Invoke();
+        return new { invoked = true };
+    }
+
+    private static object SetElementValue(HostRequest request)
+    {
+        var value = GetString(request.Params, "value");
+        var process = ResolveProcess(request);
+        var element = FindElement(process,
+            GetOptionalString(request.Params, "automationId"),
+            GetOptionalString(request.Params, "name"),
+            GetOptionalString(request.Params, "controlType"));
+        if (!element.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern))
+            throw new InvalidOperationException("The UI element does not accept direct values; use activate plus typeText.");
+        ((ValuePattern)pattern).SetValue(value);
+        return new { set = true, characters = value.Length };
+    }
+
+    private static void RequireInsideWindow(int processId, int x, int y)
+    {
+        var process = Process.GetProcessById(processId);
+        if (!GetWindowRect(process.MainWindowHandle, out var rect))
+            throw new InvalidOperationException("Could not read the target window bounds.");
+        if (x < rect.Left || x >= rect.Right || y < rect.Top || y >= rect.Bottom)
+            throw new InvalidOperationException("The recorded point is outside the target window; re-record this step.");
+    }
+
+    private static object Click(HostRequest request, int x, int y)
+    {
+        if (!string.IsNullOrWhiteSpace(request.Application) || GetOptionalInt(request.Params, "processId").HasValue)
         {
-            RequireForeground(target);
-            RequireInsideWindow(target, x, y);
+            var process = ResolveProcess(request);
+            FocusProcess(process);
+            RequireInsideWindow(process.Id, x, y);
         }
         SetCursorPos(x, y);
         Send([MouseInput(MOUSEEVENTF_LEFTDOWN), MouseInput(MOUSEEVENTF_LEFTUP)]);
-        return new { clicked = true, x, y, processId };
+        return new { clicked = true, x, y };
     }
 
-    private static object TypeText(string text, int? processId)
+    private static object TypeText(HostRequest request, string text)
     {
-        if (processId is int target) RequireForeground(target);
+        FocusProcess(ResolveProcess(request));
         foreach (var character in text)
             Send([KeyboardInput(character, false), KeyboardInput(character, true)]);
-        return new { typed = true, characters = text.Length, processId };
+        return new { typed = true, characters = text.Length };
     }
 
-    private static object PressKey(int virtualKey, int? processId)
+    private static object PressKey(HostRequest request, int virtualKey)
     {
         if (virtualKey == VK_DELETE)
-            throw new InvalidOperationException("The Delete key is never automated; it can destroy data in the focused application.");
+            throw new UnauthorizedAccessException("The Delete key is blocked by Alfred's deletion policy.");
         if (!AllowedVirtualKeys.Contains(virtualKey))
             throw new InvalidOperationException($"Virtual key 0x{virtualKey:X2} is not in Alfred's allowed key set.");
-        if (processId is int target) RequireForeground(target);
+        FocusProcess(ResolveProcess(request));
         Send([VirtualKeyInput((ushort)virtualKey, false), VirtualKeyInput((ushort)virtualKey, true)]);
-        return new { pressed = true, virtualKey, processId };
+        return new { pressed = true, virtualKey };
     }
 
     private static int GetInt(JsonElement? value, string property) =>
         value?.GetProperty(property).GetInt32() ?? throw new InvalidOperationException($"Missing {property}.");
+    private static int? GetOptionalInt(JsonElement? value, string property) =>
+        value.HasValue && value.Value.TryGetProperty(property, out var item) && item.TryGetInt32(out var result) ? result : null;
     private static string GetString(JsonElement? value, string property) =>
         value?.GetProperty(property).GetString() ?? throw new InvalidOperationException($"Missing {property}.");
-    private static int? GetOptionalInt(JsonElement? value, string property) =>
-        value is JsonElement element && element.TryGetProperty(property, out var found) && found.ValueKind == JsonValueKind.Number
-            ? found.GetInt32()
-            : null;
     private static string? GetOptionalString(JsonElement? value, string property) =>
-        value is JsonElement element && element.TryGetProperty(property, out var found) && found.ValueKind == JsonValueKind.String
-            ? found.GetString()
-            : null;
+        value.HasValue && value.Value.TryGetProperty(property, out var item) ? item.GetString() : null;
     private static void Reply(object value) { Console.Out.WriteLine(JsonSerializer.Serialize(value, Json)); Console.Out.Flush(); }
 
     private static INPUT MouseInput(uint flags) => new() { type = INPUT_MOUSE, U = new InputUnion { mi = new MOUSEINPUT { dwFlags = flags } } };

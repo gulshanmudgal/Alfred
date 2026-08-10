@@ -28,7 +28,7 @@ Alfred is a local-first desktop workflow agent for repetitive work across applic
 | Planner vision (per-turn screenshots to the CLI) | Implemented for Codex (`--image`), Copilot (`--attachment`), Grok and Cursor (prompt-listed file paths); opt-in setting, off by default |
 | Workflow YAML recording, replay, pause/stop, and recovery | Implemented with per-step app re-resolution, retries, timeouts, a single-run lock, wait/expect state conditions, cross-app variables, and mid-run approval prompts; full cross-application validation is pending |
 | Scheduling | Implemented in the core; Windows Task Scheduler validation is pending |
-| Windows MSI/NSIS packaging | Build scripts and CI are present; installers are unsigned and pre-release |
+| Windows portable ZIP plus MSI/NSIS packaging | Build scripts and CI are present; binaries are unsigned and pre-release |
 | macOS native application control and screen capture | Not implemented; Swift host contract only |
 
 ## Architecture
@@ -49,7 +49,17 @@ flowchart LR
 
 The provider CLI is a planner, not an executor. It never receives direct access to keyboard, pointer, UI Automation, screen-capture, browser Native Messaging, or filesystem mutation APIs. Every action is validated by Alfred Core before a short-lived capability is sent to a native executor. See [Architecture](docs/ARCHITECTURE.md) for the trust boundary.
 
-## Prerequisites
+## Normal-user launch on Windows
+
+Normal users do **not** need Visual Studio, Build Tools, Rust, Node.js, or the .NET SDK. Download `alfred.ps1` and launch Alfred from PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\alfred.ps1
+```
+
+The launcher downloads the latest prebuilt portable release into `%LOCALAPPDATA%\Alfred`, verifies its SHA-256 checksum when published, and opens the GUI. Future launches reuse the local copy; pass `-Update` to fetch the latest release. Windows on Arm is supported through Windows' x64 application emulation while a native Arm64 build is pending. A supported, signed-in planner CLI such as Codex is still required for real planning.
+
+## Developer prerequisites
 
 ### Windows 11 (primary platform)
 
@@ -70,7 +80,7 @@ Tauri's official [Windows prerequisites](https://v2.tauri.app/start/prerequisite
 
 The shell, GUI, policy core, workflow library, provider adapters, and Keychain integration can run on macOS. Native Mac application observation, screenshots, clicks, and typing remain blocked until the Swift host is implemented.
 
-## Quick start
+## Developer quick start
 
 Clone the repository:
 
@@ -82,7 +92,7 @@ cd Alfred
 On Windows PowerShell:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\alfred.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1
 ```
 
 On macOS:
@@ -92,7 +102,7 @@ chmod +x ./alfred
 ./alfred
 ```
 
-The launcher installs JavaScript dependencies on the first run. Alfred then opens its GUI, where you choose a provider, workflow-library folder, screenshot-retention policy, and application permissions.
+The development launcher installs JavaScript dependencies on the first run. Alfred then opens its GUI, where you choose a provider, workflow-library folder, screenshot-retention policy, and application permissions.
 
 ## Provider setup
 
@@ -111,7 +121,7 @@ Provider CLI flags and authentication behavior can change between releases. Veri
 
 ## Installed-browser bridge (Windows)
 
-1. Build Alfred once with `alfred.ps1`.
+1. Install a packaged or portable Alfred build, or start a development build with `scripts/dev.ps1`.
 2. Open `edge://extensions` (or the equivalent Chrome/Brave page).
 3. Enable **Developer mode**, select **Load unpacked**, and choose `browser/chromium-extension`.
 4. Copy the generated extension ID.
@@ -154,7 +164,7 @@ Run the complete Windows desktop smoke test in an interactive Windows 11 session
 .\scripts\windows\test-e2e.ps1
 ```
 
-Build MSI and NSIS packages:
+Build the portable ZIP plus MSI and NSIS packages:
 
 ```powershell
 .\scripts\windows\package.ps1

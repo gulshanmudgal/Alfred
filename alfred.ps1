@@ -1,25 +1,55 @@
+param([switch]$Update)
+
 $ErrorActionPreference = "Stop"
-$AlfredRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $AlfredRoot
+$Repository = "gulshanmudgal/Alfred"
+$InstallRoot = Join-Path $env:LOCALAPPDATA "Alfred\versions"
+$CurrentPointer = Join-Path $env:LOCALAPPDATA "Alfred\current.txt"
 
-if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-    Write-Error "Alfred needs Node.js 20 or newer. Install Node.js, then run this command again."
+function Start-Alfred([string]$Executable) {
+    if (-not (Test-Path $Executable)) { return $false }
+    Start-Process -FilePath $Executable
+    return $true
 }
 
-if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-    Write-Error "Alfred needs the stable Rust toolchain. Install Rust from https://rustup.rs and try again."
+if (-not $Update -and (Test-Path $CurrentPointer)) {
+    $CurrentExecutable = (Get-Content $CurrentPointer -Raw).Trim()
+    if (Start-Alfred $CurrentExecutable) { exit 0 }
 }
 
-if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
-    Write-Error "Alfred needs the .NET 10 SDK for its Windows automation host. Install it, then run this command again."
+Write-Host "Finding the latest Alfred Windows release..."
+$Headers = @{ "User-Agent" = "Alfred-Windows-Launcher"; "Accept" = "application/vnd.github+json" }
+$Release = Invoke-RestMethod -Headers $Headers -Uri "https://api.github.com/repos/$Repository/releases/latest"
+$AssetName = "Alfred-Windows-x64-portable.zip"
+$Asset = $Release.assets | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
+if (-not $Asset) {
+    throw "The latest Alfred release does not contain $AssetName. Ask the project owner to publish a Windows portable build."
 }
 
-if (-not (Test-Path "node_modules")) {
-    Write-Host "Preparing Alfred for first launch…"
-    npm install
+$Version = $Release.tag_name -replace '[^0-9A-Za-z._-]', '-'
+$VersionRoot = Join-Path $InstallRoot $Version
+$Executable = Join-Path $VersionRoot "Alfred.exe"
+if (-not (Test-Path $Executable)) {
+    New-Item -ItemType Directory -Force -Path $VersionRoot | Out-Null
+    $Archive = Join-Path $env:TEMP "Alfred-$Version-x64.zip"
+    Write-Host "Downloading Alfred $($Release.tag_name)..."
+    Invoke-WebRequest -Headers $Headers -Uri $Asset.browser_download_url -OutFile $Archive
+
+    $ChecksumAsset = $Release.assets | Where-Object { $_.name -eq "$AssetName.sha256" } | Select-Object -First 1
+    if ($ChecksumAsset) {
+        $ChecksumFile = "$Archive.sha256"
+        Invoke-WebRequest -Headers $Headers -Uri $ChecksumAsset.browser_download_url -OutFile $ChecksumFile
+        $Expected = ((Get-Content $ChecksumFile -Raw).Trim() -split '\s+')[0]
+        $Actual = (Get-FileHash -Algorithm SHA256 $Archive).Hash
+        if ($Expected -ne $Actual) { throw "The Alfred download failed its SHA-256 verification." }
+    }
+
+    Expand-Archive -Path $Archive -DestinationPath $VersionRoot -Force
 }
 
-dotnet build native/windows-host/Alfred.WindowsHost.csproj -c Debug
-$env:ALFRED_WINDOWS_HOST_PATH = (Resolve-Path "native/windows-host/bin/Debug/net10.0-windows/win-x64/alfred-windows-host.exe").Path
-
-npm run alfred
+if (-not (Test-Path $Executable)) {
+    throw "The portable release is invalid because Alfred.exe is missing."
+}
+New-Item -ItemType Directory -Force -Path (Split-Path $CurrentPointer -Parent) | Out-Null
+Set-Content -Path $CurrentPointer -Value $Executable -Encoding UTF8
+Write-Host "Launching Alfred $($Release.tag_name). No developer toolchain is required."
+Start-Alfred $Executable | Out-Null

@@ -22,8 +22,8 @@ $hostProcess = [Diagnostics.Process]::new()
 $hostProcess.StartInfo = $startInfo
 if (-not $hostProcess.Start()) { throw "Could not start Alfred Windows host." }
 
-function Invoke-AlfredHost([string]$Method, [hashtable]$Params = @{}, [string]$Intent = "observe", [string]$Target = "") {
-  $message = @{ id = [guid]::NewGuid().ToString(); method = $Method; capabilityToken = $token; params = $Params; intent = $Intent; target = $Target } | ConvertTo-Json -Compress -Depth 10
+function Invoke-AlfredHost([string]$Method, [hashtable]$Params = @{}, [string]$Intent = "observe", [string]$Target = "", [string]$Application = "") {
+  $message = @{ id = [guid]::NewGuid().ToString(); method = $Method; capabilityToken = $token; params = $Params; application = $Application; intent = $Intent; target = $Target } | ConvertTo-Json -Compress -Depth 10
   $hostProcess.StandardInput.WriteLine($message)
   $hostProcess.StandardInput.Flush()
   $line = $hostProcess.StandardOutput.ReadLine()
@@ -41,40 +41,48 @@ try {
   Write-Host "PASS destructive-action defense in depth"
 
   # The host refuses these before any input is sent, so they are safe on headless CI.
-  $deleteKey = Invoke-AlfredHost "key" @{ virtualKey = 46 } "press key" "File list"
-  if ($deleteKey.ok) { throw "The Delete key (VK 0x2E) was not blocked by the host." }
-  $unknownKey = Invoke-AlfredHost "key" @{ virtualKey = 0x5B } "press key" "Desktop"
+  $blockedLaunch = Invoke-AlfredHost "launchApplication" @{} "launch application" "PowerShell" "PowerShell"
+  if ($blockedLaunch.ok -or $blockedLaunch.error -notmatch "not allowed") { throw "Application launch allowlist did not reject the test request." }
+  Write-Host "PASS application launch allowlist"
+
+  $blockedDeleteKey = Invoke-AlfredHost "key" @{ virtualKey = 46 } "press key" "Keyboard input" "Notepad"
+  if ($blockedDeleteKey.ok -or $blockedDeleteKey.error -notmatch "Delete key is blocked") { throw "Delete-key guard did not reject the test request." }
+  Write-Host "PASS Delete-key defense in depth"
+
+  $unknownKey = Invoke-AlfredHost "key" @{ virtualKey = 0x5B } "press key" "Desktop" "Notepad"
   if ($unknownKey.ok) { throw "An unlisted virtual key was not refused by the host." }
-  Write-Host "PASS raw virtual-key policy (Delete blocked, unlisted keys refused)"
+  Write-Host "PASS virtual-key allow-list"
 
   if (-not $SkipDesktop) {
-    $notepad = Start-Process notepad.exe -PassThru
-    Start-Sleep -Seconds 2
+    $launched = Invoke-AlfredHost "launchApplication" @{} "launch approved application" "Notepad" "Notepad"
+    if (-not $launched.ok -or -not $launched.result.processId) { throw "Semantic application launch failed." }
+    $notepadId = [int]$launched.result.processId
     $apps = Invoke-AlfredHost "listApplications"
-    $app = $apps.result | Where-Object { $_.processId -eq $notepad.Id } | Select-Object -First 1
+    $app = $apps.result | Where-Object { $_.processId -eq $notepadId } | Select-Object -First 1
     if (-not $app) { throw "Notepad was not visible to the Windows host." }
-    $resolved = Invoke-AlfredHost "resolveApplication" @{ name = "notepad" }
-    if (-not $resolved.ok -or $resolved.result.processId -ne $notepad.Id) { throw "Application name resolution returned the wrong process." }
+    $resolved = Invoke-AlfredHost "resolveApplication" @{ name = "Notepad" }
+    if (-not $resolved.ok -or $resolved.result.processId -ne $notepadId) { throw "Application name resolution returned the wrong process." }
     Write-Host "PASS application name resolution"
-    if (-not (Invoke-AlfredHost "activate" @{ processId = $notepad.Id }).ok) { throw "Window activation failed." }
-    Write-Host "PASS window activation and foreground verification"
-    $tree = Invoke-AlfredHost "observeWindow" @{ processId = $notepad.Id }
+    $focused = Invoke-AlfredHost "focusApplication" @{ processId = $notepadId } "focus approved application" "Notepad" "Notepad"
+    if (-not $focused.ok) { throw "Semantic application focus failed." }
+    Write-Host "PASS window focus and foreground verification"
+    $tree = Invoke-AlfredHost "observeWindow" @{ processId = $notepadId } "observe Notepad" "Notepad" "Notepad"
     if (-not $tree.ok -or -not $tree.result.bounds) { throw "UI Automation observation failed." }
-    $capture = Invoke-AlfredHost "captureWindow" @{ processId = $notepad.Id }
+    $capture = Invoke-AlfredHost "captureWindow" @{ processId = $notepadId } "capture Notepad" "Notepad" "Notepad"
     if (-not $capture.ok -or $capture.result.base64.Length -lt 1000) { throw "Window capture did not return PNG evidence." }
     $x = [int]($tree.result.bounds.x + [Math]::Max(80, $tree.result.bounds.width / 2))
     $y = [int]($tree.result.bounds.y + [Math]::Max(100, $tree.result.bounds.height / 2))
-    if (-not (Invoke-AlfredHost "click" @{ x = $x; y = $y; processId = $notepad.Id } "focus Notepad editor" "Editor").ok) { throw "Targeted pointer input failed." }
-    if (-not (Invoke-AlfredHost "typeText" @{ text = "Alfred Windows end-to-end smoke test"; processId = $notepad.Id } "type smoke-test text" "Notepad editor").ok) { throw "Targeted keyboard input failed." }
-    if (-not (Invoke-AlfredHost "key" @{ virtualKey = 13; processId = $notepad.Id } "press enter" "Editor").ok) { throw "Allowed key (Enter) was rejected." }
-    $outside = Invoke-AlfredHost "click" @{ x = -32000; y = -32000; processId = $notepad.Id } "click target" "Editor"
+    if (-not (Invoke-AlfredHost "click" @{ x = $x; y = $y; processId = $notepadId } "focus Notepad editor" "Editor" "Notepad").ok) { throw "Targeted pointer input failed." }
+    if (-not (Invoke-AlfredHost "typeText" @{ text = "Alfred Windows end-to-end smoke test"; processId = $notepadId } "type smoke-test text" "Notepad editor" "Notepad").ok) { throw "Targeted keyboard input failed." }
+    if (-not (Invoke-AlfredHost "key" @{ virtualKey = 13; processId = $notepadId } "press enter" "Editor" "Notepad").ok) { throw "Allowed key (Enter) was rejected." }
+    $outside = Invoke-AlfredHost "click" @{ x = -32000; y = -32000; processId = $notepadId } "click target" "Editor" "Notepad"
     if ($outside.ok) { throw "A click outside the target window bounds was not refused." }
     Write-Host "PASS targeted input, bounds validation, and key allow-list"
-    $found = Invoke-AlfredHost "findElement" @{ processId = $notepad.Id; controlType = "ControlType.Edit" }
+    $found = Invoke-AlfredHost "findElement" @{ processId = $notepadId; controlType = "ControlType.Edit" } "locate editor" "Notepad" "Notepad"
     if (-not $found.ok -or -not $found.result.found) { throw "findElement did not locate the Notepad editor." }
-    $missing = Invoke-AlfredHost "findElement" @{ processId = $notepad.Id; name = "Alfred element that does not exist 9f3b2" }
+    $missing = Invoke-AlfredHost "findElement" @{ processId = $notepadId; name = "Alfred element that does not exist 9f3b2" } "locate missing" "Notepad" "Notepad"
     if (-not $missing.ok -or $missing.result.found) { throw "findElement must report found=false (not throw) for absent elements." }
-    $read = Invoke-AlfredHost "getValue" @{ processId = $notepad.Id; controlType = "ControlType.Edit" }
+    $read = Invoke-AlfredHost "getValue" @{ processId = $notepadId; controlType = "ControlType.Edit" } "read editor" "Notepad" "Notepad"
     if ($read.ok -and $read.result.value -match "smoke test") { Write-Host "PASS findElement presence checks and getValue data capture" }
     else { Write-Host "PASS findElement presence checks (getValue unsupported by this Notepad build; tolerated)" }
     Write-Host "Notepad is intentionally left open with unsaved test text; no persistent data was deleted."
