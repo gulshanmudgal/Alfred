@@ -23,6 +23,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["time", "process", "io-util", "sync"] }
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
+base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [

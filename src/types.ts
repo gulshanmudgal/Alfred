@@ -6,6 +6,7 @@ export interface AppSettings {
   libraryPath: string;
   screenshotRetention: "all" | "failures" | "none";
   theme: "system" | "light" | "dark";
+  shareScreenshotsWithPlanner: boolean;
 }
 
 export interface SystemInfo {
@@ -24,6 +25,14 @@ export interface ProviderStatus {
   credentialStored: boolean;
 }
 
+export interface StepCondition {
+  automationId?: string;
+  name?: string;
+  controlType?: string;
+  urlContains?: string;
+  absent?: boolean;
+}
+
 export interface WorkflowStep {
   id: string;
   title: string;
@@ -35,6 +44,9 @@ export interface WorkflowStep {
   payload?: Record<string, unknown>;
   timeoutMs: number;
   retries: number;
+  waitFor?: StepCondition;
+  expect?: StepCondition;
+  saveAs?: string;
 }
 
 export interface PermissionGrant {

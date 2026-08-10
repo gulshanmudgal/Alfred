@@ -23,6 +23,21 @@ internal static class Program
     private static readonly string ExpectedToken = Environment.GetEnvironmentVariable("ALFRED_CAPABILITY_TOKEN") ?? "";
     private static readonly string[] DestructiveWords = ["delete", "remove", "erase", "trash", "purge", "wipe", "shred", "overwrite", "empty recycle"];
 
+    // Keystrokes Alfred may send: Backspace, Tab, Enter, Escape, Space, PageUp/Down,
+    // End, Home, arrow keys, and F1-F12. Deletion (VK_DELETE) and every unlisted key
+    // are refused so raw virtual-key codes can never bypass the semantic safety policy.
+    private const int VK_DELETE = 0x2E;
+    private static readonly HashSet<int> AllowedVirtualKeys =
+    [
+        0x08, 0x09, 0x0D, 0x1B, 0x20,
+        0x21, 0x22, 0x23, 0x24,
+        0x25, 0x26, 0x27, 0x28,
+        0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B
+    ];
+
+    private const int SW_RESTORE = 9;
+    private const uint PW_RENDERFULLCONTENT = 0x00000002;
+
     [STAThread]
     private static async Task Main(string[] args)
     {
@@ -98,21 +113,116 @@ internal static class Program
 
     private static object Dispatch(HostRequest request) => request.Method switch
     {
-        "health" => new { host = "windows", version = "0.1.0", processId = Environment.ProcessId },
+        "health" => new { host = "windows", version = "0.2.0", processId = Environment.ProcessId },
         "listApplications" => ListApplications(),
+        "resolveApplication" => ResolveApplication(GetString(request.Params, "name")),
         "observeWindow" => ObserveWindow(GetInt(request.Params, "processId")),
         "captureWindow" => CaptureWindow(GetInt(request.Params, "processId")),
+        "activate" => Activate(GetInt(request.Params, "processId")),
         "invokeElement" => InvokeElement(request.Params),
-        "click" => Click(GetInt(request.Params, "x"), GetInt(request.Params, "y")),
-        "typeText" => TypeText(GetString(request.Params, "text")),
-        "key" => PressKey(GetInt(request.Params, "virtualKey")),
+        "setValue" => SetElementValue(request.Params),
+        "findElement" => FindElementInfo(request.Params),
+        "getValue" => GetElementValue(request.Params),
+        "click" => Click(GetInt(request.Params, "x"), GetInt(request.Params, "y"), GetOptionalInt(request.Params, "processId")),
+        "typeText" => TypeText(GetString(request.Params, "text"), GetOptionalInt(request.Params, "processId")),
+        "key" => PressKey(GetInt(request.Params, "virtualKey"), GetOptionalInt(request.Params, "processId")),
         _ => throw new InvalidOperationException($"Unsupported host method: {request.Method}")
     };
 
-    private static object ListApplications() => Process.GetProcesses()
-        .Where(p => p.MainWindowHandle != IntPtr.Zero)
-        .Select(p => new { processId = p.Id, name = p.ProcessName, title = p.MainWindowTitle })
-        .OrderBy(p => p.name).ToArray();
+    private static object ListApplications()
+    {
+        var items = new List<(int id, string name, string title)>();
+        foreach (var process in Process.GetProcesses())
+        {
+            try
+            {
+                if (process.MainWindowHandle == IntPtr.Zero) continue;
+                items.Add((process.Id, process.ProcessName, process.MainWindowTitle ?? ""));
+            }
+            catch { /* The process exited or denies access; skip it. */ }
+        }
+        return items.OrderBy(item => item.name)
+            .Select(item => new { processId = item.id, name = item.name, title = item.title })
+            .ToArray();
+    }
+
+    private static object ResolveApplication(string name)
+    {
+        var tokens = name.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(token => token.Length >= 3)
+            .Select(token => token.ToLowerInvariant())
+            .ToArray();
+        if (tokens.Length == 0)
+            throw new InvalidOperationException("An application name is required to resolve a window.");
+        var lowered = name.ToLowerInvariant();
+        (int id, string name, string title, int score)? best = null;
+        foreach (var process in Process.GetProcesses())
+        {
+            try
+            {
+                if (process.MainWindowHandle == IntPtr.Zero) continue;
+                var processName = (process.ProcessName ?? "").ToLowerInvariant();
+                var title = (process.MainWindowTitle ?? "").ToLowerInvariant();
+                var score = processName == lowered ? 100 : 0;
+                foreach (var token in tokens)
+                {
+                    if (processName.Contains(token)) score += 10;
+                    if (title.Contains(token)) score += 5;
+                }
+                if (score == 0) continue;
+                if (best is null || score > best.Value.score)
+                    best = (process.Id, process.ProcessName ?? "", process.MainWindowTitle ?? "", score);
+            }
+            catch { /* The process exited or denies access; skip it. */ }
+        }
+        if (best is null)
+            throw new InvalidOperationException($"No running application window matches \"{name}\".");
+        return new { processId = best.Value.id, name = best.Value.name, title = best.Value.title, matched = name };
+    }
+
+    private static object Activate(int processId)
+    {
+        var process = Process.GetProcessById(processId);
+        process.Refresh();
+        var handle = process.MainWindowHandle;
+        if (handle == IntPtr.Zero)
+            throw new InvalidOperationException("The application has no visible main window.");
+        if (IsIconic(handle)) ShowWindow(handle, SW_RESTORE);
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        var lastAttempt = DateTime.MinValue;
+        while (DateTime.UtcNow < deadline)
+        {
+            var foreground = GetForegroundWindow();
+            GetWindowThreadProcessId(foreground, out var foregroundPid);
+            if (foreground == handle || foregroundPid == (uint)processId)
+                return new { activated = true, processId, title = process.MainWindowTitle };
+            if ((DateTime.UtcNow - lastAttempt).TotalMilliseconds > 750)
+            {
+                SetForegroundWindow(handle);
+                BringWindowToTop(handle);
+                lastAttempt = DateTime.UtcNow;
+            }
+            Thread.Sleep(100);
+        }
+        throw new InvalidOperationException("Could not bring the target window to the foreground.");
+    }
+
+    private static void RequireForeground(int processId)
+    {
+        var foreground = GetForegroundWindow();
+        GetWindowThreadProcessId(foreground, out var foregroundPid);
+        if (foregroundPid == (uint)processId) return;
+        Activate(processId);
+    }
+
+    private static void RequireInsideWindow(int processId, int x, int y)
+    {
+        var process = Process.GetProcessById(processId);
+        if (!GetWindowRect(process.MainWindowHandle, out var rect))
+            throw new InvalidOperationException("Could not read the target window bounds.");
+        if (x < rect.Left || x >= rect.Right || y < rect.Top || y >= rect.Bottom)
+            throw new InvalidOperationException("The recorded point is outside the target window; re-record this step.");
+    }
 
     private static object ObserveWindow(int processId)
     {
@@ -143,57 +253,185 @@ internal static class Program
     private static object CaptureWindow(int processId)
     {
         var process = Process.GetProcessById(processId);
-        if (!GetWindowRect(process.MainWindowHandle, out var rect))
+        var handle = process.MainWindowHandle;
+        if (handle == IntPtr.Zero)
+            throw new InvalidOperationException("The application window is unavailable.");
+        if (IsIconic(handle))
+            throw new InvalidOperationException("The target window is minimized; run an activate step first.");
+        if (!GetWindowRect(handle, out var rect))
             throw new InvalidOperationException("Could not read the window bounds.");
         var width = Math.Max(1, rect.Right - rect.Left);
         var height = Math.Max(1, rect.Bottom - rect.Top);
         using var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
         using (var graphics = Graphics.FromImage(bitmap))
-            graphics.CopyFromScreen(rect.Left, rect.Top, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
+        {
+            // PrintWindow captures the window itself, so evidence cannot accidentally
+            // include an overlapping window from another application. Some GPU-rendered
+            // windows refuse it; fall back to reading the screen region for those.
+            var hdc = graphics.GetHdc();
+            var rendered = PrintWindow(handle, hdc, PW_RENDERFULLCONTENT);
+            graphics.ReleaseHdc(hdc);
+            if (!rendered)
+                graphics.CopyFromScreen(rect.Left, rect.Top, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
+        }
         using var output = new MemoryStream();
         bitmap.Save(output, ImageFormat.Png);
         return new { mimeType = "image/png", width, height, base64 = Convert.ToBase64String(output.ToArray()) };
     }
 
+    private static AutomationElement FindElement(Process process, string? automationId, string? name, string? controlType)
+    {
+        var root = AutomationElement.FromHandle(process.MainWindowHandle)
+            ?? throw new InvalidOperationException("The application window is unavailable.");
+        if (!string.IsNullOrEmpty(automationId))
+        {
+            var byId = root.FindFirst(TreeScope.Descendants,
+                new PropertyCondition(AutomationElement.AutomationIdProperty, automationId));
+            if (byId is not null) return byId;
+            if (string.IsNullOrEmpty(name))
+                throw new InvalidOperationException("The requested UI element was not found.");
+        }
+        if (!string.IsNullOrEmpty(name))
+        {
+            Condition condition = new PropertyCondition(AutomationElement.NameProperty, name);
+            var type = ParseControlType(controlType);
+            if (type is not null)
+                condition = new AndCondition(condition, new PropertyCondition(AutomationElement.ControlTypeProperty, type));
+            var byName = root.FindFirst(TreeScope.Descendants, condition);
+            if (byName is not null) return byName;
+        }
+        else if (ParseControlType(controlType) is ControlType onlyType)
+        {
+            var byType = root.FindFirst(TreeScope.Descendants,
+                new PropertyCondition(AutomationElement.ControlTypeProperty, onlyType));
+            if (byType is not null) return byType;
+        }
+        throw new InvalidOperationException("The requested UI element was not found.");
+    }
+
+    private static ControlType? ParseControlType(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        var shortName = value.Replace("ControlType.", "");
+        var field = typeof(ControlType).GetField(shortName,
+            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+        return field?.GetValue(null) as ControlType;
+    }
+
     private static object InvokeElement(JsonElement? parameters)
     {
         var processId = GetInt(parameters, "processId");
-        var automationId = GetString(parameters, "automationId");
         var process = Process.GetProcessById(processId);
-        var root = AutomationElement.FromHandle(process.MainWindowHandle);
-        var element = root.FindFirst(TreeScope.Descendants,
-            new PropertyCondition(AutomationElement.AutomationIdProperty, automationId))
-            ?? throw new InvalidOperationException("The requested UI element was not found.");
+        var element = FindElement(process,
+            GetOptionalString(parameters, "automationId"),
+            GetOptionalString(parameters, "name"),
+            GetOptionalString(parameters, "controlType"));
         if (!element.TryGetCurrentPattern(InvokePattern.Pattern, out var pattern))
             throw new InvalidOperationException("The UI element is not invokable.");
         ((InvokePattern)pattern).Invoke();
-        return new { invoked = true, automationId };
+        return new { invoked = true };
     }
 
-    private static object Click(int x, int y)
+    private static object SetElementValue(JsonElement? parameters)
     {
+        var processId = GetInt(parameters, "processId");
+        var value = GetString(parameters, "value");
+        var process = Process.GetProcessById(processId);
+        var element = FindElement(process,
+            GetOptionalString(parameters, "automationId"),
+            GetOptionalString(parameters, "name"),
+            GetOptionalString(parameters, "controlType"));
+        if (!element.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern))
+            throw new InvalidOperationException("The UI element does not accept direct values; use activate plus typeText.");
+        ((ValuePattern)pattern).SetValue(value);
+        return new { set = true, characters = value.Length };
+    }
+
+    // Never throws for a missing element: presence checks drive wait/precondition logic.
+    private static object FindElementInfo(JsonElement? parameters)
+    {
+        var processId = GetInt(parameters, "processId");
+        try
+        {
+            var process = Process.GetProcessById(processId);
+            var element = FindElement(process,
+                GetOptionalString(parameters, "automationId"),
+                GetOptionalString(parameters, "name"),
+                GetOptionalString(parameters, "controlType"));
+            var bounds = element.Current.BoundingRectangle;
+            return new
+            {
+                found = true,
+                name = element.Current.Name,
+                automationId = element.Current.AutomationId,
+                controlType = element.Current.ControlType?.ProgrammaticName,
+                bounds = new { x = bounds.X, y = bounds.Y, width = bounds.Width, height = bounds.Height }
+            };
+        }
+        catch
+        {
+            return new { found = false, name = "", automationId = "", controlType = "" };
+        }
+    }
+
+    private static object GetElementValue(JsonElement? parameters)
+    {
+        var processId = GetInt(parameters, "processId");
+        var process = Process.GetProcessById(processId);
+        var element = FindElement(process,
+            GetOptionalString(parameters, "automationId"),
+            GetOptionalString(parameters, "name"),
+            GetOptionalString(parameters, "controlType"));
+        if (element.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern))
+            return new { value = ((ValuePattern)pattern).Current.Value };
+        var name = element.Current.Name;
+        if (!string.IsNullOrEmpty(name)) return new { value = name };
+        throw new InvalidOperationException("The UI element exposes no readable value.");
+    }
+
+    private static object Click(int x, int y, int? processId)
+    {
+        if (processId is int target)
+        {
+            RequireForeground(target);
+            RequireInsideWindow(target, x, y);
+        }
         SetCursorPos(x, y);
         Send([MouseInput(MOUSEEVENTF_LEFTDOWN), MouseInput(MOUSEEVENTF_LEFTUP)]);
-        return new { clicked = true, x, y };
+        return new { clicked = true, x, y, processId };
     }
 
-    private static object TypeText(string text)
+    private static object TypeText(string text, int? processId)
     {
+        if (processId is int target) RequireForeground(target);
         foreach (var character in text)
             Send([KeyboardInput(character, false), KeyboardInput(character, true)]);
-        return new { typed = true, characters = text.Length };
+        return new { typed = true, characters = text.Length, processId };
     }
 
-    private static object PressKey(int virtualKey)
+    private static object PressKey(int virtualKey, int? processId)
     {
+        if (virtualKey == VK_DELETE)
+            throw new InvalidOperationException("The Delete key is never automated; it can destroy data in the focused application.");
+        if (!AllowedVirtualKeys.Contains(virtualKey))
+            throw new InvalidOperationException($"Virtual key 0x{virtualKey:X2} is not in Alfred's allowed key set.");
+        if (processId is int target) RequireForeground(target);
         Send([VirtualKeyInput((ushort)virtualKey, false), VirtualKeyInput((ushort)virtualKey, true)]);
-        return new { pressed = true, virtualKey };
+        return new { pressed = true, virtualKey, processId };
     }
 
     private static int GetInt(JsonElement? value, string property) =>
         value?.GetProperty(property).GetInt32() ?? throw new InvalidOperationException($"Missing {property}.");
     private static string GetString(JsonElement? value, string property) =>
         value?.GetProperty(property).GetString() ?? throw new InvalidOperationException($"Missing {property}.");
+    private static int? GetOptionalInt(JsonElement? value, string property) =>
+        value is JsonElement element && element.TryGetProperty(property, out var found) && found.ValueKind == JsonValueKind.Number
+            ? found.GetInt32()
+            : null;
+    private static string? GetOptionalString(JsonElement? value, string property) =>
+        value is JsonElement element && element.TryGetProperty(property, out var found) && found.ValueKind == JsonValueKind.String
+            ? found.GetString()
+            : null;
     private static void Reply(object value) { Console.Out.WriteLine(JsonSerializer.Serialize(value, Json)); Console.Out.Flush(); }
 
     private static INPUT MouseInput(uint flags) => new() { type = INPUT_MOUSE, U = new InputUnion { mi = new MOUSEINPUT { dwFlags = flags } } };
@@ -215,4 +453,11 @@ internal static class Program
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
     [DllImport("user32.dll")] private static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll", SetLastError = true)] private static extern uint SendInput(uint count, INPUT[] inputs, int size);
+    [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+    [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] private static extern bool BringWindowToTop(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
 }

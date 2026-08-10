@@ -16,6 +16,32 @@ Every proposed action follows this path:
 
 Deletion and persistent-data-loss decisions are `hard_deny` and cannot be changed through settings.
 
+## Agent loop (goal runs)
+
+A goal run closes the observe → plan → act loop with the provider inside the trust boundary:
+
+1. Core observes every target application (UIA control summaries; DOM element refs for the pinned browser tab).
+2. Core sends the goal, the observation bundle, and the capped action history to a fresh, sandboxed provider process (one process per turn; state lives in Core, not the CLI; stop kills the turn via `kill_on_drop`).
+3. The provider replies with exactly one JSON action or `done`. Core parses tolerantly (whole output, trailing JSON lines, widest brace span).
+4. The action is executed through the same policy gate as recorded steps. `request_user` parks the run in a `waiting` checkpoint until the user approves (durable grant + one-step override) or stops; `hard_deny` is absolute.
+5. Outcomes append to the history and the loop repeats.
+
+Guardrails: a machine-wide run lock, a per-run step limit, a consecutive-failure breaker, an optional human check-in cadence (the run pauses for review), and fail-closed exit for unattended scheduled runs that hit a `waiting` state.
+
+### Prompt-injection posture
+
+Observations contain untrusted content (web page text, window titles), so planner output is treated as adversarial by construction: the declared `effect` is never trusted — Core derives a floor from the method (mutating methods can never run as `observe`, which would skip the permission grant), destructive language and the Delete key are hard-denied regardless of phrasing, unknown effects park for human approval, and every action is scoped to the user-granted applications. The planner can therefore never authorize anything on its own; it can only propose.
+
+### Visual grounding (opt-in)
+
+Text observations miss canvas-rendered and image-heavy content. When the user enables **Share screenshots with the planner**, each turn also captures one image per target application (`PrintWindow` for native windows, visible-tab capture for the browser) into a per-run folder under the app-data directory. The models behind every supported CLI are multimodal; only the delivery pipe differs per CLI, and each pipe is verified before Alfred uses it:
+
+- **Codex**: attached with `-i/--image <FILE>...`.
+- **Copilot**: attached with `--attachment <path>` (valid in the non-interactive `-p` mode Alfred uses).
+- **Grok / Cursor**: no image flag exists, but their built-in file-reading tools hand image files to the multimodal model — verified live against the Grok CLI (a single `read_file` on a screenshot returned full visual understanding, including embedded text). Alfred lists the screenshot paths in the prompt for these providers.
+
+Captures double as cockpit evidence. Because images leave the device to the provider's API, the setting defaults to off. Retention follows the existing screenshot policy (`all` / `failures` / `none`), the folder prunes to the newest dozen files during a run, and stale folders are swept at startup.
+
 ## Processes
 
 ### Desktop shell

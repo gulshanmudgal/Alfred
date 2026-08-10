@@ -109,3 +109,10 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   :root { color: #ececf0; background: #17171b; --ink: #ececf0; --muted: #a3a4ad; --subtle: #777983; --line: #33343b; --surface: #222329; --canvas: #191a1f; --purple-light: #302b4e; }
   .app-shell, .page, .cockpit { background: var(--canvas); }.sidebar, .topbar, .workflow-card, .panel-surface, .modal-panel, .empty-state, .settings-section, .settings-save, .provider-option, .capability-row, .retention-option, .protection-grid > div { background: #222329; }.topbar { background: rgba(34,35,41,.86); }.search-box, .nav-item:hover, .workflow-card-footer button, .shortcut-preview, .settings-path, .settings-section select { background: #292a31; }.nav-item.active { background: #342f52; color: #b7aafa; }.command-card { background: linear-gradient(120deg,#25262c,#292640); }.field-label input, .field-label textarea, .path-picker > div, .path-picker input, .steer-bar { color: var(--ink); background: #292a31; }.fake-page, .fake-address { background: #fdfdfd; color: #26272d; }.onboarding-main { background: #1d1e23; }.onboarding-footer { background: rgba(34,35,41,.85); }.setup-step h1 { color: var(--ink); }.secondary-button { color: #d0d1d7; background: #292a31; }.onboarding-content { background: #1d1e23; }.modal-backdrop { background: rgba(8,8,12,.65); }
 }
+.approval-banner { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 14px; padding: 14px 18px; border-left: 4px solid #b98a1d; }
+.approval-banner strong { display: block; font-size: 13px; }
+.approval-banner span { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; }
+.goal-launcher-fields input { width: 100%; margin-top: 8px; padding: 10px 12px; border: 1px solid #dddde3; border-radius: 9px; outline: 0; font-size: 12px; background: #fcfcfd; }
+.goal-launcher-fields input:focus { border-color: #8b79e5; box-shadow: 0 0 0 3px #eeeaff; }
+.toggle-row { display: flex; align-items: center; gap: 9px; margin-top: 10px; font-size: 11px; color: var(--ink); }
+.toggle-row input { width: 15px; height: 15px; accent-color: #6d5bd0; }

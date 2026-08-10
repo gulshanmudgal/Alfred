@@ -26,6 +26,10 @@
         element.dispatchEvent(new Event("change", { bubbles: true }));
         return { typed: true, characters: message.text.length };
       }
+      if (message.method === "getText") {
+        const text = (("value" in element ? element.value : element.innerText?.trim()) || label(element)).slice(0, 2000);
+        return { text };
+      }
       throw new Error(`Unsupported browser method: ${message.method}`);
     }).then(respond).catch(error => respond({ error: String(error.message ?? error) }));
     return true;

@@ -7,8 +7,9 @@ use std::{
     io::{BufRead, BufReader as StdBufReader, Write},
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::{Arc, Mutex},
+    process::{Child, Command, Stdio},
+    sync::{mpsc, Arc, Mutex},
+    time::Duration,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -22,13 +23,70 @@ struct RuntimeState {
     provider_pids: Arc<Mutex<HashMap<String, u32>>>,
     native_host: Arc<Mutex<Option<NativeHostProcess>>>,
     run_controls: Arc<Mutex<HashMap<String, String>>>,
+    /// One-step policy overrides granted by the user at the "waiting" prompt:
+    /// run_id -> step_id. Lets an approved request_user step pass once, including
+    /// unknown-effect steps that no permission grant could cover. hard_deny is
+    /// never overridable.
+    approved_overrides: Arc<Mutex<HashMap<String, String>>>,
 }
 
+/// The host speaks newline-delimited JSON on stdio. A dedicated worker thread owns
+/// the pipes so callers can time out a stuck request, kill the host, and recover
+/// instead of blocking the automation runtime forever.
 struct NativeHostProcess {
     child: Child,
-    stdin: ChildStdin,
-    stdout: StdBufReader<ChildStdout>,
+    to_host: mpsc::Sender<String>,
+    from_host: mpsc::Receiver<Result<String, String>>,
     capability_token: String,
+}
+
+fn spawn_native_host(app: &AppHandle) -> Result<NativeHostProcess, String> {
+    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let mut child = Command::new(native_host_executable(app)?)
+        .env("ALFRED_CAPABILITY_TOKEN", &token)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Could not open native-host input.".to_string())?;
+    let mut stdout = StdBufReader::new(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| "Could not open native-host output.".to_string())?,
+    );
+    let (to_host, worker_inbox) = mpsc::channel::<String>();
+    let (worker_outbox, from_host) = mpsc::channel::<Result<String, String>>();
+    std::thread::spawn(move || {
+        while let Ok(line) = worker_inbox.recv() {
+            let result = (|| {
+                writeln!(stdin, "{line}").map_err(|error| error.to_string())?;
+                stdin.flush().map_err(|error| error.to_string())?;
+                let mut response = String::new();
+                stdout
+                    .read_line(&mut response)
+                    .map_err(|error| error.to_string())?;
+                if response.is_empty() {
+                    return Err("The native host closed the connection.".to_string());
+                }
+                Ok(response)
+            })();
+            let failed = result.is_err();
+            if worker_outbox.send(result).is_err() || failed {
+                break;
+            }
+        }
+    });
+    Ok(NativeHostProcess {
+        child,
+        to_host,
+        from_host,
+        capability_token: token,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +97,11 @@ pub struct AppSettings {
     library_path: String,
     screenshot_retention: String,
     theme: String,
+    /// Screenshots leave the machine when attached to a cloud planner CLI, so
+    /// visual grounding is opt-in. Only providers with verified image-input
+    /// support (Codex today) receive attachments; others stay text-only.
+    #[serde(default)]
+    share_screenshots_with_planner: bool,
 }
 
 impl Default for AppSettings {
@@ -49,6 +112,7 @@ impl Default for AppSettings {
             library_path: String::new(),
             screenshot_retention: "failures".into(),
             theme: "system".into(),
+            share_screenshots_with_planner: false,
         }
     }
 }
@@ -86,6 +150,24 @@ pub struct BrowserCommand {
     params: Value,
 }
 
+/// A state check evaluated against the target application (UIA element lookup for
+/// native steps, DOM observation for browser steps). `absent` inverts the match,
+/// e.g. "wait until the progress dialog is gone".
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StepCondition {
+    #[serde(default)]
+    automation_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    control_type: Option<String>,
+    #[serde(default)]
+    url_contains: Option<String>,
+    #[serde(default)]
+    absent: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowStep {
@@ -105,6 +187,18 @@ pub struct WorkflowStep {
     timeout_ms: u64,
     #[serde(default = "default_retries")]
     retries: u8,
+    /// Polled before acting; the step fails if the condition is not met in time.
+    #[serde(default)]
+    wait_for: Option<StepCondition>,
+    /// Checked before every attempt (an already-satisfied end state skips the
+    /// action, which makes resume idempotent) and waited for after each action.
+    #[serde(default)]
+    expect: Option<StepCondition>,
+    /// Name of a run-scoped variable that captures this step's result value.
+    /// Later steps reference it as `${name}` inside payload strings, which is how
+    /// data moves from one application to another.
+    #[serde(default)]
+    save_as: Option<String>,
 }
 
 fn default_timeout() -> u64 {
@@ -382,7 +476,32 @@ fn detect_providers() -> Vec<ProviderStatus> {
         .collect()
 }
 
-fn provider_invocation(provider: &str, prompt: &str) -> Result<(String, Vec<String>), String> {
+/// How a provider CLI receives images. The models behind every supported CLI are
+/// multimodal; only the delivery pipe differs:
+/// - Flag: Codex `-i/--image <FILE>...`, Copilot `--attachment <path>` (valid in
+///   the non-interactive -p mode Alfred uses).
+/// - PromptPaths: Grok and Cursor have no image flag, but their built-in
+///   file-reading tools hand image files to the multimodal model (verified live
+///   against the Grok CLI: a single read_file call returned full visual
+///   understanding). For these, Alfred lists the screenshot paths in the prompt.
+enum ImageDelivery {
+    Flag,
+    PromptPaths,
+}
+
+fn provider_image_delivery(provider: &str) -> Option<ImageDelivery> {
+    match provider {
+        "codex" | "copilot" => Some(ImageDelivery::Flag),
+        "grok" | "cursor" => Some(ImageDelivery::PromptPaths),
+        _ => None,
+    }
+}
+
+fn provider_invocation(
+    provider: &str,
+    prompt: &str,
+    images: &[PathBuf],
+) -> Result<(String, Vec<String>), String> {
     let args = match provider {
         "codex" => vec![
             "exec",
@@ -398,39 +517,62 @@ fn provider_invocation(provider: &str, prompt: &str) -> Result<(String, Vec<Stri
         "grok" => vec!["-p", prompt, "--output-format", "streaming-json"],
         _ => return Err(format!("Unknown provider: {provider}")),
     };
+    let mut args: Vec<String> = args.into_iter().map(str::to_string).collect();
+    if !images.is_empty() {
+        match provider {
+            "codex" => {
+                // codex takes `-i/--image <FILE>...` (comma-separated); it must
+                // precede the positional prompt argument.
+                let joined = images
+                    .iter()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let prompt_arg = args.pop();
+                args.push("--image".into());
+                args.push(joined);
+                if let Some(prompt_arg) = prompt_arg {
+                    args.push(prompt_arg);
+                }
+            }
+            // copilot takes one --attachment <path> per image; in -p mode flags
+            // may trail the prompt.
+            "copilot" => {
+                for image in images {
+                    args.push("--attachment".into());
+                    args.push(image.to_string_lossy().to_string());
+                }
+            }
+            _ => {}
+        }
+    }
     let command = provider_definitions()
         .into_iter()
         .find(|item| item.0 == provider)
         .map(|item| item.2)
         .ok_or_else(|| format!("Unknown provider: {provider}"))?;
-    Ok((
-        command.into(),
-        args.into_iter().map(str::to_string).collect(),
-    ))
+    Ok((command.into(), args))
 }
 
-#[tauri::command]
-async fn start_provider_run(
-    app: AppHandle,
-    state: State<'_, RuntimeState>,
-    provider: String,
-    prompt: String,
-    working_directory: Option<String>,
-) -> Result<String, String> {
-    if prompt.trim().is_empty() {
-        return Err("The provider prompt cannot be empty.".into());
-    }
-    let (command, args) = provider_invocation(&provider, &prompt)?;
-    let mut process = tokio::process::Command::new(&command);
+/// Builds a supervised provider CLI invocation: non-interactive, sandboxed, with
+/// the OS-vault credential injected into the environment. Shared by design-time
+/// planning sessions and runtime agent-loop turns.
+fn provider_command(
+    provider: &str,
+    prompt: &str,
+    images: &[PathBuf],
+) -> Result<tokio::process::Command, String> {
+    let (command, args) = provider_invocation(provider, prompt, images)?;
+    let mut process = tokio::process::Command::new(command);
     process
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    if let Ok(secret) = vault_entry(&provider)
+    if let Ok(secret) = vault_entry(provider)
         .and_then(|entry| entry.get_password().map_err(|error| error.to_string()))
     {
-        match provider.as_str() {
+        match provider {
             "codex" => {
                 process.env("OPENAI_API_KEY", secret);
             }
@@ -446,6 +588,21 @@ async fn start_provider_run(
             _ => {}
         }
     }
+    Ok(process)
+}
+
+#[tauri::command]
+async fn start_provider_run(
+    app: AppHandle,
+    state: State<'_, RuntimeState>,
+    provider: String,
+    prompt: String,
+    working_directory: Option<String>,
+) -> Result<String, String> {
+    if prompt.trim().is_empty() {
+        return Err("The provider prompt cannot be empty.".into());
+    }
+    let mut process = provider_command(&provider, &prompt, &[])?;
     if let Some(directory) = working_directory.filter(|value| !value.trim().is_empty()) {
         process.current_dir(directory);
     }
@@ -748,6 +905,22 @@ pub fn evaluate_base_policy(request: &ActionRequest) -> ActionDecision {
             rule: "persistent-data-loss".into(),
         };
     }
+    // Raw virtual-key codes are a non-semantic channel: keyword filters cannot see
+    // what 0x2E does, so the policy must. The Delete key can destroy data in the
+    // focused application and is denied outright; the native host independently
+    // enforces an allow-list of safe keys as defense in depth.
+    let virtual_key = request
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("virtualKey"))
+        .and_then(Value::as_i64);
+    if virtual_key == Some(0x2E) {
+        return ActionDecision {
+            decision: "hard_deny".into(),
+            reason: "Alfred blocked the Delete key. Deletion keystrokes are never automated.".into(),
+            rule: "persistent-data-loss".into(),
+        };
+    }
     if effect == "unknown" {
         return ActionDecision {
             decision: "request_user".into(),
@@ -764,6 +937,34 @@ pub fn evaluate_base_policy(request: &ActionRequest) -> ActionDecision {
 
 fn read_permissions(app: &AppHandle) -> Result<Vec<PermissionGrant>, String> {
     read_json_or_default(&permissions_path(app)?)
+}
+
+/// Observation methods never change state; everything else does. A declared
+/// effect is untrusted input — a planner can be prompt-injected, and a YAML file
+/// can be hand-edited — so the floor comes from the method: mutating methods can
+/// never run as "observe", which would skip the permission grant entirely.
+fn kind_is_observe(kind: &str) -> bool {
+    matches!(
+        kind.to_ascii_lowercase().as_str(),
+        "browser.observe"
+            | "browser.capturevisible"
+            | "observewindow"
+            | "capturewindow"
+            | "findelement"
+            | "getvalue"
+            | "browser.gettext"
+            | "listapplications"
+            | "resolveapplication"
+            | "health"
+    )
+}
+
+fn effective_effect(kind: &str, declared: &str) -> String {
+    if declared == "observe" && !kind_is_observe(kind) {
+        "unknown".into()
+    } else {
+        declared.to_string()
+    }
 }
 
 #[tauri::command]
@@ -885,8 +1086,11 @@ fn browser_bridge_status(app: AppHandle) -> Result<bool, String> {
     Ok(browser_token_path(&app)?.exists() && connect_browser_bridge().is_ok())
 }
 
-#[tauri::command]
-fn send_browser_command(app: AppHandle, command: BrowserCommand) -> Result<Value, String> {
+fn send_browser_command_inner(
+    app: AppHandle,
+    command: BrowserCommand,
+    approval_override: bool,
+) -> Result<Value, String> {
     let decision = evaluate_action(
         app.clone(),
         ActionRequest {
@@ -900,7 +1104,8 @@ fn send_browser_command(app: AppHandle, command: BrowserCommand) -> Result<Value
             payload: Some(command.params.clone()),
         },
     )?;
-    if decision.decision != "allow" {
+    let overridden = approval_override && decision.decision == "request_user";
+    if decision.decision != "allow" && !overridden {
         return Err(format!("{}: {}", decision.decision, decision.reason));
     }
     let token = fs::read_to_string(browser_token_path(&app)?)
@@ -920,7 +1125,114 @@ fn send_browser_command(app: AppHandle, command: BrowserCommand) -> Result<Value
     StdBufReader::new(stream)
         .read_line(&mut line)
         .map_err(|error| error.to_string())?;
-    serde_json::from_str(&line).map_err(|error| error.to_string())
+    let value: Value = serde_json::from_str(&line).map_err(|error| error.to_string())?;
+    // The bridge reports failures inside the envelope; surface them so runs fail
+    // (and retry) honestly instead of treating a rejected command as success.
+    if value.get("ok").and_then(Value::as_bool) == Some(false) {
+        return Err(value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("Browser action failed.")
+            .to_string());
+    }
+    Ok(value)
+}
+
+#[tauri::command]
+fn send_browser_command(app: AppHandle, command: BrowserCommand) -> Result<Value, String> {
+    send_browser_command_inner(app, command, false)
+}
+
+fn substitute_text(text: &str, variables: &HashMap<String, String>) -> String {
+    let mut result = text.to_string();
+    for (key, replacement) in variables {
+        result = result.replace(&format!("${{{key}}}"), replacement);
+    }
+    result
+}
+
+/// Replaces `${name}` placeholders in every string of a step payload with values
+/// captured by earlier steps, so data can flow from one application into another.
+fn substitute_variables(value: &mut Value, variables: &HashMap<String, String>) {
+    match value {
+        Value::String(text) => *text = substitute_text(text, variables),
+        Value::Array(items) => {
+            for item in items {
+                substitute_variables(item, variables);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                substitute_variables(item, variables);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Pulls the savable value out of a step result: native actions return the result
+/// directly, browser actions wrap it in an envelope.
+fn extract_saved_value(value: &Value) -> Option<String> {
+    for key in ["value", "text", "label", "url", "title"] {
+        if let Some(found) = value.get(key).and_then(Value::as_str) {
+            return Some(found.to_string());
+        }
+        if let Some(found) = value
+            .get("result")
+            .and_then(|result| result.get(key))
+            .and_then(Value::as_str)
+        {
+            return Some(found.to_string());
+        }
+    }
+    None
+}
+
+/// What a request_user step is waiting for the user to decide. Persisted so the
+/// approval command can grant a durable permission for future runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingApproval {
+    step_id: String,
+    application: String,
+    effect: String,
+    intent: String,
+    reason: String,
+}
+
+fn approval_path(app: &AppHandle, run_id: &str) -> Result<PathBuf, String> {
+    Ok(checkpoints_dir(app)?.join(format!("{run_id}.approval.json")))
+}
+
+#[tauri::command]
+fn approve_run_step(app: AppHandle, run_id: String) -> Result<(), String> {
+    let path = approval_path(&app, &run_id)?;
+    let contents = fs::read_to_string(&path)
+        .map_err(|_| "This run is not waiting for approval.".to_string())?;
+    let pending: PendingApproval = serde_json::from_str(&contents).map_err(|error| error.to_string())?;
+    // A durable grant covers future runs of this application and effect kind...
+    let _ = grant_permission(
+        app.clone(),
+        pending.application.clone(),
+        vec![pending.effect.clone()],
+        Vec::new(),
+    );
+    // ...and a one-step override covers this step right now, including
+    // unknown-effect steps that no grant could authorize. hard_deny steps never
+    // reach this state, so they can never be overridden.
+    let state = app.state::<RuntimeState>();
+    state
+        .approved_overrides
+        .lock()
+        .map_err(|_| "Approval state is unavailable.")?
+        .insert(run_id.clone(), pending.step_id);
+    state
+        .run_controls
+        .lock()
+        .map_err(|_| "Run control state is unavailable.")?
+        .insert(run_id.clone(), "running".into());
+    let _ = fs::remove_file(&path);
+    Ok(())
 }
 
 fn native_host_executable(app: &AppHandle) -> Result<PathBuf, String> {
@@ -950,9 +1262,14 @@ fn execute_native_action_inner(
     state: &RuntimeState,
     request: ActionRequest,
     method: String,
+    timeout: Duration,
+    approval_override: bool,
 ) -> Result<Value, String> {
     let decision = evaluate_action(app.clone(), request.clone())?;
-    if decision.decision != "allow" {
+    // hard_deny is absolute; only request_user can be overridden by the explicit
+    // one-step approval the user grants at the mid-run waiting prompt.
+    let overridden = approval_override && decision.decision == "request_user";
+    if decision.decision != "allow" && !overridden {
         return Err(format!("{}: {}", decision.decision, decision.reason));
     }
     if !cfg!(windows) {
@@ -967,28 +1284,7 @@ fn execute_native_action_inner(
         .map(|host| host.child.try_wait().ok().flatten().is_some())
         .unwrap_or(true);
     if needs_start {
-        let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-        let mut child = Command::new(native_host_executable(app)?)
-            .env("ALFRED_CAPABILITY_TOKEN", &token)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| error.to_string())?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "Could not open native-host input.".to_string())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "Could not open native-host output.".to_string())?;
-        *guard = Some(NativeHostProcess {
-            child,
-            stdin,
-            stdout: StdBufReader::new(stdout),
-            capability_token: token,
-        });
+        *guard = Some(spawn_native_host(app)?);
     }
     let host = guard
         .as_mut()
@@ -998,12 +1294,32 @@ fn execute_native_action_inner(
         "method": method, "capabilityToken": host.capability_token, "params": request.payload.clone().unwrap_or_else(|| serde_json::json!({})),
         "intent": request.intent, "target": request.target_label
     });
-    writeln!(host.stdin, "{}", message).map_err(|error| error.to_string())?;
-    host.stdin.flush().map_err(|error| error.to_string())?;
-    let mut response = String::new();
-    host.stdout
-        .read_line(&mut response)
-        .map_err(|error| error.to_string())?;
+    if host.to_host.send(message.to_string()).is_err() {
+        *guard = None;
+        return Err("The native host is not responding; it will restart on the next action.".into());
+    }
+    let response = match host.from_host.recv_timeout(timeout) {
+        Ok(Ok(line)) => line,
+        Ok(Err(error)) => {
+            let _ = host.child.kill();
+            *guard = None;
+            return Err(error);
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // A hung target application must fail this one step, never freeze
+            // every run that shares the host. Kill and respawn on demand.
+            let _ = host.child.kill();
+            *guard = None;
+            return Err(format!(
+                "The native action timed out after {} ms; the host was restarted.",
+                timeout.as_millis()
+            ));
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            *guard = None;
+            return Err("The native host stopped responding.".into());
+        }
+    };
     let value: Value = serde_json::from_str(&response).map_err(|error| error.to_string())?;
     if value.get("ok").and_then(Value::as_bool) == Some(false) {
         return Err(value
@@ -1015,6 +1331,38 @@ fn execute_native_action_inner(
     Ok(value.get("result").cloned().unwrap_or(Value::Null))
 }
 
+/// Re-resolve a recorded application name to the process that owns its window
+/// right now. Recorded PIDs go stale and can even be reused by other programs,
+/// so replay always re-binds identity through this lookup.
+fn resolve_application_process_id(
+    app: &AppHandle,
+    state: &RuntimeState,
+    application: &str,
+) -> Result<i64, String> {
+    let request = ActionRequest {
+        protocol_version: protocol_version(),
+        run_id: "resolve".into(),
+        workflow_step: String::new(),
+        application: application.into(),
+        intent: format!("locate the running window for {application}"),
+        effect: "observe".into(),
+        target_label: Some(application.into()),
+        payload: Some(serde_json::json!({ "name": application })),
+    };
+    let value = execute_native_action_inner(
+        app,
+        state,
+        request,
+        "resolveApplication".into(),
+        Duration::from_secs(10),
+        false,
+    )?;
+    value
+        .get("processId")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| format!("Could not resolve a running window for {application}."))
+}
+
 #[tauri::command]
 fn execute_native_action(
     app: AppHandle,
@@ -1022,11 +1370,221 @@ fn execute_native_action(
     request: ActionRequest,
     method: String,
 ) -> Result<Value, String> {
-    execute_native_action_inner(&app, &state, request, method)
+    execute_native_action_inner(&app, &state, request, method, Duration::from_secs(30), false)
 }
 
 fn checkpoint_path(app: &AppHandle, run_id: &str) -> Result<PathBuf, String> {
     Ok(checkpoints_dir(app)?.join(format!("{run_id}.json")))
+}
+
+fn variables_path(app: &AppHandle, run_id: &str) -> Result<PathBuf, String> {
+    Ok(checkpoints_dir(app)?.join(format!("{run_id}.variables.json")))
+}
+
+fn load_variables(app: &AppHandle, run_id: &str) -> HashMap<String, String> {
+    variables_path(app, run_id)
+        .ok()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| serde_json::from_str(&contents).ok())
+        .unwrap_or_default()
+}
+
+fn save_variables(app: &AppHandle, run_id: &str, variables: &HashMap<String, String>) {
+    if let Ok(path) = variables_path(app, run_id) {
+        let _ = write_json(&path, variables);
+    }
+}
+
+/// Evaluates one step condition against live application state. Native steps use a
+/// UIA lookup in the resolved process; browser steps use a DOM observation of the
+/// pinned (or active) tab. `${variable}` placeholders are resolved first.
+fn evaluate_step_condition(
+    app: &AppHandle,
+    application: &str,
+    is_browser: bool,
+    condition: &StepCondition,
+    pinned_tab: Option<i64>,
+    variables: &HashMap<String, String>,
+) -> Result<bool, String> {
+    let found = if is_browser {
+        let mut params = serde_json::json!({});
+        if let (Some(tab), Value::Object(ref mut map)) = (pinned_tab, &mut params) {
+            map.insert("tabId".to_string(), Value::from(tab));
+        }
+        let value = send_browser_command_inner(
+            app.clone(),
+            BrowserCommand {
+                id: "condition-check".into(),
+                method: "observe".into(),
+                effect: "observe".into(),
+                intent: "check page state before continuing".into(),
+                target_label: None,
+                params,
+            },
+            false,
+        )?;
+        let result = value.get("result").cloned().unwrap_or(Value::Null);
+        let url_ok = condition
+            .url_contains
+            .as_deref()
+            .map(|needle| {
+                result
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .contains(&substitute_text(needle, variables).to_lowercase())
+            })
+            .unwrap_or(true);
+        let name_ok = condition
+            .name
+            .as_deref()
+            .map(|needle| {
+                let needle = substitute_text(needle, variables).to_lowercase();
+                result
+                    .get("elements")
+                    .and_then(Value::as_array)
+                    .map(|elements| {
+                        elements.iter().any(|element| {
+                            element
+                                .get("label")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_lowercase()
+                                .contains(&needle)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .unwrap_or(true);
+        url_ok && name_ok
+    } else {
+        let state = app.state::<RuntimeState>();
+        let pid = resolve_application_process_id(app, &state, application)?;
+        let mut params = serde_json::json!({ "processId": pid });
+        if let Value::Object(ref mut map) = params {
+            if let Some(id) = &condition.automation_id {
+                map.insert("automationId".into(), Value::from(id.as_str()));
+            }
+            if let Some(name) = &condition.name {
+                map.insert("name".into(), Value::from(substitute_text(name, variables)));
+            }
+            if let Some(control_type) = &condition.control_type {
+                map.insert("controlType".into(), Value::from(control_type.as_str()));
+            }
+        }
+        let request = ActionRequest {
+            protocol_version: protocol_version(),
+            run_id: "condition-check".into(),
+            workflow_step: String::new(),
+            application: application.into(),
+            intent: "check application state before continuing".into(),
+            effect: "observe".into(),
+            target_label: condition.name.clone(),
+            payload: Some(params),
+        };
+        let value = execute_native_action_inner(
+            app,
+            &state,
+            request,
+            "findElement".into(),
+            Duration::from_secs(10),
+            false,
+        )?;
+        value.get("found").and_then(Value::as_bool).unwrap_or(false)
+    };
+    Ok(if condition.absent { !found } else { found })
+}
+
+enum WaitOutcome {
+    Satisfied,
+    TimedOut,
+    Stopped,
+}
+
+/// Polls a condition until it holds or the deadline passes. Transient lookup
+/// errors (busy app, restarting host) keep the wait alive; stop/pause from the
+/// user are honored between polls.
+async fn wait_for_condition(
+    app: &AppHandle,
+    run_id: &str,
+    application: &str,
+    is_browser: bool,
+    condition: &StepCondition,
+    timeout: Duration,
+    pinned_tab: Option<i64>,
+    variables: &HashMap<String, String>,
+) -> WaitOutcome {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match run_mode(app, run_id).as_str() {
+            "stop" => return WaitOutcome::Stopped,
+            "paused" | "waiting" => {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                continue;
+            }
+            _ => {}
+        }
+        if let Ok(true) = evaluate_step_condition(
+            app,
+            application,
+            is_browser,
+            condition,
+            pinned_tab,
+            variables,
+        ) {
+            return WaitOutcome::Satisfied;
+        }
+        if std::time::Instant::now() >= deadline {
+            return WaitOutcome::TimedOut;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+// Keyboard focus is a machine-global resource, so only one workflow may drive the
+// computer at a time. The lock is a file (not just in-process state) because the
+// Windows Task Scheduler launches a separate Alfred process. A heartbeat keeps the
+// lock fresh; a lock whose heartbeat stopped is treated as abandoned after a crash.
+const RUN_LOCK_STALE_MINUTES: i64 = 10;
+
+fn run_lock_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app_data_dir(app)?.join("run.lock"))
+}
+
+fn read_run_lock(path: &Path) -> Option<(String, DateTime<Utc>)> {
+    let contents = fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&contents).ok()?;
+    let run_id = value.get("runId")?.as_str()?.to_string();
+    let updated = value.get("updatedAt")?.as_str()?.parse::<DateTime<Utc>>().ok()?;
+    Some((run_id, updated))
+}
+
+fn write_run_lock(path: &Path, run_id: &str) {
+    let body = serde_json::json!({ "runId": run_id, "updatedAt": Utc::now().to_rfc3339() });
+    let _ = atomic_write(path, body.to_string().as_bytes());
+}
+
+fn try_acquire_run_lock(path: &Path, run_id: &str) -> Result<(), String> {
+    if let Some((active_id, updated)) = read_run_lock(path) {
+        let fresh = Utc::now() - updated < chrono::Duration::minutes(RUN_LOCK_STALE_MINUTES);
+        if fresh && active_id != run_id {
+            return Err(
+                "Another Alfred run is currently driving this computer. Stop it or wait for it to finish."
+                    .into(),
+            );
+        }
+    }
+    write_run_lock(path, run_id);
+    Ok(())
+}
+
+fn release_run_lock(path: &Path, run_id: &str) {
+    if let Some((active_id, _)) = read_run_lock(path) {
+        if active_id == run_id {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 fn save_checkpoint(app: &AppHandle, checkpoint: &RunCheckpoint) -> Result<(), String> {
@@ -1044,6 +1602,151 @@ fn get_checkpoint(app: AppHandle, run_id: String) -> Result<Option<RunCheckpoint
     Ok(Some(checkpoint))
 }
 
+fn run_mode(app: &AppHandle, run_id: &str) -> String {
+    app.state::<RuntimeState>()
+        .run_controls
+        .lock()
+        .ok()
+        .and_then(|map| map.get(run_id).cloned())
+        .unwrap_or_else(|| "stop".into())
+}
+
+/// Waits while a run is paused. Returns true when the run must stop.
+async fn wait_if_paused(app: &AppHandle, run_id: &str) -> bool {
+    loop {
+        match run_mode(app, run_id).as_str() {
+            "stop" => return true,
+            "paused" => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+            _ => return false,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fail_run_step(
+    app: &AppHandle,
+    run_id: &str,
+    workflow_id: &str,
+    index: usize,
+    total: usize,
+    step: &WorkflowStep,
+    application: &str,
+    error: String,
+) {
+    let _ = app.emit(
+        "alfred://run-event",
+        RunEvent {
+            run_id: run_id.into(),
+            sequence: index,
+            step_id: step.id.clone(),
+            title: step.title.clone(),
+            detail: error.clone(),
+            application: application.into(),
+            status: "failed".into(),
+            progress: (index * 100 / total) as u8,
+            evidence_data_url: None,
+            timestamp: Utc::now(),
+        },
+    );
+    let _ = save_checkpoint(
+        app,
+        &RunCheckpoint {
+            run_id: run_id.into(),
+            workflow_id: workflow_id.into(),
+            next_step_index: index,
+            status: "failed".into(),
+            error: Some(error),
+            updated_at: Utc::now(),
+        },
+    );
+}
+
+fn stop_run(app: &AppHandle, run_id: &str, workflow_id: &str, index: usize) {
+    let _ = save_checkpoint(
+        app,
+        &RunCheckpoint {
+            run_id: run_id.into(),
+            workflow_id: workflow_id.into(),
+            next_step_index: index,
+            status: "stopped".into(),
+            error: None,
+            updated_at: Utc::now(),
+        },
+    );
+}
+
+/// Parks the run when the policy engine returns request_user: records what is
+/// pending, emits a "waiting" event the UI turns into an approval prompt, then
+/// polls until the user approves (approve_run_step flips the mode back to running
+/// with a grant + one-step override) or stops the run. Returns true if approved.
+/// Headless scheduled runs never get an answer; their monitor exits non-zero on
+/// the "waiting" checkpoint, which is the intended fail-closed behavior.
+#[allow(clippy::too_many_arguments)]
+async fn park_run_for_approval(
+    app: &AppHandle,
+    run_id: &str,
+    workflow_id: &str,
+    index: usize,
+    total: usize,
+    step: &WorkflowStep,
+    application: &str,
+    error: String,
+) -> bool {
+    let reason = error.trim_start_matches("request_user:").trim().to_string();
+    let pending = PendingApproval {
+        step_id: step.id.clone(),
+        application: application.into(),
+        effect: step.effect.clone(),
+        intent: step.intent.clone().unwrap_or_else(|| step.kind.clone()),
+        reason: reason.clone(),
+    };
+    if let Ok(path) = approval_path(app, run_id) {
+        let _ = write_json(&path, &pending);
+    }
+    if let Ok(mut controls) = app.state::<RuntimeState>().run_controls.lock() {
+        controls.insert(run_id.into(), "waiting".into());
+    }
+    let _ = app.emit(
+        "alfred://run-event",
+        RunEvent {
+            run_id: run_id.into(),
+            sequence: index,
+            step_id: step.id.clone(),
+            title: step.title.clone(),
+            detail: format!("Approval needed: {reason}"),
+            application: application.into(),
+            status: "waiting".into(),
+            progress: (index * 100 / total) as u8,
+            evidence_data_url: None,
+            timestamp: Utc::now(),
+        },
+    );
+    let _ = save_checkpoint(
+        app,
+        &RunCheckpoint {
+            run_id: run_id.into(),
+            workflow_id: workflow_id.into(),
+            next_step_index: index,
+            status: "waiting".into(),
+            error: Some(reason),
+            updated_at: Utc::now(),
+        },
+    );
+    loop {
+        match run_mode(app, run_id).as_str() {
+            "running" => return true,
+            "stop" => {
+                if let Ok(path) = approval_path(app, run_id) {
+                    let _ = fs::remove_file(path);
+                }
+                stop_run(app, run_id, workflow_id, index);
+                return false;
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+        }
+    }
+}
+
 #[tauri::command]
 fn start_workflow_run(
     app: AppHandle,
@@ -1056,74 +1759,120 @@ fn start_workflow_run(
     let start_index = get_checkpoint(app.clone(), run_id.clone())?
         .map(|item| item.next_step_index)
         .unwrap_or(0);
+    let lock_path = run_lock_path(&app)?;
+    {
+        let state = app.state::<RuntimeState>();
+        let mut controls = state
+            .run_controls
+            .lock()
+            .map_err(|_| "Run control state is unavailable.")?;
+        if controls.contains_key(&run_id) {
+            return Err("This run is already active.".into());
+        }
+        controls.insert(run_id.clone(), "running".into());
+    }
+    let start = (|| {
+        try_acquire_run_lock(&lock_path, &run_id)?;
+        // Preflight: every application the workflow needs must be running before the
+        // first step, so a missing app fails fast with a clear message.
+        if cfg!(windows) {
+            let runtime = app.state::<RuntimeState>();
+            for required in &workflow.required_apps {
+                if required == "Alfred" || required == "Installed browser" {
+                    continue;
+                }
+                resolve_application_process_id(&app, &runtime, required)
+                    .map_err(|error| format!("{required} is not ready: {error}"))?;
+            }
+        }
+        save_checkpoint(
+            &app,
+            &RunCheckpoint {
+                run_id: run_id.clone(),
+                workflow_id: workflow_id.clone(),
+                next_step_index: start_index,
+                status: "running".into(),
+                error: None,
+                updated_at: Utc::now(),
+            },
+        )
+    })();
+    if let Err(error) = start {
+        release_run_lock(&lock_path, &run_id);
+        if let Ok(mut controls) = app.state::<RuntimeState>().run_controls.lock() {
+            controls.remove(&run_id);
+        }
+        return Err(error);
+    }
     let emitted_run = run_id.clone();
     let app_for_run = app.clone();
-    app.state::<RuntimeState>()
-        .run_controls
-        .lock()
-        .map_err(|_| "Run control state is unavailable.")?
-        .insert(run_id.clone(), "running".into());
-    save_checkpoint(
-        &app,
-        &RunCheckpoint {
-            run_id: run_id.clone(),
-            workflow_id: workflow_id.clone(),
-            next_step_index: start_index,
-            status: "running".into(),
-            error: None,
-            updated_at: Utc::now(),
-        },
-    )?;
     tauri::async_runtime::spawn(async move {
-        let total = workflow.steps.len().max(1);
-        for (index, step) in workflow.steps.iter().enumerate().skip(start_index) {
-            loop {
-                let mode = app_for_run
-                    .state::<RuntimeState>()
-                    .run_controls
-                    .lock()
-                    .ok()
-                    .and_then(|map| map.get(&emitted_run).cloned())
-                    .unwrap_or_else(|| "stop".into());
-                if mode == "stop" {
-                    let _ = save_checkpoint(
-                        &app_for_run,
-                        &RunCheckpoint {
-                            run_id: emitted_run.clone(),
-                            workflow_id: workflow.id.clone(),
-                            next_step_index: index,
-                            status: "stopped".into(),
-                            error: None,
-                            updated_at: Utc::now(),
-                        },
-                    );
-                    return;
-                }
-                if mode != "paused" {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
-            let application = step.application.clone().unwrap_or_else(|| "Alfred".into());
-            let request = ActionRequest {
-                protocol_version: protocol_version(),
-                run_id: emitted_run.clone(),
-                workflow_step: step.id.clone(),
+        drive_workflow_run(
+            app_for_run.clone(),
+            emitted_run.clone(),
+            workflow,
+            start_index,
+        )
+        .await;
+        release_run_lock(&lock_path, &emitted_run);
+        if let Ok(mut controls) = app_for_run.state::<RuntimeState>().run_controls.lock() {
+            controls.remove(&emitted_run);
+        }
+    });
+    Ok(run_id)
+}
+
+async fn drive_workflow_run(app: AppHandle, run_id: String, workflow: Workflow, start_index: usize) {
+    let total = workflow.steps.len().max(1);
+    let lock_path = run_lock_path(&app).ok();
+    // Browser steps in one run stick to the tab Alfred last used, so the user or
+    // another application changing the active tab mid-run cannot redirect actions.
+    let mut pinned_tab: Option<i64> = None;
+    // Values captured by saveAs steps; persisted so checkpoint resumes keep them.
+    let mut variables = load_variables(&app, &run_id);
+    for (index, step) in workflow.steps.iter().enumerate().skip(start_index) {
+        if wait_if_paused(&app, &run_id).await {
+            stop_run(&app, &run_id, &workflow.id, index);
+            return;
+        }
+        if let Some(path) = &lock_path {
+            write_run_lock(path, &run_id);
+        }
+        let application = step.application.clone().unwrap_or_else(|| "Alfred".into());
+        let is_browser = step.kind.starts_with("browser.");
+        let attempts = 1 + step.retries as u32;
+        let timeout = Duration::from_millis(step.timeout_ms.clamp(1_000, 120_000));
+        let _ = app.emit(
+            "alfred://run-event",
+            RunEvent {
+                run_id: run_id.clone(),
+                sequence: index,
+                step_id: step.id.clone(),
+                title: step.title.clone(),
+                detail: "Checking permission and handing the action to the trusted host."
+                    .into(),
                 application: application.clone(),
-                intent: step.intent.clone().unwrap_or_else(|| step.kind.clone()),
-                effect: step.effect.clone(),
-                target_label: step.target_label.clone(),
-                payload: step.payload.clone(),
-            };
-            let _ = app_for_run.emit(
+                status: "running".into(),
+                progress: (index * 100 / total) as u8,
+                evidence_data_url: None,
+                timestamp: Utc::now(),
+            },
+        );
+        // Precondition: wait for the target state before acting at all.
+        if let Some(wait_for) = &step.wait_for {
+            let label = wait_for
+                .name
+                .clone()
+                .or_else(|| wait_for.url_contains.clone())
+                .unwrap_or_else(|| "the target state".into());
+            let _ = app.emit(
                 "alfred://run-event",
                 RunEvent {
-                    run_id: emitted_run.clone(),
+                    run_id: run_id.clone(),
                     sequence: index,
                     step_id: step.id.clone(),
                     title: step.title.clone(),
-                    detail: "Checking permission and handing the action to the trusted host."
-                        .into(),
+                    detail: format!("Waiting for {label}."),
                     application: application.clone(),
                     status: "running".into(),
                     progress: (index * 100 / total) as u8,
@@ -1131,116 +1880,1195 @@ fn start_workflow_run(
                     timestamp: Utc::now(),
                 },
             );
-            let result = if step.kind.starts_with("browser.") {
-                let params = step
-                    .payload
-                    .clone()
-                    .unwrap_or_else(|| serde_json::json!({}));
-                send_browser_command(
-                    app_for_run.clone(),
-                    BrowserCommand {
-                        id: step.id.clone(),
-                        method: step.kind.trim_start_matches("browser.").into(),
-                        effect: step.effect.clone(),
-                        intent: step.intent.clone().unwrap_or_else(|| step.title.clone()),
-                        target_label: step.target_label.clone(),
-                        params,
-                    },
-                )
-            } else {
-                let runtime = app_for_run.state::<RuntimeState>();
-                execute_native_action_inner(&app_for_run, &runtime, request, step.kind.clone())
-            };
-            let (status, detail, evidence_data_url) = match result {
-                Ok(value) => {
-                    let direct = value
-                        .get("base64")
-                        .and_then(Value::as_str)
-                        .map(|data| format!("data:image/png;base64,{data}"));
-                    let nested = value
-                        .get("result")
-                        .and_then(|item| item.get("dataUrl"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
-                    (
-                        "completed",
-                        "Action completed and checkpoint saved.".to_string(),
-                        direct.or(nested),
-                    )
-                }
-                Err(error) => {
-                    let _ = app_for_run.emit(
-                        "alfred://run-event",
-                        RunEvent {
-                            run_id: emitted_run.clone(),
-                            sequence: index,
-                            step_id: step.id.clone(),
-                            title: step.title.clone(),
-                            detail: error.clone(),
-                            application: application.clone(),
-                            status: "failed".into(),
-                            progress: (index * 100 / total) as u8,
-                            evidence_data_url: None,
-                            timestamp: Utc::now(),
-                        },
-                    );
-                    let _ = save_checkpoint(
-                        &app_for_run,
-                        &RunCheckpoint {
-                            run_id: emitted_run.clone(),
-                            workflow_id: workflow.id.clone(),
-                            next_step_index: index,
-                            status: "failed".into(),
-                            error: Some(error),
-                            updated_at: Utc::now(),
-                        },
+            match wait_for_condition(
+                &app,
+                &run_id,
+                &application,
+                is_browser,
+                wait_for,
+                timeout,
+                pinned_tab,
+                &variables,
+            )
+            .await
+            {
+                WaitOutcome::Satisfied => {}
+                WaitOutcome::TimedOut => {
+                    fail_run_step(
+                        &app,
+                        &run_id,
+                        &workflow.id,
+                        index,
+                        total,
+                        step,
+                        &application,
+                        format!(
+                            "Precondition \"{label}\" was not met within {} ms.",
+                            timeout.as_millis()
+                        ),
                     );
                     return;
                 }
-            };
-            let _ = app_for_run.emit(
-                "alfred://run-event",
-                RunEvent {
-                    run_id: emitted_run.clone(),
-                    sequence: index,
-                    step_id: step.id.clone(),
-                    title: step.title.clone(),
-                    detail,
-                    application,
-                    status: status.into(),
-                    progress: (((index + 1) * 100) / total) as u8,
-                    evidence_data_url,
-                    timestamp: Utc::now(),
-                },
-            );
-            let _ = save_checkpoint(
-                &app_for_run,
-                &RunCheckpoint {
-                    run_id: emitted_run.clone(),
-                    workflow_id: workflow.id.clone(),
-                    next_step_index: index + 1,
-                    status: "running".into(),
-                    error: None,
-                    updated_at: Utc::now(),
-                },
-            );
+                WaitOutcome::Stopped => {
+                    stop_run(&app, &run_id, &workflow.id, index);
+                    return;
+                }
+            }
         }
-        let _ = save_checkpoint(
-            &app_for_run,
-            &RunCheckpoint {
-                run_id: emitted_run.clone(),
-                workflow_id: workflow.id,
-                next_step_index: workflow.steps.len(),
+        let mut outcome: Option<Value> = None;
+        let mut last_error = String::new();
+        let mut skipped = false;
+        let mut attempt = 1u32;
+        while attempt <= attempts {
+            if wait_if_paused(&app, &run_id).await {
+                stop_run(&app, &run_id, &workflow.id, index);
+                return;
+            }
+            let mut payload = step.payload.clone().unwrap_or_else(|| serde_json::json!({}));
+            substitute_variables(&mut payload, &variables);
+            let mut target_label = step.target_label.clone();
+            if let Some(label) = &mut target_label {
+                *label = substitute_text(label, &variables);
+            }
+            // Idempotent resume: when the desired end state already holds (a
+            // previous attempt applied it but the response was lost), skip the
+            // action instead of applying it twice.
+            if step.effect != "observe" {
+                if let Some(expect) = &step.expect {
+                    if let Ok(true) = evaluate_step_condition(
+                        &app,
+                        &application,
+                        is_browser,
+                        expect,
+                        pinned_tab,
+                        &variables,
+                    ) {
+                        skipped = true;
+                        outcome = Some(serde_json::json!({ "skipped": true }));
+                        break;
+                    }
+                }
+            }
+            // Every attempt re-resolves the application to a live process, so a
+            // stale recorded PID can never steer input into the wrong window.
+            if !is_browser && application != "Alfred" && cfg!(windows) {
+                let runtime = app.state::<RuntimeState>();
+                match resolve_application_process_id(&app, &runtime, &application) {
+                    Ok(pid) => {
+                        if let Value::Object(ref mut map) = payload {
+                            map.insert("processId".into(), Value::from(pid));
+                        }
+                    }
+                    Err(error) => {
+                        last_error = error;
+                        attempt += 1;
+                        if attempt <= attempts {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
+                        continue;
+                    }
+                }
+            }
+            if is_browser {
+                if let (Some(tab), Value::Object(map)) = (pinned_tab, &mut payload) {
+                    map.entry("tabId".to_string()).or_insert(Value::from(tab));
+                }
+            }
+            let approved = app
+                .state::<RuntimeState>()
+                .approved_overrides
+                .lock()
+                .ok()
+                .map(|overrides| overrides.get(&run_id) == Some(&step.id))
+                .unwrap_or(false);
+            let floored_effect = effective_effect(&step.kind, &step.effect);
+            let request = ActionRequest {
+                protocol_version: protocol_version(),
+                run_id: run_id.clone(),
+                workflow_step: step.id.clone(),
+                application: application.clone(),
+                intent: step.intent.clone().unwrap_or_else(|| step.kind.clone()),
+                effect: floored_effect.clone(),
+                target_label,
+                payload: Some(payload.clone()),
+            };
+            let result = if is_browser {
+                send_browser_command_inner(
+                    app.clone(),
+                    BrowserCommand {
+                        id: step.id.clone(),
+                        method: step.kind.trim_start_matches("browser.").into(),
+                        effect: floored_effect,
+                        intent: step.intent.clone().unwrap_or_else(|| step.title.clone()),
+                        target_label: step.target_label.clone(),
+                        params: payload,
+                    },
+                    approved,
+                )
+            } else {
+                let runtime = app.state::<RuntimeState>();
+                execute_native_action_inner(
+                    &app,
+                    &runtime,
+                    request,
+                    step.kind.clone(),
+                    timeout,
+                    approved,
+                )
+            };
+            match result {
+                Ok(value) => {
+                    // Postcondition: confirm the action actually reached the
+                    // desired state before calling the step complete.
+                    if let Some(expect) = &step.expect {
+                        match wait_for_condition(
+                            &app,
+                            &run_id,
+                            &application,
+                            is_browser,
+                            expect,
+                            timeout,
+                            pinned_tab,
+                            &variables,
+                        )
+                        .await
+                        {
+                            WaitOutcome::Satisfied => {
+                                outcome = Some(value);
+                                break;
+                            }
+                            WaitOutcome::Stopped => {
+                                stop_run(&app, &run_id, &workflow.id, index);
+                                return;
+                            }
+                            WaitOutcome::TimedOut => {
+                                last_error = "The action ran but the expected state did not appear in time."
+                                    .into();
+                                attempt += 1;
+                                if attempt <= attempts {
+                                    tokio::time::sleep(std::time::Duration::from_millis(500))
+                                        .await;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    outcome = Some(value);
+                    break;
+                }
+                Err(error) if error.starts_with("request_user") => {
+                    // Park until the user approves or stops; approval re-attempts
+                    // the step without consuming one of its retries.
+                    let approved_now = park_run_for_approval(
+                        &app,
+                        &run_id,
+                        &workflow.id,
+                        index,
+                        total,
+                        step,
+                        &application,
+                        error,
+                    )
+                    .await;
+                    if !approved_now {
+                        return;
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    // hard_deny is deterministic; retrying cannot help it.
+                    let retryable = !error.starts_with("hard_deny");
+                    last_error = error;
+                    attempt += 1;
+                    if !retryable || attempt > attempts {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+        }
+        let Some(value) = outcome else {
+            fail_run_step(
+                &app,
+                &run_id,
+                &workflow.id,
+                index,
+                total,
+                step,
+                &application,
+                format!("{last_error} (after {attempts} attempt(s))"),
+            );
+            return;
+        };
+        // A one-step approval override is consumed with its step.
+        if let Ok(mut overrides) = app.state::<RuntimeState>().approved_overrides.lock() {
+            if overrides.get(&run_id) == Some(&step.id) {
+                overrides.remove(&run_id);
+            }
+        }
+        if let Some(name) = &step.save_as {
+            if let Some(saved) = extract_saved_value(&value) {
+                variables.insert(name.clone(), saved);
+                save_variables(&app, &run_id, &variables);
+            }
+        }
+        if is_browser {
+            if let Some(tab) = value
+                .get("result")
+                .and_then(|result| result.get("tabId"))
+                .and_then(Value::as_i64)
+            {
+                pinned_tab = Some(tab);
+            }
+        }
+        let direct = value
+            .get("base64")
+            .and_then(Value::as_str)
+            .map(|data| format!("data:image/png;base64,{data}"));
+        let nested = value
+            .get("result")
+            .and_then(|item| item.get("dataUrl"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let detail = if skipped {
+            "Already in the desired state; action skipped (idempotent resume).".to_string()
+        } else if let Some(name) = &step.save_as {
+            format!("Action completed; value saved as ${{{name}}}. Checkpoint saved.")
+        } else {
+            "Action completed and checkpoint saved.".to_string()
+        };
+        let _ = app.emit(
+            "alfred://run-event",
+            RunEvent {
+                run_id: run_id.clone(),
+                sequence: index,
+                step_id: step.id.clone(),
+                title: step.title.clone(),
+                detail,
+                application: application.clone(),
                 status: "completed".into(),
+                progress: (((index + 1) * 100) / total) as u8,
+                evidence_data_url: direct.or(nested),
+                timestamp: Utc::now(),
+            },
+        );
+        let _ = save_checkpoint(
+            &app,
+            &RunCheckpoint {
+                run_id: run_id.clone(),
+                workflow_id: workflow.id.clone(),
+                next_step_index: index + 1,
+                status: "running".into(),
                 error: None,
                 updated_at: Utc::now(),
             },
         );
+    }
+    let _ = save_checkpoint(
+        &app,
+        &RunCheckpoint {
+            run_id: run_id.clone(),
+            workflow_id: workflow.id,
+            next_step_index: workflow.steps.len(),
+            status: "completed".into(),
+            error: None,
+            updated_at: Utc::now(),
+        },
+    );
+}
+
+/// One reply from the planner: either the next action or a completion signal.
+/// Deliberately mirrors the workflow-step shape so goal actions flow through the
+/// same policy gate, approval parking, and executors as recorded steps.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct PlannerReply {
+    #[serde(default)]
+    done: bool,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    application: Option<String>,
+    #[serde(default)]
+    intent: Option<String>,
+    #[serde(default)]
+    effect: Option<String>,
+    #[serde(default)]
+    target_label: Option<String>,
+    #[serde(default)]
+    payload: Option<Value>,
+}
+
+fn parse_planner_action(output: &str) -> Result<PlannerReply, String> {
+    // Provider CLIs wrap answers differently (JSONL events, prose around the JSON,
+    // markdown fences). Try the whole output, then JSON-looking lines from the
+    // end, then the widest brace span. The first candidate that is valid JSON with
+    // a recognizable shape wins.
+    let mut candidates: Vec<String> = vec![output.trim().to_string()];
+    for line in output.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('{') && trimmed.ends_with('}') {
+            candidates.push(trimmed.to_string());
+        }
+    }
+    if let (Some(start), Some(end)) = (output.find('{'), output.rfind('}')) {
+        if end > start {
+            candidates.push(output[start..=end].to_string());
+        }
+    }
+    for candidate in candidates {
+        if let Ok(reply) = serde_json::from_str::<PlannerReply>(&candidate) {
+            if reply.done || reply.kind.is_some() {
+                return Ok(reply);
+            }
+        }
+    }
+    Err("The planner did not return a usable action.".into())
+}
+
+const PLANNER_TURN_TIMEOUT_SECS: u64 = 180;
+
+/// One agent-loop turn: a fresh, sandboxed provider process per turn. The loop
+/// keeps the state (goal, observations, history), so sessions stay stateless and
+/// each turn is independently cancellable — stopping the run drops the child,
+/// and kill_on_drop terminates the CLI.
+async fn run_planner_turn(
+    app: &AppHandle,
+    run_id: &str,
+    provider: &str,
+    prompt: &str,
+    images: &[PathBuf],
+) -> Result<String, String> {
+    let child = provider_command(provider, prompt, images)?
+        .spawn()
+        .map_err(|error| format!("Could not start {provider}: {error}"))?;
+    let wait = child.wait_with_output();
+    tokio::pin!(wait);
+    let deadline = std::time::Instant::now() + Duration::from_secs(PLANNER_TURN_TIMEOUT_SECS);
+    loop {
+        if run_mode(app, run_id) == "stop" {
+            return Err("stopped".into());
+        }
+        match tokio::time::timeout(Duration::from_millis(500), &mut wait).await {
+            Ok(Ok(output)) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Ok(format!("{stdout}\n{stderr}"));
+            }
+            Ok(Err(error)) => return Err(format!("The planner process failed: {error}")),
+            Err(_) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err("The planner did not answer within 180 seconds.".into());
+                }
+            }
+        }
+    }
+}
+
+/// Compacts a UIA observation tree into the lines a planner can act on.
+fn summarize_native_tree(node: &Value, out: &mut Vec<String>, depth: usize) {
+    if out.len() >= 40 || depth > 6 {
+        return;
+    }
+    let control = node.get("controlType").and_then(Value::as_str).unwrap_or("");
+    let name = node.get("name").and_then(Value::as_str).unwrap_or("");
+    let automation_id = node.get("automationId").and_then(Value::as_str).unwrap_or("");
+    let interesting = matches!(
+        control,
+        "ControlType.Button" | "ControlType.Edit" | "ControlType.MenuItem"
+            | "ControlType.ListItem" | "ControlType.Hyperlink" | "ControlType.TabItem"
+            | "ControlType.ComboBox" | "ControlType.CheckBox" | "ControlType.RadioButton"
+            | "ControlType.Document" | "ControlType.Text" | "ControlType.Window"
+    );
+    if interesting && !(name.is_empty() && automation_id.is_empty()) {
+        let short = control.replace("ControlType.", "");
+        let trimmed: String = name.chars().take(80).collect();
+        let mut line = format!("- {short}");
+        if !trimmed.is_empty() {
+            line.push_str(&format!(" \"{trimmed}\""));
+        }
+        if !automation_id.is_empty() {
+            line.push_str(&format!(" (id: {automation_id})"));
+        }
+        out.push(line);
+    }
+    if let Some(children) = node.get("children").and_then(Value::as_array) {
+        for child in children {
+            summarize_native_tree(child, out, depth + 1);
+        }
+    }
+}
+
+fn summarize_browser_elements(result: &Value, out: &mut Vec<String>) {
+    if let Some(url) = result.get("url").and_then(Value::as_str) {
+        out.push(format!("page: {url}"));
+    }
+    if let Some(elements) = result.get("elements").and_then(Value::as_array) {
+        for element in elements.iter().take(40) {
+            let reference = element.get("ref").and_then(Value::as_str).unwrap_or("");
+            let label: String = element
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .chars()
+                .take(80)
+                .collect();
+            let tag = element.get("tag").and_then(Value::as_str).unwrap_or("");
+            out.push(format!("- {tag} {reference} \"{label}\""));
+        }
+    }
+}
+
+fn build_planner_prompt(
+    goal: &str,
+    applications: &[String],
+    observations: &str,
+    history: &[String],
+) -> String {
+    let history_text = if history.is_empty() {
+        "(none yet)".to_string()
+    } else {
+        history.join("\n")
+    };
+    format!(
+        "You are the planning brain of Alfred, a supervised desktop automation agent running on the user's machine. Propose the next single action toward the goal.\n\nGOAL: {goal}\n\nTARGET APPLICATIONS: {apps}\n\nCURRENT DESKTOP STATE:\n{observations}\n\nACTION HISTORY (oldest first):\n{history_text}\n\nReply with exactly one JSON object and nothing else (no markdown fences, no prose):\n{{\"done\": false, \"title\": \"short human label\", \"kind\": \"<method>\", \"application\": \"<exact app name>\", \"intent\": \"what and why\", \"effect\": \"observe|create|modify_reversible|external_write\", \"targetLabel\": \"<element label>\", \"payload\": {{...}}}}\nWhen the goal is fully complete, reply: {{\"done\": true, \"summary\": \"what was accomplished\"}}.\n\nMethods: browser.observe | browser.navigate {{\"url\"}} | browser.click {{\"ref\"}} | browser.type {{\"ref\",\"text\"}} | browser.getText {{\"ref\"}} | activate {{}} | observeWindow | findElement {{\"automationId\"|\"name\"|\"controlType\"}} | getValue (same selectors) | invokeElement (same selectors) | setValue (selectors + \"value\") | click {{\"x\",\"y\"}} | typeText {{\"text\"}} | key {{\"virtualKey\": 13|9|27}} (Enter, Tab, Escape only).\n\nRules:\n- One small action per reply; observe before acting when unsure.\n- NEVER propose deletion, trash, purge, overwrite, password entry, shell commands, or credential handling. Alfred hard-blocks them regardless of what you return.\n- Prefer setValue/invokeElement (semantic, focus-independent) over click/typeText.\n- Never include processId; Alfred injects the live one.\n- Use application names exactly as listed; browser actions use \"Installed browser\".\n- If the last action failed or changed nothing, try a different approach instead of repeating it.",
+        apps = applications.join(", "),
+    )
+}
+
+fn emit_goal_event(
+    app: &AppHandle,
+    run_id: &str,
+    sequence: usize,
+    title: &str,
+    detail: &str,
+    status: &str,
+    progress: u8,
+) {
+    let _ = app.emit(
+        "alfred://run-event",
+        RunEvent {
+            run_id: run_id.into(),
+            sequence,
+            step_id: format!("goal-{sequence}"),
+            title: title.into(),
+            detail: detail.into(),
+            application: "Alfred".into(),
+            status: status.into(),
+            progress,
+            evidence_data_url: None,
+            timestamp: Utc::now(),
+        },
+    );
+}
+
+/// Builds the textual observation bundle the planner reasons over: one compact
+/// section per target application (DOM refs for the browser, UIA control lines
+/// for native apps). Returns the bundle and the tab the browser answered from.
+fn gather_observations(
+    app: &AppHandle,
+    run_id: &str,
+    applications: &[String],
+    pinned_tab: Option<i64>,
+) -> (String, Option<i64>) {
+    let mut observations = String::new();
+    let mut pinned = pinned_tab;
+    for application in applications {
+        if application == "Installed browser" {
+            let mut params = serde_json::json!({});
+            if let (Some(tab), Value::Object(ref mut map)) = (pinned, &mut params) {
+                map.insert("tabId".to_string(), Value::from(tab));
+            }
+            match send_browser_command_inner(
+                app.clone(),
+                BrowserCommand {
+                    id: "goal-observe".into(),
+                    method: "observe".into(),
+                    effect: "observe".into(),
+                    intent: "observe the page before planning".into(),
+                    target_label: None,
+                    params,
+                },
+                false,
+            ) {
+                Ok(value) => {
+                    let result = value.get("result").cloned().unwrap_or(Value::Null);
+                    if let Some(tab) = result.get("tabId").and_then(Value::as_i64) {
+                        pinned = Some(tab);
+                    }
+                    let mut lines = vec!["Installed browser:".to_string()];
+                    summarize_browser_elements(&result, &mut lines);
+                    observations.push_str(&lines.join("\n"));
+                    observations.push('\n');
+                }
+                Err(error) => {
+                    observations.push_str(&format!("Installed browser: unavailable ({error})\n"));
+                }
+            }
+        } else if cfg!(windows) {
+            let runtime = app.state::<RuntimeState>();
+            let section = resolve_application_process_id(app, &runtime, application)
+                .and_then(|pid| {
+                    let request = ActionRequest {
+                        protocol_version: protocol_version(),
+                        run_id: run_id.into(),
+                        workflow_step: "goal-observe".into(),
+                        application: application.clone(),
+                        intent: format!("observe {application} before planning"),
+                        effect: "observe".into(),
+                        target_label: None,
+                        payload: Some(serde_json::json!({ "processId": pid })),
+                    };
+                    execute_native_action_inner(
+                        app,
+                        &runtime,
+                        request,
+                        "observeWindow".into(),
+                        Duration::from_secs(15),
+                        false,
+                    )
+                });
+            match section {
+                Ok(tree) => {
+                    let mut lines = vec![format!("{application}:")];
+                    summarize_native_tree(&tree, &mut lines, 0);
+                    observations.push_str(&lines.join("\n"));
+                    observations.push('\n');
+                }
+                Err(error) => {
+                    observations.push_str(&format!("{application}: unavailable ({error})\n"));
+                }
+            }
+        }
+    }
+    if observations.trim().is_empty() {
+        observations = "(no observations available)".into();
+    }
+    (observations, pinned)
+}
+
+/// Ends a goal run with a failure: event + checkpoint.
+fn fail_goal_run(app: &AppHandle, run_id: &str, goal: &str, step: usize, progress: u8, error: String) {
+    emit_goal_event(app, run_id, step, "Goal run failed", &error, "failed", progress);
+    let _ = save_checkpoint(
+        app,
+        &RunCheckpoint {
+            run_id: run_id.into(),
+            workflow_id: goal.into(),
+            next_step_index: step,
+            status: "failed".into(),
+            error: Some(error),
+            updated_at: Utc::now(),
+        },
+    );
+}
+
+const GOAL_RUN_MAX_CONSECUTIVE_FAILURES: u32 = 3;
+const MAX_PLANNER_HISTORY: usize = 12;
+
+/// The agent loop: observe → plan → policy-gate → execute → record, until the
+/// planner declares the goal done, a guardrail trips, or the user stops the run.
+/// Every action flows through the same policy engine, approval parking, run lock,
+/// and targeted executors as recorded workflows — the planner only proposes.
+async fn drive_goal_run(
+    app: AppHandle,
+    run_id: String,
+    provider: String,
+    goal: String,
+    applications: Vec<String>,
+    max_steps: u32,
+    check_in_every: u32,
+    share_screenshots: bool,
+) {
+    let lock_path = run_lock_path(&app).ok();
+    let mut pinned_tab: Option<i64> = None;
+    let mut history: Vec<String> = Vec::new();
+    let mut consecutive_failures = 0u32;
+    let mut since_check_in = 0u32;
+    for step_index in 0..max_steps {
+        if wait_if_paused(&app, &run_id).await {
+            stop_run(&app, &run_id, &goal, step_index as usize);
+            return;
+        }
+        if let Some(path) = &lock_path {
+            write_run_lock(path, &run_id);
+        }
+        let progress = ((step_index * 100) / max_steps.max(1)) as u8;
+        emit_goal_event(
+            &app, &run_id, step_index as usize, "Observing the desktop",
+            "Reading the current state of every target application.", "running", progress,
+        );
+        let (observations, new_pinned) =
+            gather_observations(&app, &run_id, &applications, pinned_tab);
+        pinned_tab = new_pinned;
+        // Visual grounding: one screenshot per target app. Attached to the planner
+        // turn only for CLIs with verified image input (Codex); also shown in the
+        // cockpit timeline as evidence.
+        let (shot_paths, shot_evidence) = if share_screenshots {
+            capture_run_screenshots(&app, &run_id, &applications, step_index, pinned_tab)
+        } else {
+            (Vec::new(), None)
+        };
+        emit_goal_event(
+            &app, &run_id, step_index as usize, "Planning the next action",
+            &format!("{provider} is deciding the next step."), "running", progress,
+        );
+        let mut prompt = build_planner_prompt(&goal, &applications, &observations, &history);
+        // Flag providers receive the files as CLI attachments; path providers get
+        // the file list in the prompt and their file reader supplies the vision.
+        let delivery = provider_image_delivery(&provider);
+        let flag_images: &[PathBuf] = match delivery {
+            Some(ImageDelivery::Flag) => &shot_paths,
+            _ => &[],
+        };
+        if !shot_paths.is_empty() {
+            match delivery {
+                Some(ImageDelivery::Flag) => prompt.push_str(&format!(
+                    "\n\nSCREENSHOTS ATTACHED: {} image(s), one per target application in the order listed. Cross-check them against the text observations; if they disagree, trust the screenshot.",
+                    shot_paths.len()
+                )),
+                Some(ImageDelivery::PromptPaths) => {
+                    prompt.push_str("\n\nSCREENSHOT FILES — use your file-reading tool to view each image below; they show the current desktop state, one per target application in the order listed. Cross-check them against the text observations; if they disagree, trust the screenshot:");
+                    for path in &shot_paths {
+                        prompt.push_str(&format!("\n- {}", path.display()));
+                    }
+                }
+                None => {}
+            }
+        }
+        let output = match run_planner_turn(&app, &run_id, &provider, &prompt, flag_images).await {
+            Ok(output) => output,
+            Err(error) if error == "stopped" => {
+                stop_run(&app, &run_id, &goal, step_index as usize);
+                return;
+            }
+            Err(error) => {
+                consecutive_failures += 1;
+                history.push(format!("planner error: {error}"));
+                if consecutive_failures >= GOAL_RUN_MAX_CONSECUTIVE_FAILURES {
+                    fail_goal_run(&app, &run_id, &goal, step_index as usize, progress, format!("The planner is unreachable: {error}"));
+                    return;
+                }
+                continue;
+            }
+        };
+        let reply = match parse_planner_action(&output) {
+            Ok(reply) => reply,
+            Err(error) => {
+                consecutive_failures += 1;
+                history.push(error.to_string());
+                if consecutive_failures >= GOAL_RUN_MAX_CONSECUTIVE_FAILURES {
+                    fail_goal_run(&app, &run_id, &goal, step_index as usize, progress, "The planner kept returning unusable output.".into());
+                    return;
+                }
+                continue;
+            }
+        };
+        if reply.done {
+            let summary = reply
+                .summary
+                .unwrap_or_else(|| "The planner reports the goal is complete.".into());
+            let _ = save_checkpoint(&app, &RunCheckpoint {
+                run_id: run_id.clone(),
+                workflow_id: goal.clone(),
+                next_step_index: max_steps as usize,
+                status: "completed".into(),
+                error: None,
+                updated_at: Utc::now(),
+            });
+            emit_goal_event(&app, &run_id, step_index as usize, "Goal completed", &summary, "completed", 100);
+            return;
+        }
+        // 3. Execute through the same policy-gated path as recorded workflows.
+        let kind = reply.kind.clone().unwrap_or_default();
+        let is_browser = kind.starts_with("browser.");
+        let application = reply.application.clone().unwrap_or_else(|| {
+            if is_browser {
+                "Installed browser".into()
+            } else {
+                applications.first().cloned().unwrap_or_else(|| "Alfred".into())
+            }
+        });
+        let title = reply.title.clone().unwrap_or_else(|| kind.clone());
+        let declared_effect = reply.effect.clone().unwrap_or_else(|| "unknown".into());
+        let step = WorkflowStep {
+            id: format!("goal-step-{step_index}"),
+            title: title.clone(),
+            kind: kind.clone(),
+            effect: effective_effect(&kind, &declared_effect),
+            application: Some(application.clone()),
+            intent: reply.intent.clone(),
+            target_label: reply.target_label.clone(),
+            payload: reply.payload.clone(),
+            timeout_ms: 30_000,
+            retries: 1,
+            wait_for: None,
+            expect: None,
+            save_as: None,
+        };
+        let mut payload = step.payload.clone().unwrap_or_else(|| serde_json::json!({}));
+        if !is_browser && application != "Alfred" && cfg!(windows) {
+            let runtime = app.state::<RuntimeState>();
+            match resolve_application_process_id(&app, &runtime, &application) {
+                Ok(pid) => {
+                    if let Value::Object(ref mut map) = payload {
+                        map.insert("processId".into(), Value::from(pid));
+                    }
+                }
+                Err(error) => {
+                    consecutive_failures += 1;
+                    history.push(format!("{title} — target unavailable: {error}"));
+                    if consecutive_failures >= GOAL_RUN_MAX_CONSECUTIVE_FAILURES {
+                        fail_goal_run(&app, &run_id, &goal, step_index as usize, progress, format!("Target application never became available: {error}"));
+                        return;
+                    }
+                    continue;
+                }
+            }
+        }
+        if is_browser {
+            if let (Some(tab), Value::Object(map)) = (pinned_tab, &mut payload) {
+                map.entry("tabId".to_string()).or_insert(Value::from(tab));
+            }
+        }
+        emit_goal_event(
+            &app, &run_id, step_index as usize, &title,
+            &format!("{kind} in {application}, checked by the safety engine."), "running", progress,
+        );
+        // A request_user parks the run; on approval the same action re-enters the
+        // policy gate (now authorized) instead of being skipped.
+        let result = loop {
+            let approved = app
+                .state::<RuntimeState>()
+                .approved_overrides
+                .lock()
+                .ok()
+                .map(|overrides| overrides.get(&run_id) == Some(&step.id))
+                .unwrap_or(false);
+            let request = ActionRequest {
+                protocol_version: protocol_version(),
+                run_id: run_id.clone(),
+                workflow_step: step.id.clone(),
+                application: application.clone(),
+                intent: step.intent.clone().unwrap_or_else(|| kind.clone()),
+                effect: step.effect.clone(),
+                target_label: step.target_label.clone(),
+                payload: Some(payload.clone()),
+            };
+            let attempt_result = if is_browser {
+                send_browser_command_inner(
+                    app.clone(),
+                    BrowserCommand {
+                        id: step.id.clone(),
+                        method: kind.trim_start_matches("browser.").into(),
+                        effect: step.effect.clone(),
+                        intent: step.intent.clone().unwrap_or_else(|| title.clone()),
+                        target_label: step.target_label.clone(),
+                        params: payload.clone(),
+                    },
+                    approved,
+                )
+            } else {
+                let runtime = app.state::<RuntimeState>();
+                execute_native_action_inner(
+                    &app,
+                    &runtime,
+                    request,
+                    kind.clone(),
+                    Duration::from_secs(30),
+                    approved,
+                )
+            };
+            match attempt_result {
+                Err(error) if error.starts_with("request_user") => {
+                    let approved_now = park_run_for_approval(
+                        &app,
+                        &run_id,
+                        &goal,
+                        step_index as usize,
+                        max_steps as usize,
+                        &step,
+                        &application,
+                        error,
+                    )
+                    .await;
+                    if !approved_now {
+                        return;
+                    }
+                    continue;
+                }
+                other => break other,
+            }
+        };
+        match result {
+            Ok(value) => {
+                history.push(format!("{title} ({kind}) — ok"));
+                if history.len() > MAX_PLANNER_HISTORY {
+                    history.remove(0);
+                }
+                consecutive_failures = 0;
+                if step.effect != "observe" {
+                    since_check_in += 1;
+                }
+                if is_browser {
+                    if let Some(tab) = value
+                        .get("result")
+                        .and_then(|result| result.get("tabId"))
+                        .and_then(Value::as_i64)
+                    {
+                        pinned_tab = Some(tab);
+                    }
+                }
+                // A one-step approval override is consumed with its action.
+                if let Ok(mut overrides) = app.state::<RuntimeState>().approved_overrides.lock() {
+                    if overrides.get(&run_id) == Some(&step.id) {
+                        overrides.remove(&run_id);
+                    }
+                }
+                let next_progress = (((step_index + 1) * 100) / max_steps.max(1)) as u8;
+                let _ = app.emit(
+                    "alfred://run-event",
+                    RunEvent {
+                        run_id: run_id.clone(),
+                        sequence: step_index as usize,
+                        step_id: step.id.clone(),
+                        title: title.clone(),
+                        detail: "Action completed.".into(),
+                        application: application.clone(),
+                        status: "completed".into(),
+                        progress: next_progress,
+                        evidence_data_url: shot_evidence.clone(),
+                        timestamp: Utc::now(),
+                    },
+                );
+                let _ = save_checkpoint(
+                    &app,
+                    &RunCheckpoint {
+                        run_id: run_id.clone(),
+                        workflow_id: goal.clone(),
+                        next_step_index: (step_index + 1) as usize,
+                        status: "running".into(),
+                        error: None,
+                        updated_at: Utc::now(),
+                    },
+                );
+                // Human check-in cadence: pause so the cockpit's Resume button
+                // lets the user inspect the desktop before the agent continues.
+                if check_in_every > 0 && since_check_in >= check_in_every {
+                    since_check_in = 0;
+                    if let Ok(mut controls) = app.state::<RuntimeState>().run_controls.lock() {
+                        controls.insert(run_id.clone(), "paused".into());
+                    }
+                    emit_goal_event(
+                        &app,
+                        &run_id,
+                        step_index as usize,
+                        "Check-in pause",
+                        &format!("{check_in_every} actions completed. Review the desktop, then resume."),
+                        "paused",
+                        next_progress,
+                    );
+                }
+            }
+            Err(error) => {
+                consecutive_failures += 1;
+                history.push(format!("{title} ({kind}) — failed: {error}"));
+                if history.len() > MAX_PLANNER_HISTORY {
+                    history.remove(0);
+                }
+                emit_goal_event(
+                    &app,
+                    &run_id,
+                    step_index as usize,
+                    &title,
+                    &format!("Action failed; the planner will adjust: {error}"),
+                    "running",
+                    progress,
+                );
+                if consecutive_failures >= GOAL_RUN_MAX_CONSECUTIVE_FAILURES {
+                    fail_goal_run(
+                        &app,
+                        &run_id,
+                        &goal,
+                        step_index as usize,
+                        progress,
+                        format!(
+                            "The planner is not making progress ({GOAL_RUN_MAX_CONSECUTIVE_FAILURES} consecutive failures; last: {error})"
+                        ),
+                    );
+                    return;
+                }
+            }
+        }
+    }
+    fail_goal_run(
+        &app,
+        &run_id,
+        &goal,
+        max_steps as usize,
+        100,
+        format!("Reached the step limit ({max_steps}) before the planner finished the goal."),
+    );
+}
+
+/// Starts an agent run: the planner proposes, the policy engine disposes.
+/// Takes the same machine-wide run lock as workflow replays.
+#[tauri::command]
+fn start_goal_run(
+    app: AppHandle,
+    goal: String,
+    applications: Vec<String>,
+    max_steps: Option<u32>,
+    check_in_every: Option<u32>,
+) -> Result<String, String> {
+    let goal = goal.trim().to_string();
+    if goal.is_empty() {
+        return Err("Describe the goal first.".into());
+    }
+    let applications: Vec<String> = applications
+        .into_iter()
+        .map(|application| application.trim().to_string())
+        .filter(|application| !application.is_empty())
+        .collect();
+    if applications.is_empty() {
+        return Err("Choose at least one target application.".into());
+    }
+    let settings = get_settings(app.clone())?;
+    let max_steps = max_steps.unwrap_or(30).clamp(1, 100);
+    let check_in_every = check_in_every.unwrap_or(0);
+    let run_id = Uuid::new_v4().to_string();
+    let lock_path = run_lock_path(&app)?;
+    {
+        let state = app.state::<RuntimeState>();
+        let mut controls = state
+            .run_controls
+            .lock()
+            .map_err(|_| "Run control state is unavailable.")?;
+        if controls.contains_key(&run_id) {
+            return Err("This run is already active.".into());
+        }
+        controls.insert(run_id.clone(), "running".into());
+    }
+    let start = (|| {
+        try_acquire_run_lock(&lock_path, &run_id)?;
+        if cfg!(windows) {
+            let runtime = app.state::<RuntimeState>();
+            for required in &applications {
+                if required == "Alfred" || required == "Installed browser" {
+                    continue;
+                }
+                resolve_application_process_id(&app, &runtime, required)
+                    .map_err(|error| format!("{required} is not ready: {error}"))?;
+            }
+        }
+        save_checkpoint(
+            &app,
+            &RunCheckpoint {
+                run_id: run_id.clone(),
+                workflow_id: goal.clone(),
+                next_step_index: 0,
+                status: "running".into(),
+                error: None,
+                updated_at: Utc::now(),
+            },
+        )
+    })();
+    if let Err(error) = start {
+        release_run_lock(&lock_path, &run_id);
+        if let Ok(mut controls) = app.state::<RuntimeState>().run_controls.lock() {
+            controls.remove(&run_id);
+        }
+        return Err(error);
+    }
+    let emitted_run = run_id.clone();
+    let app_for_run = app.clone();
+    let share_screenshots = settings.share_screenshots_with_planner;
+    let screenshot_retention = settings.screenshot_retention.clone();
+    tauri::async_runtime::spawn(async move {
+        drive_goal_run(
+            app_for_run.clone(),
+            emitted_run.clone(),
+            settings.provider.clone(),
+            goal,
+            applications,
+            max_steps,
+            check_in_every,
+            share_screenshots,
+        )
+        .await;
+        let final_status = get_checkpoint(app_for_run.clone(), emitted_run.clone())
+            .ok()
+            .flatten()
+            .map(|checkpoint| checkpoint.status)
+            .unwrap_or_default();
+        cleanup_run_screenshots(&app_for_run, &emitted_run, &screenshot_retention, &final_status);
+        release_run_lock(&lock_path, &emitted_run);
         if let Ok(mut controls) = app_for_run.state::<RuntimeState>().run_controls.lock() {
             controls.remove(&emitted_run);
         }
     });
     Ok(run_id)
+}
+
+fn run_screenshots_dir(app: &AppHandle, run_id: &str) -> Result<PathBuf, String> {
+    let path = app_data_dir(app)?.join("run-screenshots").join(run_id);
+    fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+fn screenshot_slug(application: &str) -> String {
+    application
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+fn should_keep_screenshots(retention: &str, final_status: &str) -> bool {
+    match retention {
+        "all" => true,
+        "failures" => final_status == "failed",
+        _ => false,
+    }
+}
+
+/// Runs do not survive an app restart, so any folder left here is residue from a
+/// crashed or interrupted session.
+fn sweep_stale_screenshots(app: &AppHandle) {
+    if let Ok(root) = app_data_dir(app).map(|dir| dir.join("run-screenshots")) {
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+fn cleanup_run_screenshots(app: &AppHandle, run_id: &str, retention: &str, final_status: &str) {
+    if !should_keep_screenshots(retention, final_status) {
+        if let Ok(dir) = app_data_dir(app).map(|dir| dir.join("run-screenshots").join(run_id)) {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Captures one screenshot per target application into the run's private folder.
+/// Returns the file paths (attached to planner turns for vision-capable CLIs)
+/// and the first capture as a data URL (shown in the cockpit timeline). Prunes
+/// the folder to the newest dozen files so long runs cannot fill the disk.
+fn capture_run_screenshots(
+    app: &AppHandle,
+    run_id: &str,
+    applications: &[String],
+    step_index: u32,
+    pinned_tab: Option<i64>,
+) -> (Vec<PathBuf>, Option<String>) {
+    use base64::Engine;
+    let mut paths = Vec::new();
+    let mut evidence = None;
+    let Ok(dir) = run_screenshots_dir(app, run_id) else {
+        return (paths, evidence);
+    };
+    for application in applications {
+        let captured: Option<(String, Option<String>)> = if application == "Installed browser" {
+            let mut params = serde_json::json!({});
+            if let (Some(tab), Value::Object(ref mut map)) = (pinned_tab, &mut params) {
+                map.insert("tabId".to_string(), Value::from(tab));
+            }
+            send_browser_command_inner(
+                app.clone(),
+                BrowserCommand {
+                    id: "goal-capture".into(),
+                    method: "captureVisible".into(),
+                    effect: "observe".into(),
+                    intent: "capture the page for planner vision".into(),
+                    target_label: None,
+                    params,
+                },
+                false,
+            )
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("result")
+                    .and_then(|result| result.get("dataUrl"))
+                    .and_then(Value::as_str)
+                    .map(|data_url| {
+                        (
+                            data_url.trim_start_matches("data:image/png;base64,").to_string(),
+                            Some(data_url.to_string()),
+                        )
+                    })
+            })
+        } else if cfg!(windows) {
+            let runtime = app.state::<RuntimeState>();
+            resolve_application_process_id(app, &runtime, application)
+                .and_then(|pid| {
+                    let request = ActionRequest {
+                        protocol_version: protocol_version(),
+                        run_id: run_id.into(),
+                        workflow_step: "goal-capture".into(),
+                        application: application.clone(),
+                        intent: format!("capture {application} for planner vision"),
+                        effect: "observe".into(),
+                        target_label: None,
+                        payload: Some(serde_json::json!({ "processId": pid })),
+                    };
+                    execute_native_action_inner(
+                        app,
+                        &runtime,
+                        request,
+                        "captureWindow".into(),
+                        Duration::from_secs(15),
+                        false,
+                    )
+                })
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("base64")
+                        .and_then(Value::as_str)
+                        .map(|base64| (base64.to_string(), None))
+                })
+        } else {
+            None
+        };
+        if let Some((png_base64, data_url)) = captured {
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&png_base64) {
+                let path = dir.join(format!(
+                    "step-{step_index:04}-{}.png",
+                    screenshot_slug(application)
+                ));
+                if fs::write(&path, bytes).is_ok() {
+                    paths.push(path);
+                    if evidence.is_none() {
+                        evidence = Some(
+                            data_url.unwrap_or_else(|| format!("data:image/png;base64,{png_base64}")),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir(&dir) {
+        let mut files: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().map(|ext| ext == "png").unwrap_or(false))
+            .collect();
+        files.sort();
+        let excess = files.len().saturating_sub(12);
+        for stale in files.into_iter().take(excess) {
+            let _ = fs::remove_file(stale);
+        }
+    }
+    (paths, evidence)
 }
 
 #[tauri::command]
@@ -1506,6 +3334,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(RuntimeState::default())
         .setup(|app| {
+            sweep_stale_screenshots(app.handle());
             start_scheduler(app.handle().clone());
             let args: Vec<String> = std::env::args().collect();
             if let Some(index) = args.iter().position(|value| value == "--run-workflow") {
@@ -1514,13 +3343,14 @@ pub fn run() {
                         let _ = window.hide();
                     }
                     if let Ok(settings) = get_settings(app.handle().clone()) {
-                        if let Ok(run_id) = start_workflow_run(
+                        match start_workflow_run(
                             app.handle().clone(),
                             settings.library_path,
                             workflow_id.clone(),
                             None,
                         ) {
-                            let scheduled_app = app.handle().clone();
+                            Ok(run_id) => {
+                                let scheduled_app = app.handle().clone();
                             tauri::async_runtime::spawn(async move {
                                 loop {
                                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -1542,6 +3372,8 @@ pub fn run() {
                                     }
                                 }
                             });
+                            }
+                            Err(_) => app.handle().exit(1),
                         }
                     }
                 }
@@ -1567,7 +3399,9 @@ pub fn run() {
             evaluate_action,
             get_checkpoint,
             start_workflow_run,
+            start_goal_run,
             set_run_control,
+            approve_run_step,
             list_schedules,
             save_schedule,
             set_schedule_enabled,
@@ -1648,8 +3482,201 @@ mod tests {
     }
     #[test]
     fn provider_commands_are_restricted() {
-        let (_, args) = provider_invocation("codex", "plan").unwrap();
+        let (_, args) = provider_invocation("codex", "plan", &[]).unwrap();
         assert!(args.contains(&"read-only".to_string()));
         assert!(args.contains(&"--skip-git-repo-check".to_string()));
+    }
+    #[test]
+    fn codex_attaches_images_before_the_prompt() {
+        let images = vec![PathBuf::from("/tmp/a.png"), PathBuf::from("/tmp/b.png")];
+        let (_, args) = provider_invocation("codex", "plan", &images).unwrap();
+        let flag = args.iter().position(|arg| arg == "--image").unwrap();
+        assert_eq!(args[flag + 1], "/tmp/a.png,/tmp/b.png");
+        assert_eq!(args.last().map(String::as_str), Some("plan"));
+        // No images, no flag.
+        let (_, plain) = provider_invocation("codex", "plan", &[]).unwrap();
+        assert!(!plain.iter().any(|arg| arg == "--image"));
+    }
+    #[test]
+    fn copilot_attaches_images_as_attachments() {
+        let images = vec![PathBuf::from("/tmp/a.png"), PathBuf::from("/tmp/b.png")];
+        let (_, args) = provider_invocation("copilot", "plan", &images).unwrap();
+        let flags: Vec<_> = args
+            .iter()
+            .filter(|arg| arg.as_str() == "--attachment")
+            .collect();
+        assert_eq!(flags.len(), 2);
+        assert!(args.iter().any(|arg| arg == "/tmp/a.png"));
+        assert!(args.iter().any(|arg| arg == "/tmp/b.png"));
+        // Path-delivery providers keep clean args; their pipe is the prompt text.
+        let (_, grok) = provider_invocation("grok", "plan", &images).unwrap();
+        assert!(!grok.iter().any(|arg| arg.contains("a.png")));
+        assert!(matches!(
+            provider_image_delivery("codex"),
+            Some(ImageDelivery::Flag)
+        ));
+        assert!(matches!(
+            provider_image_delivery("copilot"),
+            Some(ImageDelivery::Flag)
+        ));
+        assert!(matches!(
+            provider_image_delivery("grok"),
+            Some(ImageDelivery::PromptPaths)
+        ));
+        assert!(matches!(
+            provider_image_delivery("cursor"),
+            Some(ImageDelivery::PromptPaths)
+        ));
+    }
+    #[test]
+    fn mutating_methods_cannot_masquerade_as_observe() {
+        // A prompt-injected planner (or hand-edited YAML) declaring "observe" on a
+        // mutating method must not skip the permission grant.
+        assert_eq!(effective_effect("typeText", "observe"), "unknown");
+        assert_eq!(effective_effect("setValue", "observe"), "unknown");
+        assert_eq!(effective_effect("browser.click", "observe"), "unknown");
+        assert_eq!(effective_effect("observeWindow", "observe"), "observe");
+        assert_eq!(effective_effect("browser.observe", "observe"), "observe");
+        assert_eq!(effective_effect("getValue", "observe"), "observe");
+        assert_eq!(effective_effect("typeText", "modify_reversible"), "modify_reversible");
+    }
+    #[test]
+    fn screenshot_retention_policy() {
+        assert!(should_keep_screenshots("all", "completed"));
+        assert!(should_keep_screenshots("failures", "failed"));
+        assert!(!should_keep_screenshots("failures", "completed"));
+        assert!(!should_keep_screenshots("none", "failed"));
+        assert_eq!(screenshot_slug("Microsoft Edge"), "microsoft-edge");
+        assert_eq!(screenshot_slug("Installed browser"), "installed-browser");
+    }
+    #[test]
+    fn blocks_delete_virtual_key_payload() {
+        // The keyword filters cannot see that virtual-key 0x2E is the Delete key;
+        // the policy must deny it through the non-semantic channel.
+        let mut value = request("press key", "modify_reversible", Some("File list"));
+        value.payload = Some(serde_json::json!({"virtualKey": 46}));
+        assert_eq!(evaluate_base_policy(&value).decision, "hard_deny");
+    }
+    #[test]
+    fn allows_navigation_virtual_key_payload() {
+        let mut value = request("press enter", "modify_reversible", Some("OK"));
+        value.payload = Some(serde_json::json!({"virtualKey": 13}));
+        assert_eq!(evaluate_base_policy(&value).decision, "allow");
+    }
+    #[test]
+    fn run_lock_rejects_overlap_and_allows_resume_and_stale_takeover() {
+        let path = std::env::temp_dir().join(format!("alfred-test-lock-{}.json", Uuid::new_v4()));
+        try_acquire_run_lock(&path, "run-a").unwrap();
+        // A second, different run is refused while the first is active.
+        assert!(try_acquire_run_lock(&path, "run-b").is_err());
+        // The same run may re-acquire (checkpoint resume).
+        assert!(try_acquire_run_lock(&path, "run-a").is_ok());
+        // A stale lock (crashed owner) can be taken over.
+        let stale = Utc::now() - chrono::Duration::minutes(RUN_LOCK_STALE_MINUTES + 5);
+        fs::write(
+            &path,
+            serde_json::json!({"runId": "run-c", "updatedAt": stale.to_rfc3339()}).to_string(),
+        )
+        .unwrap();
+        assert!(try_acquire_run_lock(&path, "run-b").is_ok());
+        // Only the owner releases the lock.
+        release_run_lock(&path, "run-a");
+        assert!(path.exists());
+        release_run_lock(&path, "run-b");
+        assert!(!path.exists());
+    }
+    #[test]
+    fn substitutes_variables_in_nested_payloads() {
+        let mut variables = HashMap::new();
+        variables.insert("invoice".to_string(), "INV-1042".to_string());
+        let mut payload = serde_json::json!({
+            "text": "Invoice ${invoice}",
+            "steps": ["${invoice}", 42, true],
+            "nested": { "url": "https://example.test/${invoice}" }
+        });
+        substitute_variables(&mut payload, &variables);
+        assert_eq!(payload["text"], "Invoice INV-1042");
+        assert_eq!(payload["steps"][0], "INV-1042");
+        assert_eq!(payload["steps"][1], 42);
+        assert_eq!(payload["nested"]["url"], "https://example.test/INV-1042");
+        // Unknown placeholders are left untouched so the failure stays visible.
+        let mut unknown = serde_json::json!({"text": "${missing}"});
+        substitute_variables(&mut unknown, &variables);
+        assert_eq!(unknown["text"], "${missing}");
+    }
+    #[test]
+    fn extracts_saved_values_from_native_and_browser_results() {
+        let native = serde_json::json!({ "value": "hello" });
+        assert_eq!(extract_saved_value(&native).as_deref(), Some("hello"));
+        let browser = serde_json::json!({ "ok": true, "result": { "text": "page text" } });
+        assert_eq!(extract_saved_value(&browser).as_deref(), Some("page text"));
+        let nothing = serde_json::json!({ "clicked": true });
+        assert_eq!(extract_saved_value(&nothing), None);
+    }
+    #[test]
+    fn step_conditions_and_save_as_default_off_in_old_workflows() {
+        // Workflows recorded before phase 2 must still deserialize unchanged.
+        let legacy = serde_json::json!({
+            "id": "one", "title": "Click OK", "kind": "click", "effect": "modify_reversible"
+        });
+        let step: WorkflowStep = serde_json::from_value(legacy).unwrap();
+        assert!(step.wait_for.is_none());
+        assert!(step.expect.is_none());
+        assert!(step.save_as.is_none());
+    }
+    #[test]
+    fn parses_clean_planner_json() {
+        let reply = parse_planner_action(
+            "{\"done\": false, \"kind\": \"invokeElement\", \"application\": \"Notepad\", \"effect\": \"modify_reversible\", \"payload\": {\"name\": \"Format\"}}",
+        )
+        .unwrap();
+        assert!(!reply.done);
+        assert_eq!(reply.kind.as_deref(), Some("invokeElement"));
+        assert_eq!(reply.application.as_deref(), Some("Notepad"));
+    }
+    #[test]
+    fn parses_planner_json_wrapped_in_prose_and_fences() {
+        let output = "Here is my next action:\n```json\n{\"done\": false, \"kind\": \"key\", \"payload\": {\"virtualKey\": 13}}\n```\nThat presses Enter.";
+        let reply = parse_planner_action(output).unwrap();
+        assert_eq!(reply.kind.as_deref(), Some("key"));
+        let done = parse_planner_action("All finished.\n{\"done\": true, \"summary\": \"Saved the file.\"}").unwrap();
+        assert!(done.done);
+        assert_eq!(done.summary.as_deref(), Some("Saved the file."));
+    }
+    #[test]
+    fn rejects_planner_output_without_an_action() {
+        assert!(parse_planner_action("I cannot help with that.").is_err());
+        assert!(parse_planner_action("{\"message\": \"no action here\"}").is_err());
+    }
+    #[test]
+    fn planner_prompt_carries_goal_observations_and_rules() {
+        let prompt = build_planner_prompt(
+            "Copy the total into Notepad",
+            &["Installed browser".to_string(), "Notepad".to_string()],
+            "Installed browser:\npage: https://example.test",
+            &["browser.navigate — ok".to_string()],
+        );
+        assert!(prompt.contains("Copy the total into Notepad"));
+        assert!(prompt.contains("https://example.test"));
+        assert!(prompt.contains("browser.navigate — ok"));
+        assert!(prompt.contains("NEVER propose deletion"));
+        assert!(prompt.contains("Never include processId"));
+    }
+    #[test]
+    fn native_tree_summary_keeps_actionable_controls_only() {
+        let tree = serde_json::json!({
+            "name": "", "controlType": "ControlType.Pane",
+            "children": [
+                { "name": "File", "controlType": "ControlType.MenuItem", "automationId": "mFile", "children": [] },
+                { "name": "", "controlType": "ControlType.Pane", "children": [
+                    { "name": "Save", "controlType": "ControlType.Button", "automationId": "btnSave", "children": [] }
+                ]}
+            ]
+        });
+        let mut lines = Vec::new();
+        summarize_native_tree(&tree, &mut lines, 0);
+        assert!(lines.iter().any(|line| line.contains("MenuItem") && line.contains("mFile")));
+        assert!(lines.iter().any(|line| line.contains("Button") && line.contains("btnSave")));
+        assert!(!lines.iter().any(|line| line.contains("Pane")));
     }
 }

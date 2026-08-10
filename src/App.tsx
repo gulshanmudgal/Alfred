@@ -186,6 +186,7 @@ function Home({ workflows, onCreate, onRun }: { workflows: Workflow[]; onCreate:
         <div className="command-copy"><strong>Describe your everyday task</strong><span>Alfred will plan it, show every action, and help you refine it.</span></div>
         <button onClick={onCreate}>Start describing <Icon name="arrow" size={17} /></button>
       </section>
+      <GoalLauncher onRun={onRun} />
       <section className="section-block">
         <div className="section-heading"><div><h2>{workflows.length ? "Your workflows" : "See how Alfred works"}</h2><p>{workflows.length ? "Continue where you left off or run something again." : "Try a safe simulation, then create your own workflow."}</p></div><button className="text-button">View all <Icon name="arrow" size={15} /></button></div>
         <div className="workflow-grid">
@@ -198,6 +199,39 @@ function Home({ workflows, onCreate, onRun }: { workflows: Workflow[]; onCreate:
         <button>Review protection</button>
       </section>
     </div>
+  );
+}
+
+function GoalLauncher({ onRun }: { onRun: (workflow: Workflow) => void }) {
+  const [goal, setGoal] = useState("");
+  const [apps, setApps] = useState("");
+  const start = () => {
+    const applications = apps.split(",").map((app) => app.trim()).filter(Boolean);
+    if (!goal.trim() || !applications.length) return;
+    const now = new Date().toISOString();
+    onRun({
+      id: `goal-${crypto.randomUUID()}`,
+      name: goal.trim().length > 48 ? `${goal.trim().slice(0, 48)}…` : goal.trim(),
+      goal: goal.trim(),
+      version: "1.0.0",
+      createdAt: now,
+      updatedAt: now,
+      status: "goal",
+      requiredApps: applications,
+      steps: [],
+    });
+  };
+  return (
+    <section className="command-card goal-launcher">
+      <div className="command-icon"><Icon name="brain" size={22} /></div>
+      <div className="command-copy goal-launcher-fields">
+        <strong>Run a goal with the live planner</strong>
+        <span>The planner observes your apps and acts step by step, with Alfred's safety engine and your approvals supervising every action.</span>
+        <input value={goal} onChange={(event) => setGoal(event.target.value)} placeholder="Goal, e.g. Copy the invoice total from the open Edge page into Notepad" />
+        <input value={apps} onChange={(event) => setApps(event.target.value)} placeholder="Target apps, comma separated — e.g. Installed browser, Notepad" />
+      </div>
+      <button disabled={!goal.trim() || !apps.trim()} onClick={start}>Run goal <Icon name="arrow" size={17} /></button>
+    </section>
   );
 }
 
@@ -298,6 +332,9 @@ function WorkflowStudio({ workflow, settings, onWorkflowChanged, onClose }: { wo
   const [method, setMethod] = useState("browser.observe");
   const [target, setTarget] = useState("");
   const [parameters, setParameters] = useState("{}");
+  const [waitFor, setWaitFor] = useState("");
+  const [expect, setExpect] = useState("");
+  const [saveAs, setSaveAs] = useState("");
   const [providerLines, setProviderLines] = useState<string[]>([]);
   const [providerSession, setProviderSession] = useState("");
   const [error, setError] = useState("");
@@ -313,17 +350,23 @@ function WorkflowStudio({ workflow, settings, onWorkflowChanged, onClose }: { wo
     setError("");
     try {
       const payload = JSON.parse(parameters);
-      const effect = method.endsWith("observe") || method === "observeWindow" || method === "captureWindow" ? "observe" : "modify_reversible";
-      const step = { id: crypto.randomUUID(), title: target || method, kind: method, effect, application, intent: `${method} ${target}`.trim(), targetLabel: target || undefined, payload, timeoutMs: 30000, retries: 1 };
+      const effect = method.endsWith("observe") || method === "observeWindow" || method === "captureWindow" || method === "findElement" || method === "getValue" || method === "browser.getText" ? "observe" : "modify_reversible";
+      const step = {
+        id: crypto.randomUUID(), title: target || method, kind: method, effect, application,
+        intent: `${method} ${target}`.trim(), targetLabel: target || undefined, payload, timeoutMs: 30000, retries: 1,
+        waitFor: waitFor.trim() ? { name: waitFor.trim() } : undefined,
+        expect: expect.trim() ? { name: expect.trim() } : undefined,
+        saveAs: saveAs.trim() ? saveAs.trim() : undefined,
+      };
       const saved = await invoke<Workflow>("record_action", { libraryPath: settings.libraryPath, workflowId: workflow.id, step });
-      setSteps(saved.steps); setTarget(""); setParameters("{}");
+      setSteps(saved.steps); setTarget(""); setParameters("{}"); setWaitFor(""); setExpect(""); setSaveAs("");
       if (effect !== "observe") await invoke("grant_permission", { application: method.startsWith("browser.") ? "Installed browser" : application, allowedEffects: [effect], allowedIntents: [method.split(".").at(-1)] });
     } catch (caught) { setError(`Could not record action: ${String(caught)}`); }
   };
   const finalize = async () => { try { await invoke("finalize_recording", { libraryPath: settings.libraryPath, workflowId: workflow.id }); await onWorkflowChanged(); onClose(); } catch (caught) { setError(String(caught)); } };
   return <div className="page workflow-studio"><section className="page-title"><div><button className="back-button" onClick={onClose}>‹</button><span className="eyebrow">WORKFLOW RECORDER</span><h1>{workflow.name}</h1><p>{workflow.goal}</p></div><button className="primary-button" disabled={!steps.length} onClick={finalize}>Finalize workflow</button></section>
     <div className="studio-grid"><section className="settings-section"><h2>1. Ask the selected brain</h2><p>Alfred runs the installed {settings.provider} CLI in a supervised, read-only planning session.</p><div className="studio-actions"><button className="secondary-button" disabled={!!providerSession} onClick={askProvider}><Icon name="brain" size={17}/> Generate plan</button>{providerSession && <button className="secondary-button" onClick={async () => { await invoke("cancel_provider_run", { sessionId: providerSession }); setProviderSession(""); }}>Stop planner</button>}</div><pre className="provider-console">{providerLines.length ? providerLines.join("\n") : "Provider output appears here. Review it before recording actions."}</pre></section>
-      <section className="settings-section"><h2>2. Record an approved action</h2><p>Choose a narrow semantic method. Parameters are kept in the portable workflow YAML.</p><div className="record-form"><label>Application<input value={application} onChange={event => setApplication(event.target.value)}/></label><label>Method<select value={method} onChange={event => setMethod(event.target.value)}><option>browser.observe</option><option>browser.navigate</option><option>browser.click</option><option>browser.type</option><option>observeWindow</option><option>captureWindow</option><option>invokeElement</option><option>click</option><option>typeText</option><option>key</option></select></label><label>Target label<input value={target} onChange={event => setTarget(event.target.value)} placeholder="Invoice number field"/></label><label>Parameters (JSON)<textarea value={parameters} onChange={event => setParameters(event.target.value)} rows={4}/></label><button className="primary-button" onClick={addStep}>Record action</button></div></section></div>
+      <section className="settings-section"><h2>2. Record an approved action</h2><p>Choose a narrow semantic method. Parameters are kept in the portable workflow YAML.</p><div className="record-form"><label>Application<input value={application} onChange={event => setApplication(event.target.value)}/></label><label>Method<select value={method} onChange={event => setMethod(event.target.value)}><option>browser.observe</option><option>browser.navigate</option><option>browser.click</option><option>browser.type</option><option>browser.getText</option><option>resolveApplication</option><option>activate</option><option>observeWindow</option><option>captureWindow</option><option>findElement</option><option>getValue</option><option>invokeElement</option><option>setValue</option><option>click</option><option>typeText</option><option>key</option></select></label><label>Target label<input value={target} onChange={event => setTarget(event.target.value)} placeholder="Invoice number field"/></label><label>Parameters (JSON)<textarea value={parameters} onChange={event => setParameters(event.target.value)} rows={4}/></label><label>Wait for (optional label)<input value={waitFor} onChange={event => setWaitFor(event.target.value)} placeholder="Results table"/></label><label>Expect after (optional label)<input value={expect} onChange={event => setExpect(event.target.value)} placeholder="Saved confirmation"/></label><label>Save result as (optional variable)<input value={saveAs} onChange={event => setSaveAs(event.target.value)} placeholder="invoiceNumber"/></label><button className="primary-button" onClick={addStep}>Record action</button></div></section></div>
     {error && <div className="error-message">{error}</div>}
     <section className="panel-surface recorded-steps"><div className="panel-heading"><span>Recorded steps</span><b>{steps.length}</b></div>{steps.map((step, index) => <div className="plan-step done" key={step.id}><span className="step-marker">{index + 1}</span><div><strong>{step.title}</strong><small>{step.application} · {step.kind} · {step.effect}</small></div></div>)}{!steps.length && <p>No actions recorded yet.</p>}</section>
   </div>;
@@ -334,6 +377,7 @@ function ExecutionCockpit({ workflow, settings, onClose }: { workflow: Workflow;
   const [runId, setRunId] = useState("");
   const [paused, setPaused] = useState(false);
   const [takeover, setTakeover] = useState(false);
+  const [startError, setStartError] = useState("");
   const queued = useRef<RunEvent[]>([]);
   const activeRun = useRef("");
 
@@ -348,13 +392,17 @@ function ExecutionCockpit({ workflow, settings, onClose }: { workflow: Workflow;
   }, [paused, takeover]);
 
   useEffect(() => {
-    const command = workflow.status === "example" ? "start_demo_run" : "start_workflow_run";
-    const args = workflow.status === "example" ? { workflowId: workflow.id } : { libraryPath: settings.libraryPath, workflowId: workflow.id, resumeRunId: null };
+    const command = workflow.status === "example" ? "start_demo_run" : workflow.status === "goal" ? "start_goal_run" : "start_workflow_run";
+    const args = workflow.status === "example"
+      ? { workflowId: workflow.id }
+      : workflow.status === "goal"
+        ? { goal: workflow.goal, applications: workflow.requiredApps }
+        : { libraryPath: settings.libraryPath, workflowId: workflow.id, resumeRunId: null };
     invoke<string>(command, args).then((id) => {
       activeRun.current = id; setRunId(id);
-    });
+    }).catch((caught) => setStartError(String(caught)));
     return () => { activeRun.current = ""; };
-  }, [workflow.id, workflow.status, settings.libraryPath]);
+  }, [workflow.id, workflow.status, workflow.goal, workflow.requiredApps, settings.libraryPath]);
 
   const resume = () => {
     setPaused(false); setTakeover(false);
@@ -366,25 +414,37 @@ function ExecutionCockpit({ workflow, settings, onClose }: { workflow: Workflow;
     if (control === "paused") setPaused(true); else onClose();
   };
   const retryFromCheckpoint = async () => {
-    const id = await invoke<string>("start_workflow_run", { libraryPath: settings.libraryPath, workflowId: workflow.id, resumeRunId: runId });
-    activeRun.current = id; setPaused(false); setTakeover(false);
+    try {
+      setStartError("");
+      const id = await invoke<string>("start_workflow_run", { libraryPath: settings.libraryPath, workflowId: workflow.id, resumeRunId: runId });
+      activeRun.current = id; setPaused(false); setTakeover(false);
+    } catch (caught) { setStartError(String(caught)); }
+  };
+  const approveWaitingStep = async () => {
+    try { await invoke("approve_run_step", { runId }); }
+    catch (caught) { setStartError(String(caught)); }
   };
   const current = events.at(-1);
   const progress = current?.progress ?? 3;
-  const complete = progress === 100;
-  const planned = workflow.steps.length ? workflow.steps.map(step => step.title) : ["Prepare workspace", "Open approved website", "Read invoice table", "Check safety policy", "Append workbook rows", "Verify the result"];
+  const complete = progress === 100 && current?.status !== "failed";
+  const waitingApproval = current?.status === "waiting";
+  const planned = workflow.status === "goal"
+    ? (events.length ? events.filter((event) => event.status === "completed").map((event) => event.title).slice(-8) : ["The planner decides each step live — actions appear here as they happen."])
+    : workflow.steps.length ? workflow.steps.map(step => step.title) : ["Prepare workspace", "Open approved website", "Read invoice table", "Check safety policy", "Append workbook rows", "Verify the result"];
 
   return (
     <div className="cockpit">
       <div className="cockpit-header">
-        <div><button className="back-button" onClick={onClose}>‹</button><span className="run-kicker">{complete ? "RUN COMPLETED" : takeover ? "USER IN CONTROL" : paused ? "RUN PAUSED" : "RUNNING SAFELY"}</span><h1>{workflow.name}</h1></div>
+        <div><button className="back-button" onClick={onClose}>‹</button><span className="run-kicker">{complete ? "RUN COMPLETED" : waitingApproval ? "WAITING FOR APPROVAL" : takeover ? "USER IN CONTROL" : paused ? "RUN PAUSED" : "RUNNING SAFELY"}</span><h1>{workflow.name}</h1></div>
         <div className="run-controls">
-          {current?.status === "failed" && workflow.status !== "example" && <button className="primary-button" onClick={retryFromCheckpoint}>Retry from checkpoint</button>}
-          {(paused || takeover) ? <button className="secondary-button" onClick={resume}><Icon name="runs" size={16} /> Resume</button> : <button className="secondary-button" onClick={() => controlRun("paused")}><Icon name="pause" size={16} /> Pause</button>}
+          {current?.status === "failed" && workflow.status !== "example" && workflow.status !== "goal" && <button className="primary-button" onClick={retryFromCheckpoint}>Retry from checkpoint</button>}
+          {(paused || takeover || current?.status === "paused") ? <button className="secondary-button" onClick={resume}><Icon name="runs" size={16} /> Resume</button> : <button className="secondary-button" onClick={() => controlRun("paused")}><Icon name="pause" size={16} /> Pause</button>}
           <button className="secondary-button" onClick={() => { controlRun("paused"); setTakeover(true); }}><Icon name="hand" size={16} /> Take over</button>
           <button className="danger-button" onClick={() => controlRun("stop")}><Icon name="stop" size={15} /> Stop</button>
         </div>
       </div>
+      {startError && <div className="error-message">{startError}</div>}
+      {waitingApproval && <div className="approval-banner panel-surface"><div><strong>Alfred needs your approval</strong><span>{current?.detail}</span></div><div className="run-controls"><button className="primary-button" onClick={approveWaitingStep}>Approve this action</button><button className="danger-button" onClick={() => controlRun("stop")}>Deny and stop</button></div></div>}
       <div className="progress-track"><span style={{ width: `${progress}%` }} /></div>
       <div className="cockpit-grid">
         <section className="plan-panel panel-surface">
@@ -529,6 +589,7 @@ function SettingsView({ settings, providers, system, onSave }: { settings: AppSe
     <section className="settings-section"><h2>Application permissions</h2><p>Alfred observes app state by default. Reversible changes require an explicit application grant.</p><div className="permission-add"><input value={permissionApp} onChange={event => setPermissionApp(event.target.value)} placeholder="Application name"/><button onClick={addPermission}>Allow reversible changes</button></div><div className="permission-list">{permissions.map(permission => <div key={permission.id}><div><strong>{permission.application}</strong><span>{permission.allowedEffects.join(", ")}</span></div><button onClick={async () => setPermissions(await invoke<PermissionGrant[]>("set_permission_enabled", { permissionId: permission.id, enabled: !permission.enabled }))}>{permission.enabled ? "Enabled" : "Disabled"}</button></div>)}</div></section>
     <section className="settings-section"><h2>Workflow library</h2><p>Automations are portable YAML files in a folder you control.</p><div className="settings-path"><Icon name="folder" size={18}/><span>{draft.libraryPath}</span><button onClick={choose}>Change</button></div><small className="platform-note">Running on {system.os} · {system.architecture}</small></section>
     <section className="settings-section"><h2>Screenshot retention</h2><select value={draft.screenshotRetention} onChange={(event) => setDraft({ ...draft, screenshotRetention: event.target.value as AppSettings["screenshotRetention"] })}><option value="failures">Only when a run needs attention</option><option value="all">Every run</option><option value="none">Discard immediately</option></select></section>
+    <section className="settings-section"><h2>Planner vision</h2><p>Attach a screenshot of each target app to planner turns so the planner can see the desktop, not just read it. Images leave this device to the provider's API.</p><label className="toggle-row"><input type="checkbox" checked={draft.shareScreenshotsWithPlanner} onChange={(event) => setDraft({ ...draft, shareScreenshotsWithPlanner: event.target.checked })}/><span>Share screenshots with the planner (Codex and Copilot attach them directly; Grok and Cursor read the screenshot files Alfred lists in the prompt)</span></label></section>
     <section className="settings-section danger-zone"><h2>Safety policy</h2><div className="immutable-setting"><Icon name="shield" size={19}/><div><strong>Persistent-data deletion blocked</strong><span>This protection is enforced in Core, the Windows host, and the browser extension.</span></div><span>Always on</span></div></section>
   </div>{message && <div className="info-callout"><Icon name="check" size={18}/><span>{message}</span></div>}<div className="settings-save"><span>{saved ? "Settings saved" : "Changes stay local to this machine."}</span><button className="primary-button" onClick={async () => { await onSave(draft); setSaved(true); setTimeout(() => setSaved(false), 1800); }}>Save changes</button></div></div>;
 }

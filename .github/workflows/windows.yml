@@ -6,7 +6,19 @@ on:
   pull_request:
 jobs:
   build-and-test:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            hostRid: win-x64
+            artifact: x64
+          - os: windows-11-arm
+            triple: aarch64-pc-windows-msvc
+            hostRid: win-arm64
+            artifact: arm64
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -16,20 +28,18 @@ jobs:
         with: { dotnet-version: 10.0.x }
       - run: npm ci
       - run: npm run build
-      - run: dotnet publish native/windows-host/Alfred.WindowsHost.csproj -c Release -r win-x64 --self-contained true
+      - run: dotnet publish native/windows-host/Alfred.WindowsHost.csproj -c Release -r ${{ matrix.hostRid }} --self-contained true
       - name: Stage Windows automation sidecar
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
-          Copy-Item native/windows-host/bin/Release/net10.0-windows/win-x64/publish/alfred-windows-host.exe src-tauri/binaries/alfred-windows-host-x86_64-pc-windows-msvc.exe -Force
+          Copy-Item native/windows-host/bin/Release/net10.0-windows/${{ matrix.hostRid }}/publish/alfred-windows-host.exe src-tauri/binaries/alfred-windows-host-${{ matrix.triple }}.exe -Force
       - run: cargo test --release --manifest-path src-tauri/Cargo.toml
       - shell: pwsh
-        run: ./scripts/windows/test-e2e.ps1 -SkipDesktop -HostPath native/windows-host/bin/Release/net10.0-windows/win-x64/publish/alfred-windows-host.exe
+        run: ./scripts/windows/test-e2e.ps1 -SkipDesktop -HostPath native/windows-host/bin/Release/net10.0-windows/${{ matrix.hostRid }}/publish/alfred-windows-host.exe
       - shell: pwsh
-        run: ./scripts/windows/package.ps1
+        run: ./scripts/windows/package.ps1 -Triple ${{ matrix.triple }}
       - uses: actions/upload-artifact@v4
         with:
-          name: Alfred-Windows-installers
-          path: |
-            src-tauri/target/release/bundle/nsis/*
-            src-tauri/target/release/bundle/msi/*
+          name: Alfred-Windows-installers-${{ matrix.artifact }}
+          path: src-tauri/target/${{ matrix.triple }}/release/bundle/*
