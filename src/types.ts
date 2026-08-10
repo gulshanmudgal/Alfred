@@ -103,3 +103,12 @@ export interface RunEvent {
   evidenceDataUrl?: string;
   timestamp: string;
 }
+
+export interface RunCheckpoint {
+  runId: string;
+  workflowId: string;
+  nextStepIndex: number;
+  status: string;
+  error?: string | null;
+  updatedAt: string;
+}

@@ -753,6 +753,23 @@ fn provider_command(
     Ok((process, invocation.stdin))
 }
 
+/// Preflight used when a goal run starts: resolves the configured planner CLI
+/// exactly the way provider_command does — including the Windows command-script
+/// policy — without spawning anything. A missing or unsupervisable CLI fails the
+/// invoke immediately, so the cockpit shows a clear error instead of starting a
+/// run whose planner turns all die before the first timeline event arrives.
+fn preflight_provider(provider: &str) -> Result<(), String> {
+    let invocation = provider_invocation(provider, "preflight", &[])?;
+    let resolved = resolve_provider_command(&invocation.command).ok_or_else(|| {
+        format!(
+            "{} is not available to Alfred. Install it, sign in, then restart Alfred.",
+            invocation.command
+        )
+    })?;
+    let _ = resolved_process(&resolved, &invocation.args, provider == "codex")?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn start_provider_run(
     app: AppHandle,
@@ -2250,8 +2267,11 @@ async fn park_run_for_approval(
     }
 }
 
+/// Async for the same reason as start_goal_run: the Windows app-resolution
+/// preflight below performs native-host round-trips that must not block the
+/// WebView's main thread.
 #[tauri::command]
-fn start_workflow_run(
+async fn start_workflow_run(
     app: AppHandle,
     library_path: String,
     workflow_id: String,
@@ -3332,8 +3352,10 @@ async fn drive_goal_run(
 
 /// Starts an agent run: the planner proposes, the policy engine disposes.
 /// Takes the same machine-wide run lock as workflow replays.
+/// Async so the Windows native-host preflight cannot freeze the WebView's main
+/// thread — a frozen window right after "Run goal" looks identical to a hang.
 #[tauri::command]
-fn start_goal_run(
+async fn start_goal_run(
     app: AppHandle,
     goal: String,
     applications: Vec<String>,
@@ -3353,6 +3375,9 @@ fn start_goal_run(
         return Err("Choose at least one target application.".into());
     }
     let settings = get_settings(app.clone())?;
+    // Fail fast when the planner CLI cannot be supervised on this machine;
+    // otherwise the run dies off-screen and the cockpit looks stuck.
+    preflight_provider(&settings.provider)?;
     let max_steps = max_steps.unwrap_or(30).clamp(1, 100);
     let check_in_every = check_in_every.unwrap_or(0);
     let run_id = Uuid::new_v4().to_string();
@@ -3858,12 +3883,14 @@ pub fn run() {
                         let _ = window.hide();
                     }
                     if let Ok(settings) = get_settings(app.handle().clone()) {
-                        match start_workflow_run(
+                        // setup is synchronous; drive the async command to
+                        // completion before wiring the exit watchdog.
+                        match tauri::async_runtime::block_on(start_workflow_run(
                             app.handle().clone(),
                             settings.library_path,
                             workflow_id.clone(),
                             None,
-                        ) {
+                        )) {
                             Ok(run_id) => {
                                 let scheduled_app = app.handle().clone();
                             tauri::async_runtime::spawn(async move {

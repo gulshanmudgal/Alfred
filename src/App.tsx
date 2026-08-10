@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Icon } from "./icons";
-import type { AppSettings, PermissionGrant, ProviderEvent, ProviderStatus, RunEvent, SystemInfo, View, Workflow, WorkflowSchedule, WorkflowStep } from "./types";
+import type { AppSettings, PermissionGrant, ProviderEvent, ProviderStatus, RunCheckpoint, RunEvent, SystemInfo, View, Workflow, WorkflowSchedule, WorkflowStep } from "./types";
 
 const starterWorkflows: Workflow[] = [
   {
@@ -430,16 +430,36 @@ function ExecutionCockpit({ workflow, settings, onClose }: { workflow: Workflow;
   const [startError, setStartError] = useState("");
   const queued = useRef<RunEvent[]>([]);
   const activeRun = useRef("");
+  // The backend starts emitting run events as soon as the run spawns, which can
+  // beat the invoke() response that carries the run id. Hold those early events
+  // instead of dropping them — a run that fails before the id arrives must not
+  // leave the cockpit spinning forever. Only one run drives the machine at a
+  // time (the core's run lock), so early events can only belong to this run.
+  const early = useRef<RunEvent[]>([]);
+  const pausedRef = useRef(false);
+  const takeoverRef = useRef(false);
 
   useEffect(() => {
-    let dispose: (() => void) | undefined;
-    listen<RunEvent>("alfred://run-event", ({ payload }) => {
-      if (payload.runId !== activeRun.current) return;
-      if (paused || takeover) queued.current.push(payload);
-      else setEvents((current) => [...current, payload]);
-    }).then((unlisten) => { dispose = unlisten; });
-    return () => dispose?.();
+    pausedRef.current = paused;
+    takeoverRef.current = takeover;
   }, [paused, takeover]);
+
+  // Subscribe once: re-subscribing on pause/takeover would open a gap in which
+  // events are silently missed.
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    let active = true;
+    listen<RunEvent>("alfred://run-event", ({ payload }) => {
+      if (!active) return;
+      if (payload.runId !== activeRun.current) {
+        if (!activeRun.current) early.current.push(payload);
+        return;
+      }
+      if (pausedRef.current || takeoverRef.current) queued.current.push(payload);
+      else setEvents((current) => [...current, payload]);
+    }).then((unlisten) => { if (active) dispose = unlisten; else unlisten(); });
+    return () => { active = false; dispose?.(); };
+  }, []);
 
   useEffect(() => {
     const command = workflow.status === "example" ? "start_demo_run" : workflow.status === "goal" ? "start_goal_run" : "start_workflow_run";
@@ -449,10 +469,43 @@ function ExecutionCockpit({ workflow, settings, onClose }: { workflow: Workflow;
         ? { goal: workflow.goal, applications: workflow.requiredApps }
         : { libraryPath: settings.libraryPath, workflowId: workflow.id, resumeRunId: null };
     invoke<string>(command, args).then((id) => {
-      activeRun.current = id; setRunId(id);
+      activeRun.current = id;
+      setRunId(id);
+      const held = early.current.filter((event) => event.runId === id);
+      early.current = [];
+      if (held.length) setEvents((current) => [...current, ...held]);
     }).catch((caught) => setStartError(String(caught)));
-    return () => { activeRun.current = ""; };
+    return () => { activeRun.current = ""; early.current = []; };
   }, [workflow.id, workflow.status, workflow.goal, workflow.requiredApps, settings.libraryPath]);
+
+  // Silence watchdog: if the run reached a terminal state before any timeline
+  // event could be displayed, surface its checkpoint instead of spinning with
+  // no explanation.
+  useEffect(() => {
+    if (!runId || events.length > 0 || startError || workflow.status === "example") return;
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      invoke<RunCheckpoint | null>("get_checkpoint", { runId }).then((checkpoint) => {
+        if (cancelled || !checkpoint || checkpoint.status === "running") return;
+        if (checkpoint.status === "completed") {
+          setEvents((current) => current.length ? current : [{
+            runId,
+            sequence: checkpoint.nextStepIndex,
+            stepId: "recovered",
+            title: "Run completed",
+            detail: "The run finished before its timeline could be displayed.",
+            application: "Alfred",
+            status: "completed",
+            progress: 100,
+            timestamp: checkpoint.updatedAt,
+          }]);
+        } else {
+          setStartError(`The run ended before it could show progress: ${checkpoint.error ?? "it was stopped."}`);
+        }
+      }).catch(() => undefined);
+    }, 3000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [runId, events.length, startError, workflow.status]);
 
   const resume = () => {
     setPaused(false); setTakeover(false);
