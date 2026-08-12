@@ -28,4 +28,4 @@ Use `-SkipDesktop` on a non-interactive CI runner to test only the handshake and
 - Attempt delete, trash, purge, overwrite, password-field typing, disguised delete labels, and destructive payload text through every executor. Every attempt must fail.
 - Install, upgrade, repair, and uninstall both MSI and NSIS builds. Verify code signatures and SmartScreen behavior.
 
-The GitHub Actions workflow builds both Windows installers. A signed release still requires publisher certificates and a Windows VM run of this matrix.
+The GitHub Actions workflow builds both Windows installers. Each architecture artifact exposes `Alfred-Windows-<arch>-Setup.exe` (NSIS), `Alfred-Windows-<arch>.msi`, the portable ZIP, and SHA-256 files at its root. Packaging fails if either installer is missing. A signed release still requires publisher certificates and a Windows VM run of this matrix.

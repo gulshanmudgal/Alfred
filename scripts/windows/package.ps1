@@ -20,6 +20,26 @@ npm run tauri build -- --target $Triple --config src-tauri/tauri.windows.conf.js
 & "scripts\windows\verify-gui-subsystem.ps1" -Executable "src-tauri\target\$Triple\release\alfred.exe"
 
 $distribution = Join-Path $root "dist\windows"
+New-Item -ItemType Directory -Force -Path $distribution | Out-Null
+
+# Copy Tauri's versioned bundles to stable, obvious artifact names. Keeping the
+# installers under dist/windows also lets CI upload them at the artifact root
+# instead of burying them under src-tauri/target/<triple>/release/bundle.
+$bundleDirectory = Join-Path $root "src-tauri\target\$Triple\release\bundle"
+$nsisBundles = @(Get-ChildItem -Path (Join-Path $bundleDirectory "nsis\*.exe") -File)
+$msiBundles = @(Get-ChildItem -Path (Join-Path $bundleDirectory "msi\*.msi") -File)
+if ($nsisBundles.Count -ne 1) {
+  throw "Expected exactly one NSIS installer under $bundleDirectory, found $($nsisBundles.Count)."
+}
+if ($msiBundles.Count -ne 1) {
+  throw "Expected exactly one MSI installer under $bundleDirectory, found $($msiBundles.Count)."
+}
+
+$nsisInstaller = Join-Path $distribution "Alfred-Windows-$arch-Setup.exe"
+$msiInstaller = Join-Path $distribution "Alfred-Windows-$arch.msi"
+Copy-Item $nsisBundles[0].FullName $nsisInstaller -Force
+Copy-Item $msiBundles[0].FullName $msiInstaller -Force
+
 $portable = Join-Path $distribution "portable-$arch"
 New-Item -ItemType Directory -Force -Path $portable | Out-Null
 Copy-Item "src-tauri\target\$Triple\release\alfred.exe" (Join-Path $portable "Alfred.exe") -Force
@@ -31,7 +51,13 @@ Copy-Item "scripts\windows\install-browser-bridge.ps1" (Join-Path $portable "scr
 $archive = Join-Path $distribution "Alfred-Windows-$arch-portable.zip"
 if (Test-Path $archive) { Remove-Item $archive -Force }
 Compress-Archive -Path (Join-Path $portable "*") -DestinationPath $archive -CompressionLevel Optimal
-$hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
-Set-Content -Path "$archive.sha256" -Value "$hash  Alfred-Windows-$arch-portable.zip" -Encoding ASCII
-Write-Host "Portable release: $archive"
 
+foreach ($releaseFile in @($nsisInstaller, $msiInstaller, $archive)) {
+  $hash = (Get-FileHash -Algorithm SHA256 $releaseFile).Hash.ToLowerInvariant()
+  $fileName = Split-Path $releaseFile -Leaf
+  Set-Content -Path "$releaseFile.sha256" -Value "$hash  $fileName" -Encoding ASCII
+}
+
+Write-Host "NSIS installer: $nsisInstaller"
+Write-Host "MSI installer: $msiInstaller"
+Write-Host "Portable release: $archive"
