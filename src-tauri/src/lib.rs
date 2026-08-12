@@ -338,6 +338,14 @@ pub struct GoalRunMemory {
     completion_evidence: Vec<String>,
     #[serde(default)]
     verification_attempts: u32,
+    /// Most recent user-authored text that Alfred proved was entered into an
+    /// application. External-publication goals use it as an outcome anchor: the
+    /// same text must later appear in non-editable, current desktop state before
+    /// a completion claim can pass.
+    #[serde(default)]
+    last_typed_text: Option<String>,
+    #[serde(default)]
+    last_typed_application: Option<String>,
     status: String,
     #[serde(default)]
     completion_summary: Option<String>,
@@ -937,6 +945,7 @@ const ALLOWED_PLAN_METHODS: &[&str] = &[
     "launchApplication",
     "listInstalledApplications",
     "focusApplication",
+    "navigateApplication",
     "observeWindow",
     "captureWindow",
     "findElement",
@@ -965,6 +974,41 @@ fn method_effect(method: &str) -> &'static str {
     } else {
         "modify_reversible"
     }
+}
+
+fn is_native_browser_application(application: &str) -> bool {
+    matches!(
+        application.to_ascii_lowercase().as_str(),
+        "microsoft edge" | "google chrome" | "brave"
+    )
+}
+
+fn is_safe_http_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.is_empty() || trimmed.len() > 2048 || trimmed.chars().any(char::is_control) {
+        return false;
+    }
+    let authority = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .and_then(|rest| rest.split(['/', '?', '#']).next());
+    if authority.is_none_or(|value| value.is_empty() || value.contains('@')) {
+        return false;
+    }
+    tauri::Url::parse(trimmed).is_ok_and(|parsed| {
+        matches!(parsed.scheme(), "https" | "http")
+            && parsed.host_str().is_some()
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+    })
+}
+
+fn native_browser_application(applications: &[String]) -> String {
+    applications
+        .iter()
+        .find(|application| is_native_browser_application(application))
+        .cloned()
+        .unwrap_or_else(|| "Microsoft Edge".into())
 }
 
 fn validate_workflow_step(step: &WorkflowStep) -> Result<(), String> {
@@ -1007,6 +1051,19 @@ fn validate_workflow_step(step: &WorkflowStep) -> Result<(), String> {
             .unwrap_or(false)
     {
         return Err("Only CTRL+L and CTRL+S are allowed shortcuts.".into());
+    }
+    if step.kind == "navigateApplication" {
+        let application = step.application.as_deref().unwrap_or_default();
+        let url = params
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !is_native_browser_application(application) || !is_safe_http_url(url) {
+            return Err(
+                "navigateApplication requires Edge, Chrome, or Brave and an absolute HTTP(S) URL."
+                    .into(),
+            );
+        }
     }
     if matches!(
         step.kind.as_str(),
@@ -2273,7 +2330,7 @@ async fn park_run_for_approval(
     run_id: &str,
     workflow_id: &str,
     index: usize,
-    total: usize,
+    progress: u8,
     step: &WorkflowStep,
     application: &str,
     error: String,
@@ -2302,7 +2359,7 @@ async fn park_run_for_approval(
             detail: format!("Approval needed: {reason}"),
             application: application.into(),
             status: "waiting".into(),
-            progress: (index * 100 / total) as u8,
+            progress,
             evidence_data_url: None,
             timestamp: Utc::now(),
         },
@@ -2666,7 +2723,7 @@ async fn drive_workflow_run(
                         &run_id,
                         &workflow.id,
                         index,
-                        total,
+                        (index * 100 / total.max(1)) as u8,
                         step,
                         &application,
                         error,
@@ -3039,7 +3096,13 @@ fn planner_refusal_as_done(output: &str) -> Option<PlannerReply> {
 /// page dump cannot flood the next prompt. Preserves paging metadata so the
 /// planner can continue with browser.read { offset }.
 fn planner_result_digest(value: &Value) -> String {
-    let result = value.get("result").cloned().unwrap_or(Value::Null);
+    // Browser-bridge replies retain a `result` envelope, while the native host
+    // is unwrapped by `execute_native_action_inner`. Digest both shapes so a
+    // verified native write is visible to the next planner turn.
+    let result = value
+        .get("result")
+        .cloned()
+        .unwrap_or_else(|| value.clone());
     let mut parts = Vec::new();
     match &result {
         Value::String(text) if !text.trim().is_empty() => {
@@ -3051,6 +3114,7 @@ fn planner_result_digest(value: &Value) -> String {
             if let Some(text) = map
                 .get("text")
                 .or_else(|| map.get("value"))
+                .or_else(|| map.get("observedText"))
                 .and_then(Value::as_str)
                 .filter(|text| !text.trim().is_empty())
             {
@@ -3375,6 +3439,8 @@ fn summarize_native_tree(node: &Value, out: &mut Vec<String>, depth: usize) {
         .get("automationId")
         .and_then(Value::as_str)
         .unwrap_or("");
+    let enabled = node.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    let bounds = node.get("bounds").and_then(Value::as_object);
     let interesting = matches!(
         control,
         "ControlType.Button"
@@ -3399,6 +3465,21 @@ fn summarize_native_tree(node: &Value, out: &mut Vec<String>, depth: usize) {
         }
         if !automation_id.is_empty() {
             line.push_str(&format!(" (id: {automation_id})"));
+        }
+        if !enabled {
+            line.push_str(" [disabled]");
+        }
+        if let Some(bounds) = bounds {
+            let x = bounds.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+            let y = bounds.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+            let width = bounds.get("width").and_then(Value::as_f64).unwrap_or(0.0);
+            let height = bounds.get("height").and_then(Value::as_f64).unwrap_or(0.0);
+            if width > 0.0 && height > 0.0 {
+                line.push_str(&format!(
+                    " [screen x={:.0} y={:.0} w={:.0} h={:.0}]",
+                    x, y, width, height
+                ));
+            }
         }
         out.push(line);
     }
@@ -3468,15 +3549,28 @@ fn summarize_browser_read(result: &Value, out: &mut Vec<String>) {
     }
 }
 
-/// Playwright-style browser playbook injected when the goal targets the web.
-/// Teaches the planner to read content (not invent it), page through long UIs,
-/// and stop cleanly on login/CAPTCHA walls.
-fn browser_skill_block() -> &'static str {
+/// Browser playbook injected when the goal targets the web. Capability
+/// availability is explicit: extension-only methods are never advertised in
+/// native visual mode, so the planner cannot route an Edge action into a bridge
+/// that is not connected.
+fn browser_skill_block(bridge_connected: bool) -> &'static str {
+    if !bridge_connected {
+        return r#"
+
+BROWSER SKILL — NATIVE VISUAL MODE (the optional extension is NOT connected):
+- `browser.*` methods and the pseudo-application "Installed browser" are unavailable. Never propose either one.
+- Operate the exact native browser listed in TARGET APPLICATIONS (normally Microsoft Edge).
+- Navigate with one bounded action: navigateApplication {"url":"https://..."}. Core restricts it to Edge/Chrome/Brave and HTTP(S). Then observeWindow.
+- Use observeWindow/findElement/getValue for semantic state, setValue/invokeElement where UI Automation exposes them, and click only with screenshot-grounded coordinates inside the browser window.
+- Screenshots attached to each turn are the visual ground truth. Re-observe after every navigation, compose, and submission.
+- For X posting, navigating directly to https://x.com/compose/post is allowed. Confirm the signed-in composer is visible. Target its editable control—not the browser address bar—when entering text; typeText itself verifies the text landed there. Click the enabled composer Post control, then navigate to the user's profile or X Latest search and re-observe. The exact authored text must appear as a published, non-editable post before claiming completion; a closed composer or successful click receipt is not publication proof.
+- A login wall or CAPTCHA is a concrete blocker. Never invent success and never ask for credentials.
+- One small action per reply. Do not retry an unchanged action after an error."#;
+    }
     r#"
 
-BROWSER SKILL (use for any website / portal / dashboard task):
-Alfred is hybrid: use the DOM bridge when CURRENT DESKTOP STATE contains a connected "Installed browser" observation. The extension is optional. If the bridge is unavailable, operate Microsoft Edge / Google Chrome / Brave as a normal native application with launchApplication, observeWindow, UIA selectors, screenshots, and safe keyboard input. Never keep retrying a missing bridge.
-When the DOM bridge is connected, you control the user's already-logged-in Chromium tab through Alfred — similar to Playwright, but every action is policy-gated.
+BROWSER SKILL — DOM ACCELERATOR CONNECTED:
+The optional extension is connected, so `browser.*` methods and application "Installed browser" are available for the user's already-logged-in Chromium tab. Every action remains policy-gated.
 1. browser.navigate {"url":"..."} when the goal includes a link or you must change pages.
 2. browser.wait {"text":"visible fragment","timeoutMs":12000} after navigations while SPAs load.
 3. browser.observe lists interactive controls with refs (e1, e2, …). Use it before click/type when you need refs.
@@ -3581,11 +3675,28 @@ fn planner_app_list(applications: &[String]) -> String {
     }
 }
 
-fn planner_app_rule(applications: &[String]) -> &'static str {
-    if applications.is_empty() {
-        "Name the target application yourself in every action, based on the goal; browser actions use \"Installed browser\"."
+fn planner_app_rule_for_capabilities(
+    applications: &[String],
+    bridge_connected: bool,
+) -> &'static str {
+    if bridge_connected {
+        if applications.is_empty() {
+            "Name the target application yourself in every action, based on the goal. Use application \"Installed browser\" for browser.* actions."
+        } else {
+            "Use application names exactly as listed. For browser.* actions, use the listed pseudo-application \"Installed browser\"."
+        }
+    } else if applications.is_empty() {
+        "Name one exact native application in every action based on the goal. The pseudo-application \"Installed browser\" and every browser.* method are unavailable."
     } else {
-        "Use application names exactly as listed; browser actions use \"Installed browser\"."
+        "Use application names exactly as listed. The pseudo-application \"Installed browser\" and every browser.* method are unavailable."
+    }
+}
+
+fn planner_methods(bridge_connected: bool) -> &'static str {
+    if bridge_connected {
+        "listApplications (application \"Alfred\"; lists running app windows) | listInstalledApplications (application \"Alfred\"; lists exact launchable Start-menu names) | browser.observe | browser.navigate {\"url\"} | browser.click {\"ref\"} | browser.type {\"ref\",\"text\"} | browser.getText {\"ref\"} | browser.read {\"offset\":0} | browser.scroll {\"direction\":\"down\"} or {\"text\":\"find visible text\"} | browser.find {\"text\":\"label\"} | browser.wait {\"text\":\"fragment\",\"timeoutMs\":12000} | launchApplication | focusApplication | activate | observeWindow | captureWindow | findElement | getValue | invokeElement | setValue | click | typeText | key | shortcut"
+    } else {
+        "listApplications (application \"Alfred\"; lists running app windows) | listInstalledApplications (application \"Alfred\"; lists exact launchable Start-menu names) | launchApplication (exact installed Start-menu application) | navigateApplication {\"url\":\"https://...\"} (Edge/Chrome/Brave only) | focusApplication | activate | observeWindow | captureWindow | findElement {\"automationId\"|\"name\"|\"controlType\"} | getValue (same selectors) | invokeElement (same selectors) | setValue (selectors + \"value\") | click {\"x\",\"y\"} | typeText {\"text\", optional \"automationId\"|\"name\"|\"controlType\"} | key {\"virtualKey\":13|9|27} | shortcut {\"keys\":\"CTRL+L\"|\"CTRL+S\"}"
     }
 }
 
@@ -3595,6 +3706,7 @@ fn build_planner_prompt(
     observations: &str,
     history: &[String],
     plan: &[String],
+    bridge_connected: bool,
 ) -> String {
     let history_text = if history.is_empty() {
         "(none yet)".to_string()
@@ -3613,14 +3725,23 @@ fn build_planner_prompt(
         format!("\n\nCURRENT PLAN (your outline; follow it, or return an updated plan):\n{outline}")
     };
     let skill = if goal_needs_browser_skill(goal, applications) {
-        browser_skill_block()
+        browser_skill_block(bridge_connected)
     } else {
         ""
     };
+    let capability = if bridge_connected {
+        "optional DOM browser accelerator: connected"
+    } else {
+        "optional DOM browser accelerator: not connected; native application control only"
+    };
     let mut prompt = format!(
-        "You are the planning brain of Alfred, a supervised desktop automation agent running on the user's machine. Propose the next single action toward the goal.\n\nGOAL: {goal}\n\nTARGET APPLICATIONS: {apps}\n\nCURRENT DESKTOP STATE:\n{observations}\n\nACTION HISTORY (oldest first):\n{history_text}{plan_text}{skill}\n\nReply with exactly one JSON object and nothing else (no markdown fences, no prose):\n{{\"done\": false, \"title\": \"short human label\", \"kind\": \"<method>\", \"application\": \"<exact app name>\", \"intent\": \"what and why\", \"effect\": \"observe|create|modify_reversible|external_write\", \"targetLabel\": \"<element label>\", \"payload\": {{...}}}}\nWhen the goal appears fully complete, reply: {{\"done\": true, \"summary\": \"what was accomplished\"}}. Alfred treats this as a completion claim and performs a fresh evidence-review turn before closing the run.\nIf the goal has multiple phases, you may instead reply {{\"plan\": [\"short phase\", ...]}} (no \"kind\") to outline or revise your approach; it is pinned below as CURRENT PLAN.\n\nMethods: listApplications (application \"Alfred\"; lists running app windows) | listInstalledApplications (application \"Alfred\"; lists exact launchable Start-menu names) | browser.observe | browser.navigate {{\"url\"}} | browser.click {{\"ref\"}} | browser.type {{\"ref\",\"text\"}} | browser.getText {{\"ref\"}} | browser.read {{\"offset\":0}} (page text: headings/tables/grids/articles; ~6000 chars/chunk; page with offset while hasMore) | browser.scroll {{\"direction\":\"down\"}} or {{\"text\":\"find visible text\"}} | browser.find {{\"text\":\"label\"}} (returns refs) | browser.wait {{\"text\":\"fragment\",\"timeoutMs\":12000}} | launchApplication (an exact installed Start-menu application) | focusApplication | activate {{}} | observeWindow | findElement {{\"automationId\"|\"name\"|\"controlType\"}} | getValue (same selectors) | invokeElement (same selectors) | setValue (selectors + \"value\") | click {{\"x\",\"y\"}} | typeText {{\"text\"}} | key {{\"virtualKey\": 13|9|27}} (Enter, Tab, Escape only).\n\nRules:\n- One small action per reply; observe or find before click/type when unsure.\n- browser.observe lists interactive elements only; for page CONTENT use browser.read (auto-preview may already appear under CURRENT DESKTOP STATE).\n- NEVER propose deletion, trash, purge, overwrite, password entry, shell commands, or credential handling. Alfred hard-blocks them regardless of what you return.\n- Prefer setValue/invokeElement (semantic, focus-independent) over click/typeText.\n- Never include processId; Alfred injects the live one.\n- {app_rule}\n- If the last action failed or changed nothing, try a different approach instead of repeating it.\n- If a target application is not running, propose launchApplication. If the exact installed name is uncertain, call listInstalledApplications first.\n- Never claim to have read or analyzed content that does not appear in CURRENT DESKTOP STATE or ACTION HISTORY; if you cannot access the content the goal needs, reply done with a summary explaining the blocker instead of inventing results.",
+        "You are the planning brain of Alfred, a supervised desktop automation agent running on the user's machine. Propose the next single action toward the goal.\n\nGOAL: {goal}\n\nTARGET APPLICATIONS: {apps}\n\nAVAILABLE CAPABILITIES: {capability}\n\nCURRENT DESKTOP STATE:\n{observations}\n\nACTION HISTORY (oldest first):\n{history_text}{plan_text}{skill}\n\nReply with exactly one JSON object and nothing else (no markdown fences, no prose):\n{{\"done\": false, \"title\": \"short human label\", \"kind\": \"<method>\", \"application\": \"<exact app name>\", \"intent\": \"what and why\", \"effect\": \"observe|create|modify_reversible|external_write\", \"targetLabel\": \"<element label>\", \"payload\": {{...}}}}\nWhen the goal appears fully complete, reply: {{\"done\": true, \"summary\": \"what was accomplished\"}}. Alfred treats this as a completion claim and performs a fresh evidence-review turn before closing the run.\nIf the goal has multiple phases, you may instead reply {{\"plan\": [\"short phase\", ...]}} (no \"kind\") to outline or revise your approach; it is pinned below as CURRENT PLAN.\n\nMethods available on this turn: {methods}.\n\nRules:\n- One small action per reply; observe or find before click/type when unsure.\n- NEVER propose deletion, trash, purge, overwrite, password entry, shell commands, or credential handling. Alfred hard-blocks them regardless of what you return.\n- Prefer setValue/invokeElement (semantic, focus-independent) over click/typeText.\n- Never include processId; Alfred injects the live one.\n- {app_rule}\n- If the last action failed or changed nothing, try a different approach instead of repeating it.\n- If a target application is not running, propose launchApplication. If the exact installed name is uncertain, call listInstalledApplications first.\n- Never claim to have read or analyzed content that does not appear in CURRENT DESKTOP STATE or ACTION HISTORY; if you cannot access the content the goal needs, reply done with a summary explaining the blocker instead of inventing results.",
         apps = planner_app_list(applications),
-        app_rule = planner_app_rule(applications),
+        methods = planner_methods(bridge_connected),
+        app_rule = planner_app_rule_for_capabilities(applications, bridge_connected),
+    );
+    prompt.push_str(
+        "\n- For typeText, name the intended editable control in targetLabel and include any selectors visible in CURRENT DESKTOP STATE. Alfred rejects the action unless it can focus that target and read the entered text back from it.\n- Never treat a successful input or click call as proof of the final outcome. Re-observe the destination and verify the requested result itself is visible.",
     );
     prompt.push_str(
         "\n- `shortcut` is available for two allow-listed combinations only: {\"keys\":\"CTRL+L\"} focuses a browser/Explorer address bar; {\"keys\":\"CTRL+S\"} opens Save/Save As.",
@@ -3808,6 +3929,12 @@ fn fail_goal_run(
 const GOAL_RUN_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const MAX_PLANNER_HISTORY: usize = 40;
 
+/// Goal runs have no arbitrary action ceiling. Progress is deliberately
+/// asymptotic and stays below 100 until evidence-backed completion.
+fn goal_run_progress(step_index: usize) -> u8 {
+    ((step_index.saturating_mul(4)).min(95)) as u8
+}
+
 fn remember_goal_event(memory: &mut GoalRunMemory, entry: String) {
     memory.history.push(entry);
     while memory.history.len() > MAX_PLANNER_HISTORY {
@@ -3815,10 +3942,46 @@ fn remember_goal_event(memory: &mut GoalRunMemory, entry: String) {
     }
 }
 
-fn append_completion_review(prompt: &mut String, claim: &str) {
+fn goal_requires_published_text(goal: &str) -> bool {
+    let lower = goal.to_ascii_lowercase();
+    lower.contains("tweet")
+        || lower.contains("twitter")
+        || (lower.contains("x.com") && lower.contains("post"))
+        || lower.contains("publish a post")
+        || lower.contains("post on social")
+}
+
+fn authored_text_anchor(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.len() < 3 || trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return None;
+    }
+    Some(trimmed.chars().take(500).collect())
+}
+
+fn append_completion_review(
+    prompt: &mut String,
+    claim: &str,
+    required_text: Option<&str>,
+    require_published_text: bool,
+) {
     prompt.push_str(&format!(
-        "\n\nCOMPLETION REVIEW — do not trust the earlier claim. Re-check it only against CURRENT DESKTOP STATE and concrete successful results in ACTION HISTORY. Earlier claim: {claim}\nIf every requested outcome is visibly evidenced, reply exactly {{\"done\":true,\"verified\":true,\"summary\":\"verified outcome\",\"evidence\":[\"specific visible fact\",\"specific successful result\"]}}. Evidence must name concrete UI text/state or an action result above. If anything is missing or uncertain, reply with verified:false and the next corrective action using the normal action schema. Never mark a blocker as successful completion."
+        "\n\nCOMPLETION REVIEW — do not trust the earlier claim. Re-check it only against CURRENT DESKTOP STATE from this fresh turn. ACTION HISTORY proves only that an input was attempted; it is never final-outcome evidence. Earlier claim: {claim}\n"
     ));
+    if require_published_text {
+        if let Some(text) = required_text {
+            prompt.push_str(&format!(
+                "REQUIRED PUBLISHED TEXT: {text}\nThe required text must be visible now as non-editable published content. Text still inside an Edit/Document composer, a closed composer, navigation to a feed, or a successful Post click is not proof. Navigate to the user's profile or an exact Latest search and observe the matching post before completing.\n"
+            ));
+        } else {
+            prompt.push_str(
+                "No verified authored-text anchor has been recorded yet, so this publication goal cannot complete. Enter the content into the intended composer and let Alfred verify that input before submitting.\n",
+            );
+        }
+    }
+    prompt.push_str(
+        "If every requested outcome is visibly evidenced, reply exactly {\"done\":true,\"verified\":true,\"summary\":\"verified outcome\",\"evidence\":[\"specific text or state visible in CURRENT DESKTOP STATE\"]}. Every evidence item must describe current visible state, not an earlier action receipt. If anything is missing or uncertain, reply with verified:false and the next corrective action using the normal action schema. Never mark a blocker as successful completion.",
+    );
 }
 
 fn evidence_matches_grounding(evidence: &str, grounding: &str) -> bool {
@@ -3851,15 +4014,62 @@ fn evidence_matches_grounding(evidence: &str, grounding: &str) -> bool {
     false
 }
 
-fn is_verified_completion(reply: &PlannerReply, grounding: &str) -> bool {
+/// Publication text must be present in static page content. UIA exposes browser
+/// composers and address bars as Edit/Document controls, so excluding those
+/// prevents a draft (or a misdirected address-bar write) from proving success.
+fn observation_contains_published_text(observation: &str, expected: &str) -> bool {
+    let expected_words: Vec<String> = expected
+        .to_ascii_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+        .collect();
+    if expected_words.len() < 3 {
+        return false;
+    }
+    let prefix_len = expected_words.len().min(10);
+    let expected_prefix = &expected_words[..prefix_len];
+    observation.lines().any(|line| {
+        let trimmed = line.trim_start();
+        if !(trimmed.starts_with("- Text ")
+            || trimmed.starts_with("- Hyperlink ")
+            || trimmed.starts_with("- ListItem "))
+        {
+            return false;
+        }
+        let static_words: Vec<String> = line
+            .to_ascii_lowercase()
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_string)
+            .collect();
+        // UIA labels are intentionally capped at 80 characters, so allow the
+        // tail to be truncated while requiring the authored word sequence—not
+        // just a bag of common topic words—in one static element. Aggregating
+        // across unrelated search results would allow a similar post to pass.
+        static_words
+            .windows(prefix_len)
+            .any(|window| window == expected_prefix)
+    })
+}
+
+fn is_verified_completion(
+    reply: &PlannerReply,
+    current_observation: &str,
+    required_text: Option<&str>,
+    require_published_text: bool,
+) -> bool {
     reply.done
         && reply.verified == Some(true)
         && reply.evidence.as_ref().is_some_and(|items| {
             !items.is_empty()
                 && items
                     .iter()
-                    .all(|item| evidence_matches_grounding(item, grounding))
+                    .all(|item| evidence_matches_grounding(item, current_observation))
         })
+        && (!require_published_text
+            || required_text
+                .is_some_and(|text| observation_contains_published_text(current_observation, text)))
 }
 
 /// The agent loop: observe → plan → policy-gate → execute → record, until the
@@ -3869,7 +4079,6 @@ fn is_verified_completion(reply: &PlannerReply, grounding: &str) -> bool {
 async fn drive_goal_run(
     app: AppHandle,
     mut memory: GoalRunMemory,
-    max_steps: u32,
     check_in_every: u32,
     share_screenshots: bool,
 ) {
@@ -3877,8 +4086,35 @@ async fn drive_goal_run(
     let provider = memory.provider.clone();
     let goal = memory.goal.clone();
     let lock_path = run_lock_path(&app).ok();
-    for step_index in memory.next_step_index as u32..max_steps {
-        memory.next_step_index = step_index as usize;
+    loop {
+        let step_index = memory.next_step_index;
+        // This is a durable planner-turn sequence, not a completion budget.
+        // Advancing before the turn also makes crash recovery monotonic.
+        memory.next_step_index = memory.next_step_index.saturating_add(1);
+        let bridge_connected = browser_bridge_status(app.clone()).unwrap_or(false);
+        if bridge_connected && goal_needs_browser_skill(&goal, &memory.applications) {
+            if !memory
+                .applications
+                .iter()
+                .any(|application| application.eq_ignore_ascii_case("Installed browser"))
+            {
+                memory.applications.push("Installed browser".into());
+            }
+        } else if !bridge_connected {
+            // A saved/continued run may contain the bridge pseudo-application
+            // from an earlier turn. Fall back to an executable native target as
+            // soon as the optional accelerator disappears.
+            for application in &mut memory.applications {
+                if application.eq_ignore_ascii_case("Installed browser") {
+                    *application = "Microsoft Edge".into();
+                }
+            }
+            memory.applications.sort_by_key(|item| item.to_lowercase());
+            memory
+                .applications
+                .dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+            memory.pinned_browser_tab = None;
+        }
         if wait_if_paused(&app, &run_id).await {
             memory.status = "stopped".into();
             let _ = save_goal_run_memory(&app, &mut memory);
@@ -3898,7 +4134,7 @@ async fn drive_goal_run(
             }
         }
         let _ = save_goal_run_memory(&app, &mut memory);
-        let progress = ((step_index * 100) / max_steps.max(1)) as u8;
+        let progress = goal_run_progress(step_index);
         emit_goal_event(
             &app,
             &run_id,
@@ -3925,7 +4161,7 @@ async fn drive_goal_run(
                 &app,
                 &run_id,
                 &memory.applications,
-                step_index,
+                step_index.min(u32::MAX as usize) as u32,
                 memory.pinned_browser_tab,
             )
         } else {
@@ -3946,9 +4182,15 @@ async fn drive_goal_run(
             &memory.last_observation,
             &memory.history,
             &memory.working_plan,
+            bridge_connected,
         );
         if let Some(claim) = memory.completion_claim.as_deref() {
-            append_completion_review(&mut prompt, claim);
+            append_completion_review(
+                &mut prompt,
+                claim,
+                memory.last_typed_text.as_deref(),
+                goal_requires_published_text(&goal),
+            );
         }
         // Flag providers receive the files as CLI attachments; path providers get
         // the file list in the prompt and their file reader supplies the vision.
@@ -4122,8 +4364,13 @@ async fn drive_goal_run(
             }
         };
         if reply.done {
-            let grounding = format!("{}\n{}", memory.last_observation, memory.history.join("\n"));
-            let verified_reply = is_verified_completion(&reply, &grounding);
+            let require_published_text = goal_requires_published_text(&goal);
+            let verified_reply = is_verified_completion(
+                &reply,
+                &memory.last_observation,
+                memory.last_typed_text.as_deref(),
+                require_published_text,
+            );
             let summary = reply
                 .summary
                 .unwrap_or_else(|| "The planner reports the goal is complete.".into());
@@ -4152,14 +4399,14 @@ async fn drive_goal_run(
                 memory.completion_summary = Some(summary.clone());
                 memory.completion_evidence = evidence.clone();
                 memory.pending_action = None;
-                memory.next_step_index = step_index as usize;
+                memory.next_step_index = step_index.saturating_add(1);
                 let _ = save_goal_run_memory(&app, &mut memory);
                 let _ = save_checkpoint(
                     &app,
                     &RunCheckpoint {
                         run_id: run_id.clone(),
                         workflow_id: goal.clone(),
-                        next_step_index: step_index as usize,
+                        next_step_index: step_index.saturating_add(1),
                         status: "completed".into(),
                         error: None,
                         updated_at: Utc::now(),
@@ -4225,10 +4472,9 @@ async fn drive_goal_run(
             }
         }
         // 3. Execute through the same policy-gated path as recorded workflows.
-        let kind = reply.kind.clone().unwrap_or_default();
-        let is_browser = kind.starts_with("browser.");
-        let application = reply.application.clone().unwrap_or_else(|| {
-            if is_browser {
+        let mut kind = reply.kind.clone().unwrap_or_default();
+        let mut application = reply.application.clone().unwrap_or_else(|| {
+            if kind.starts_with("browser.") {
                 "Installed browser".into()
             } else {
                 memory
@@ -4238,6 +4484,51 @@ async fn drive_goal_run(
                     .unwrap_or_else(|| "Alfred".into())
             }
         });
+        // Compatibility fallback for a provider that ignores the native method
+        // list. Navigation has an equivalent bounded host capability; all other
+        // bridge actions remain rejected and are sent back for re-planning.
+        if kind == "browser.navigate" && !bridge_connected {
+            kind = "navigateApplication".into();
+            application = native_browser_application(&memory.applications);
+            remember_goal_event(
+                &mut memory,
+                "translated unavailable browser.navigate to safe native navigateApplication".into(),
+            );
+        }
+        let is_browser = kind.starts_with("browser.");
+        if is_browser && !bridge_connected {
+            let message = format!(
+                "Rejected unavailable action {kind}: the optional browser extension is not connected. Use the native browser methods listed in AVAILABLE CAPABILITIES."
+            );
+            remember_goal_event(&mut memory, message.clone());
+            memory.pending_action = None;
+            memory.consecutive_failures += 1;
+            let _ = save_goal_run_memory(&app, &mut memory);
+            emit_goal_event(
+                &app,
+                &run_id,
+                step_index as usize,
+                "Planner chose an unavailable browser action",
+                &message,
+                "running",
+                progress,
+            );
+            if memory.consecutive_failures >= GOAL_RUN_MAX_CONSECUTIVE_FAILURES {
+                memory.status = "failed".into();
+                let _ = save_goal_run_memory(&app, &mut memory);
+                fail_goal_run(
+                    &app,
+                    &run_id,
+                    &goal,
+                    step_index as usize,
+                    progress,
+                    "The planner repeatedly ignored the available native browser capabilities."
+                        .into(),
+                );
+                return;
+            }
+            continue;
+        }
         if application != "Alfred"
             && !memory
                 .applications
@@ -4263,6 +4554,36 @@ async fn drive_goal_run(
             expect: None,
             save_as: None,
         };
+        if let Err(error) = validate_workflow_step(&step) {
+            let message = format!("Rejected invalid planner action {kind}: {error}");
+            remember_goal_event(&mut memory, message.clone());
+            memory.pending_action = None;
+            memory.consecutive_failures += 1;
+            let _ = save_goal_run_memory(&app, &mut memory);
+            emit_goal_event(
+                &app,
+                &run_id,
+                step_index as usize,
+                "Planner proposed an invalid action",
+                &message,
+                "running",
+                progress,
+            );
+            if memory.consecutive_failures >= GOAL_RUN_MAX_CONSECUTIVE_FAILURES {
+                memory.status = "failed".into();
+                let _ = save_goal_run_memory(&app, &mut memory);
+                fail_goal_run(
+                    &app,
+                    &run_id,
+                    &goal,
+                    step_index as usize,
+                    progress,
+                    "The planner repeatedly proposed invalid actions.".into(),
+                );
+                return;
+            }
+            continue;
+        }
         let mut payload = step
             .payload
             .clone()
@@ -4366,7 +4687,7 @@ async fn drive_goal_run(
                         &run_id,
                         &goal,
                         step_index as usize,
-                        max_steps as usize,
+                        progress,
                         &step,
                         &application,
                         error,
@@ -4394,6 +4715,16 @@ async fn drive_goal_run(
                 if step.effect != "observe" {
                     memory.actions_since_check_in += 1;
                 }
+                if matches!(kind.as_str(), "typeText" | "browser.type") {
+                    if let Some(text) = payload
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .and_then(authored_text_anchor)
+                    {
+                        memory.last_typed_text = Some(text);
+                        memory.last_typed_application = Some(application.clone());
+                    }
+                }
                 if is_browser {
                     if let Some(tab) = value
                         .get("result")
@@ -4409,8 +4740,8 @@ async fn drive_goal_run(
                         overrides.remove(&run_id);
                     }
                 }
-                let next_progress = (((step_index + 1) * 100) / max_steps.max(1)) as u8;
-                memory.next_step_index = (step_index + 1) as usize;
+                let next_progress = goal_run_progress(step_index.saturating_add(1));
+                memory.next_step_index = step_index.saturating_add(1);
                 let _ = save_goal_run_memory(&app, &mut memory);
                 let _ = app.emit(
                     "alfred://run-event",
@@ -4432,7 +4763,7 @@ async fn drive_goal_run(
                     &RunCheckpoint {
                         run_id: run_id.clone(),
                         workflow_id: goal.clone(),
-                        next_step_index: (step_index + 1) as usize,
+                        next_step_index: step_index.saturating_add(1),
                         status: "running".into(),
                         error: None,
                         updated_at: Utc::now(),
@@ -4491,18 +4822,6 @@ async fn drive_goal_run(
             }
         }
     }
-    memory.status = "failed".into();
-    memory.pending_action = None;
-    memory.next_step_index = max_steps as usize;
-    let _ = save_goal_run_memory(&app, &mut memory);
-    fail_goal_run(
-        &app,
-        &run_id,
-        &goal,
-        max_steps as usize,
-        100,
-        format!("Reached the step limit ({max_steps}) before the planner finished the goal."),
-    );
 }
 
 /// Starts an agent run: the planner proposes, the policy engine disposes.
@@ -4515,7 +4834,6 @@ async fn start_goal_run(
     goal: String,
     applications: Vec<String>,
     provider: Option<String>,
-    max_steps: Option<u32>,
     check_in_every: Option<u32>,
 ) -> Result<String, String> {
     let goal = goal.trim().to_string();
@@ -4547,7 +4865,6 @@ async fn start_goal_run(
     // Fail fast when the planner CLI cannot be supervised on this machine;
     // otherwise the run dies off-screen and the cockpit looks stuck.
     preflight_provider(&provider)?;
-    let max_steps = max_steps.unwrap_or(30).clamp(1, 100);
     let check_in_every = check_in_every.unwrap_or(0);
     let run_id = Uuid::new_v4().to_string();
     // Grok and Copilot accept a caller-selected UUID. Codex and Cursor emit the
@@ -4573,6 +4890,8 @@ async fn start_goal_run(
         completion_claim: None,
         completion_evidence: Vec::new(),
         verification_attempts: 0,
+        last_typed_text: None,
+        last_typed_application: None,
         status: "running".into(),
         completion_summary: None,
         updated_at: Utc::now(),
@@ -4629,7 +4948,6 @@ async fn start_goal_run(
         drive_goal_run(
             app_for_run.clone(),
             memory,
-            max_steps,
             check_in_every,
             share_screenshots,
         )
@@ -5015,7 +5333,6 @@ fn start_scheduler(app: AppHandle) {
                             workflow.goal,
                             workflow.required_apps,
                             workflow.planner_provider,
-                            None,
                             Some(0),
                         )
                         .await;
@@ -5137,7 +5454,6 @@ pub fn run() {
                                     workflow.goal,
                                     workflow.required_apps,
                                     workflow.planner_provider,
-                                    None,
                                     Some(0),
                                 ))
                             });
@@ -5672,27 +5988,70 @@ mod tests {
     #[test]
     fn completion_requires_explicit_nonempty_evidence() {
         let claim = parse_planner_action(r#"{"done":true,"summary":"Saved the file."}"#).unwrap();
-        let grounding = "Notepad: title Alfred smoke.txt\nSave file (shortcut) — ok";
-        assert!(!is_verified_completion(&claim, grounding));
+        let current = "Notepad: title Alfred smoke.txt\n- Text \"Saved as Alfred smoke.txt\"";
+        assert!(!is_verified_completion(&claim, current, None, false));
         let empty = parse_planner_action(
             r#"{"done":true,"verified":true,"summary":"Saved.","evidence":[]}"#,
         )
         .unwrap();
-        assert!(!is_verified_completion(&empty, grounding));
+        assert!(!is_verified_completion(&empty, current, None, false));
         let verified = parse_planner_action(
             r#"{"done":true,"verified":true,"summary":"Saved.","evidence":["Notepad title shows Alfred smoke.txt"]}"#,
         )
         .unwrap();
-        assert!(is_verified_completion(&verified, grounding));
+        assert!(is_verified_completion(&verified, current, None, false));
         let hallucinated = parse_planner_action(
             r#"{"done":true,"verified":true,"summary":"Saved.","evidence":["Excel shows quarterly revenue 42 million"]}"#,
         )
         .unwrap();
-        assert!(!is_verified_completion(&hallucinated, grounding));
+        assert!(!is_verified_completion(&hallucinated, current, None, false));
         let mut prompt = String::from("state");
-        append_completion_review(&mut prompt, "Saved the file");
+        append_completion_review(&mut prompt, "Saved the file", None, false);
         assert!(prompt.contains("do not trust the earlier claim"));
-        assert!(prompt.contains("specific visible fact"));
+        assert!(prompt.contains("CURRENT DESKTOP STATE"));
+    }
+
+    #[test]
+    fn publication_completion_requires_authored_text_in_static_current_state() {
+        let reply = parse_planner_action(
+            r#"{"done":true,"verified":true,"summary":"Tweet published.","evidence":["Profile shows Octopuses have three hearts"]}"#,
+        )
+        .unwrap();
+        let text = "Fun fact: Octopuses have three hearts and two stop beating when they swim.";
+        let published = "Microsoft Edge:\n- Text \"Fun fact: Octopuses have three hearts and two stop beating when they swim.\"";
+        assert!(is_verified_completion(&reply, published, Some(text), true));
+
+        let draft = "Microsoft Edge:\n- Edit \"Fun fact: Octopuses have three hearts and two stop beating when they swim.\"\n- Button \"Post\"";
+        assert!(!is_verified_completion(&reply, draft, Some(text), true));
+
+        let someone_elses_similar_post = "Microsoft Edge:\n- Text \"Fun fact: Octopuses have three hearts, blue blood, and two stop beating when they swim.\"";
+        assert!(!is_verified_completion(
+            &reply,
+            someone_elses_similar_post,
+            Some(text),
+            true
+        ));
+
+        let action_receipt =
+            "Click Post button (click) — ok\nConfirm tweet text (findElement) — ok";
+        assert!(!is_verified_completion(
+            &reply,
+            action_receipt,
+            Some(text),
+            true
+        ));
+
+        let mut prompt = String::from("state");
+        append_completion_review(&mut prompt, "Tweet published", Some(text), true);
+        assert!(prompt.contains("REQUIRED PUBLISHED TEXT"));
+        assert!(prompt.contains("non-editable published content"));
+    }
+
+    #[test]
+    fn live_goal_progress_never_implies_completion() {
+        assert_eq!(goal_run_progress(0), 0);
+        assert_eq!(goal_run_progress(10), 40);
+        assert_eq!(goal_run_progress(1000), 95);
     }
     #[test]
     fn rejects_planner_output_without_an_action() {
@@ -5886,6 +6245,7 @@ mod tests {
             "(no observations available)",
             &[],
             &[],
+            false,
         );
         assert!(prompt.contains("infer them from the goal"));
         assert!(prompt.contains("listApplications"));
@@ -5918,6 +6278,7 @@ mod tests {
             "Installed browser:\npage: https://app.datadoghq.test",
             &[],
             &["Open Datadog".to_string(), "Open RUM".to_string()],
+            true,
         );
         assert!(prompt.contains("CURRENT PLAN"));
         assert!(prompt.contains("2. Open RUM"));
@@ -5955,6 +6316,7 @@ mod tests {
             "Installed browser:\npage: https://app.datadoghq.com",
             &[],
             &[],
+            true,
         );
         assert!(prompt.contains("BROWSER SKILL"));
         assert!(prompt.contains("browser.find"));
@@ -5984,12 +6346,50 @@ mod tests {
             "Installed browser:\npage: https://example.test",
             &["browser.navigate — ok".to_string()],
             &[],
+            true,
         );
         assert!(prompt.contains("Copy the total into Notepad"));
         assert!(prompt.contains("https://example.test"));
         assert!(prompt.contains("browser.navigate — ok"));
         assert!(prompt.contains("NEVER propose deletion"));
         assert!(prompt.contains("Never include processId"));
+    }
+    #[test]
+    fn native_x_goal_never_advertises_extension_only_actions() {
+        let prompt = build_planner_prompt(
+            "go to x.com and post a fun fact as tweet",
+            &["Microsoft Edge".to_string()],
+            "Microsoft Edge: unavailable (not open)",
+            &[],
+            &[],
+            false,
+        );
+        assert!(prompt.contains("NATIVE VISUAL MODE"));
+        assert!(prompt.contains("https://x.com/compose/post"));
+        assert!(prompt.contains("navigateApplication {\"url\":\"https://...\"}"));
+        assert!(prompt.contains("`browser.*` methods"));
+        assert!(prompt.contains("are unavailable"));
+        let methods = prompt
+            .split("Methods available on this turn:")
+            .nth(1)
+            .unwrap()
+            .split("Rules:")
+            .next()
+            .unwrap();
+        assert!(!methods.contains("browser.navigate"));
+        assert!(!methods.contains("Installed browser"));
+    }
+    #[test]
+    fn native_navigation_requires_allowlisted_browser_and_http_url() {
+        assert!(is_native_browser_application("Microsoft Edge"));
+        assert!(is_native_browser_application("Google Chrome"));
+        assert!(!is_native_browser_application("PowerShell"));
+        assert!(is_safe_http_url("https://x.com/compose/post"));
+        assert!(is_safe_http_url("http://localhost:1420"));
+        assert!(!is_safe_http_url("file:///C:/Windows/System32/cmd.exe"));
+        assert!(!is_safe_http_url("javascript:alert(1)"));
+        assert!(!is_safe_http_url("https://user:secret@example.com"));
+        assert!(!is_safe_http_url("https:///missing-host"));
     }
     #[test]
     fn native_tree_summary_keeps_actionable_controls_only() {
@@ -6011,5 +6411,18 @@ mod tests {
             .iter()
             .any(|line| line.contains("Button") && line.contains("btnSave")));
         assert!(!lines.iter().any(|line| line.contains("Pane")));
+    }
+    #[test]
+    fn native_tree_summary_includes_screen_bounds_for_visual_grounding() {
+        let tree = serde_json::json!({
+            "name": "Post", "controlType": "ControlType.Button", "automationId": "postButton",
+            "bounds": {"x": 920, "y": 640, "width": 80, "height": 32}, "children": []
+        });
+        let mut lines = Vec::new();
+        summarize_native_tree(&tree, &mut lines, 0);
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("- Button \"Post\" (id: postButton) [screen x=920 y=640 w=80 h=32]")
+        );
     }
 }

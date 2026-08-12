@@ -28,7 +28,7 @@ A goal run closes the observe → plan → act loop with the provider inside the
 6. A completion claim never closes the run. Alfred takes a fresh observation and requires a separate evidence-review response with concrete visible facts or successful results. Only then does the checkpoint become `completed`.
 7. Outcomes are committed to memory and the reusable run ledger before the loop repeats.
 
-Guardrails: a machine-wide run lock, a per-run step limit, a consecutive-failure breaker, an optional human check-in cadence (the run pauses for review), and fail-closed exit for unattended scheduled runs that hit a `waiting` state.
+Guardrails: a machine-wide run lock, evidence-backed action postconditions, a consecutive-failure breaker, an optional human check-in cadence (the run pauses for review), and fail-closed exit for unattended scheduled runs that hit a `waiting` state. Live goals do not have an arbitrary global step limit; they continue until verified completion, a concrete repeated failure, user stop, or an unrecoverable provider/target error.
 
 ### Prompt-injection posture
 
@@ -66,7 +66,7 @@ The Windows .NET host implements running/installed application enumeration, UI A
 
 ### Browser bridge
 
-The Chromium Manifest V3 extension is an optional accelerator for DOM-backed observation, navigation, screenshot capture, click, and type. It is not required for browser control: without it, Edge/Chrome/Brave are ordinary native targets observed through screenshots and UI Automation. Webpages cannot address the bridge. Element references expire after page changes; password fields and destructive actions are blocked in the extension.
+The Chromium Manifest V3 extension is an optional accelerator for DOM-backed observation, navigation, screenshot capture, click, and type. It is not required for browser control: without it, Edge/Chrome/Brave are ordinary native targets observed through screenshots and UI Automation. Core computes bridge availability before every planner turn; extension-only `browser.*` methods and the `Installed browser` pseudo-target are omitted and rejected when disconnected. Native URL changes use `navigateApplication`, an atomic Ctrl+L/type/Enter operation restricted to allow-listed browsers and absolute HTTP(S) URLs. Webpages cannot address the bridge. Element references expire after page changes; password fields and destructive actions are blocked in the extension.
 
 ## Persistence
 

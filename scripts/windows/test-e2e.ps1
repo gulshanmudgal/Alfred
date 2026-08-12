@@ -20,7 +20,10 @@ if (-not $HostPath) {
   throw "The requested Windows host does not exist: $HostPath"
 }
 $HostPath = (Resolve-Path $HostPath).Path
-$token = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+$tokenBytes = New-Object byte[] 32
+$random = [Security.Cryptography.RandomNumberGenerator]::Create()
+try { $random.GetBytes($tokenBytes) } finally { $random.Dispose() }
+$token = [BitConverter]::ToString($tokenBytes).Replace("-", "")
 $startInfo = [Diagnostics.ProcessStartInfo]::new()
 $startInfo.FileName = $HostPath
 $startInfo.UseShellExecute = $false
@@ -89,6 +92,15 @@ try {
     $focused = Invoke-AlfredHost "focusApplication" @{ processId = $notepadId } "focus approved application" "Notepad" "Notepad"
     if (-not $focused.ok) { throw "Semantic application focus failed." }
     Write-Host "PASS window focus and foreground verification"
+    # Put another trusted window in front, then require the host to reclaim
+    # focus. This catches Windows foreground-lock failures that only appear once
+    # Alfred is behind another app.
+    $calculator = Invoke-AlfredHost "launchApplication" @{} "launch focus competitor" "Calculator" "Calculator"
+    if (-not $calculator.ok) { throw "Could not launch the focus competitor." }
+    Start-Sleep -Milliseconds 250
+    $refocused = Invoke-AlfredHost "focusApplication" @{ processId = $notepadId } "refocus approved application" "Notepad" "Notepad"
+    if (-not $refocused.ok) { throw "Host could not reclaim focus from another foreground app." }
+    Write-Host "PASS foreground-lock recovery"
     $tree = Invoke-AlfredHost "observeWindow" @{ processId = $notepadId } "observe Notepad" "Notepad" "Notepad"
     if (-not $tree.ok -or -not $tree.result.bounds) { throw "UI Automation observation failed: $($tree.error)" }
     $capture = Invoke-AlfredHost "captureWindow" @{ processId = $notepadId } "capture Notepad" "Notepad" "Notepad"
@@ -96,11 +108,28 @@ try {
     $x = [int]($tree.result.bounds.x + [Math]::Max(80, $tree.result.bounds.width / 2))
     $y = [int]($tree.result.bounds.y + [Math]::Max(100, $tree.result.bounds.height / 2))
     if (-not (Invoke-AlfredHost "click" @{ x = $x; y = $y; processId = $notepadId } "focus Notepad editor" "Editor" "Notepad").ok) { throw "Targeted pointer input failed." }
-    if (-not (Invoke-AlfredHost "typeText" @{ text = "Alfred Windows end-to-end smoke test"; processId = $notepadId } "type smoke-test text" "Notepad editor" "Notepad").ok) { throw "Targeted keyboard input failed." }
+    $typed = Invoke-AlfredHost "typeText" @{ text = "Alfred Windows end-to-end smoke test"; processId = $notepadId } "type smoke-test text" "Notepad editor" "Notepad"
+    if (-not $typed.ok -or -not $typed.result.verified -or $typed.result.observedText -notmatch "end-to-end smoke test") {
+      throw "Targeted keyboard input was not verified in the intended control: $($typed.error)"
+    }
+    $idempotent = Invoke-AlfredHost "typeText" @{ text = "Alfred Windows end-to-end smoke test"; processId = $notepadId } "retry the same smoke-test text" "Notepad editor" "Notepad"
+    if (-not $idempotent.ok -or -not $idempotent.result.verified -or -not $idempotent.result.alreadyPresent) {
+      throw "A duplicate typeText retry was not treated as idempotent."
+    }
+    $unicodeText = "Alfred Windows UTF-8 " + [char]0x2014 + " emoji " + [char]::ConvertFromUtf32(0x1F419)
+    $replaced = Invoke-AlfredHost "typeText" @{ text = $unicodeText; processId = $notepadId } "replace smoke-test text with Unicode" "Notepad editor" "Notepad"
+    if (-not $replaced.ok -or -not $replaced.result.verified -or $replaced.result.observedText -ne $unicodeText) {
+      throw "Unicode text was corrupted, duplicated, or not verified in the intended control: $($replaced.error)"
+    }
     if (-not (Invoke-AlfredHost "key" @{ virtualKey = 13; processId = $notepadId } "press enter" "Editor" "Notepad").ok) { throw "Allowed key (Enter) was rejected." }
     $outside = Invoke-AlfredHost "click" @{ x = -32000; y = -32000; processId = $notepadId } "click target" "Editor" "Notepad"
     if ($outside.ok) { throw "A click outside the target window bounds was not refused." }
-    Write-Host "PASS targeted input, bounds validation, and key allow-list"
+    Write-Host "PASS targeted input postcondition, bounds validation, and key allow-list"
+    $badNavigation = Invoke-AlfredHost "navigateApplication" @{ url = "file:///C:/Windows/System32/cmd.exe"; processId = $notepadId } "navigate outside HTTP" "Address bar" "Notepad"
+    if ($badNavigation.ok) { throw "Native navigation accepted a non-browser application and non-HTTP URL." }
+    $badCredentialUrl = Invoke-AlfredHost "navigateApplication" @{ url = "https://user:secret@example.com"; processId = $notepadId } "navigate credential URL" "Address bar" "Microsoft Edge"
+    if ($badCredentialUrl.ok) { throw "Native navigation accepted a URL containing credentials." }
+    Write-Host "PASS native navigation browser and HTTP(S) allow-list"
     $editorControlType = "ControlType.Edit"
     $found = Invoke-AlfredHost "findElement" @{ processId = $notepadId; controlType = $editorControlType } "locate editor" "Notepad" "Notepad"
     if (-not $found.result.found) {
@@ -138,7 +167,7 @@ try {
       $deadline = [DateTime]::UtcNow.AddSeconds(8)
       while (-not (Test-Path $savedPath) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 200 }
       if (-not (Test-Path $savedPath)) { throw "Notepad did not create $savedPath" }
-      if ((Get-Content $savedPath -Raw) -notmatch "Alfred Windows end-to-end smoke test") { throw "Saved file content did not match the typed text." }
+      if ((Get-Content $savedPath -Raw) -notmatch [Regex]::Escape($unicodeText)) { throw "Saved file content did not preserve the verified Unicode text." }
       Write-Host "PASS create, save, and verify file: $savedPath"
     } else {
       Write-Host "Notepad is intentionally left open with unsaved test text; no persistent data was deleted."

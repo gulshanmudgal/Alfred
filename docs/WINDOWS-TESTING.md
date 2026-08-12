@@ -8,7 +8,7 @@ Run these gates on a clean Windows 11 VM before calling a build production-ready
 ./scripts/windows/test-e2e.ps1
 ```
 
-The script starts the capability-authenticated host, verifies the deletion and input allow-lists, lists exact Start-menu applications, opens Notepad idempotently, observes its UI Automation tree, captures the window, types test text, saves it under a unique new filename on the desktop, and verifies the file content. It prints the retained path; the unique name prevents overwrite. Pass `-SkipSave` to leave the text unsaved.
+The script starts the capability-authenticated host, verifies the deletion, input, and native browser-navigation allow-lists, lists exact Start-menu applications, opens Notepad idempotently, observes its UI Automation tree, captures the window, types test text, saves it under a unique new filename on the desktop, and verifies the file content. It prints the retained path; the unique name prevents overwrite. Pass `-SkipSave` to leave the text unsaved.
 
 Use `-SkipDesktop` on a non-interactive CI runner to test only the handshake and safety boundary.
 
