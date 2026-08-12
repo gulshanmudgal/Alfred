@@ -70,15 +70,6 @@ export interface WorkflowSchedule {
   createdAt: string;
 }
 
-export interface ProviderEvent {
-  sessionId: string;
-  provider: string;
-  stream: string;
-  line: string;
-  status: string;
-  timestamp: string;
-}
-
 export interface Workflow {
   id: string;
   name: string;
@@ -87,6 +78,7 @@ export interface Workflow {
   createdAt: string;
   updatedAt: string;
   status: string;
+  plannerProvider?: string;
   requiredApps: string[];
   steps: WorkflowStep[];
 }

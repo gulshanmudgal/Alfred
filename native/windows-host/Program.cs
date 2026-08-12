@@ -22,9 +22,11 @@ internal static class Program
 {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     private static readonly string ExpectedToken = Environment.GetEnvironmentVariable("ALFRED_CAPABILITY_TOKEN") ?? "";
-    private static readonly string[] DestructiveWords = ["delete", "remove", "erase", "trash", "purge", "wipe", "shred", "overwrite", "empty recycle"];
+    private static readonly string[] DestructiveWords = ["delete", "remove", "erase", "trash", "purge", "wipe", "shred", "overwrite", "uninstall", "empty recycle"];
 
-    // Only these applications may be launched by name; everything else is refused.
+    // Stable Windows inbox/browser aliases. Other applications are launchable
+    // only when an exact Start-menu shortcut is installed; the planner can never
+    // supply an executable path or arbitrary command line.
     private static readonly IReadOnlyDictionary<string, string> LaunchTargets = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
     {
         ["Notepad"] = "notepad.exe",
@@ -47,9 +49,22 @@ internal static class Program
         0x25, 0x26, 0x27, 0x28,
         0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B
     ];
+    private static readonly IReadOnlyDictionary<string, ushort> AllowedShortcuts =
+        new Dictionary<string, ushort>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["CTRL+L"] = 0x4C, // Browser / Explorer address bar
+            ["CTRL+S"] = 0x53  // Save / Save As
+        };
 
     private const int SW_RESTORE = 9;
     private const uint PW_RENDERFULLCONTENT = 0x00000002;
+    // The Rust planner keeps at most 40 interesting controls from an observation.
+    // Bound the raw UIA snapshot as well: modern Windows apps can expose thousands
+    // of descendants, and writing that JSON as one stdout frame can exceed the
+    // Windows anonymous-pipe limit (Win32 error 223) and poison later actions.
+    private const int MaxSnapshotNodes = 120;
+    private const int MaxSnapshotChildren = 60;
+    private const int MaxSnapshotTextChars = 256;
 
     [STAThread]
     private static async Task Main(string[] args)
@@ -128,6 +143,7 @@ internal static class Program
     {
         "health" => new { host = "windows", version = "0.1.3", processId = Environment.ProcessId },
         "listApplications" => ListApplications(),
+        "listInstalledApplications" => ListInstalledApplications(),
         "resolveApplication" => ResolveApplication(GetString(request.Params, "name")),
         "launchApplication" => LaunchApplication(request),
         "focusApplication" => FocusApplication(request),
@@ -141,6 +157,7 @@ internal static class Program
         "click" => Click(request, GetInt(request.Params, "x"), GetInt(request.Params, "y")),
         "typeText" => TypeText(request, GetString(request.Params, "text")),
         "key" => PressKey(request, GetInt(request.Params, "virtualKey")),
+        "shortcut" => PressShortcut(request, GetString(request.Params, "keys")),
         _ => throw new InvalidOperationException($"Unsupported host method: {request.Method}")
     };
 
@@ -157,9 +174,51 @@ internal static class Program
             catch { /* The process exited or denies access; skip it. */ }
         }
         return items.OrderBy(item => item.name)
-            .Select(item => new { processId = item.id, name = item.name, title = item.title })
+            .Take(200)
+            .Select(item => new { processId = item.id, name = item.name, title = Truncate(item.title, 160) })
             .ToArray();
     }
+
+    private static IEnumerable<string> StartMenuRoots()
+    {
+        var common = Environment.GetFolderPath(Environment.SpecialFolder.CommonStartMenu);
+        var user = Environment.GetFolderPath(Environment.SpecialFolder.StartMenu);
+        if (!string.IsNullOrWhiteSpace(common)) yield return Path.Combine(common, "Programs");
+        if (!string.IsNullOrWhiteSpace(user)) yield return Path.Combine(user, "Programs");
+    }
+
+    private static IReadOnlyList<(string Name, string Path)> StartMenuApplications()
+    {
+        var applications = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var root in StartMenuRoots())
+        {
+            if (!Directory.Exists(root)) continue;
+            try
+            {
+                foreach (var path in Directory.EnumerateFiles(root, "*.lnk", SearchOption.AllDirectories))
+                {
+                    var name = Path.GetFileNameWithoutExtension(path).Trim();
+                    if (!string.IsNullOrWhiteSpace(name)) applications.TryAdd(name, path);
+                }
+            }
+            catch { /* A vendor-owned Start-menu folder may deny traversal. */ }
+        }
+        return applications.OrderBy(item => item.Key)
+            .Select(item => (item.Key, item.Value)).ToArray();
+    }
+
+    private static object ListInstalledApplications() => StartMenuApplications()
+        .Select(item => item.Name)
+        .Concat(LaunchTargets.Keys)
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .OrderBy(name => name)
+        .Take(300)
+        .Select(name => new { name })
+        .ToArray();
+
+    private static string? FindStartMenuShortcut(string application) => StartMenuApplications()
+        .FirstOrDefault(item => item.Name.Equals(application, StringComparison.OrdinalIgnoreCase))
+        .Path;
 
     // Token-scored name-to-window resolution used by Alfred Core for preflight and
     // state conditions. LaunchTargets names resolve through their executable name.
@@ -200,9 +259,18 @@ internal static class Program
     private static object LaunchApplication(HostRequest request)
     {
         var application = GetApplication(request);
-        if (!LaunchTargets.TryGetValue(application, out var executable))
-            throw new UnauthorizedAccessException($"Alfred is not allowed to launch {application}.");
-        var process = Process.Start(new ProcessStartInfo(executable) { UseShellExecute = true })
+        var target = LaunchTargets.TryGetValue(application, out var executable)
+            ? executable
+            : FindStartMenuShortcut(application);
+        if (string.IsNullOrWhiteSpace(target))
+            throw new UnauthorizedAccessException($"{application} is not an exact installed Start-menu application.");
+        var existing = FindApplicationProcess(application);
+        if (existing is not null)
+        {
+            FocusProcess(existing);
+            return new { launched = false, alreadyRunning = true, application, processId = existing.Id, title = existing.MainWindowTitle };
+        }
+        var process = Process.Start(new ProcessStartInfo(target) { UseShellExecute = true })
             ?? throw new InvalidOperationException($"Windows could not launch {application}.");
         try { process.WaitForInputIdle(5000); } catch { }
         for (var attempt = 0; attempt < 40 && process.MainWindowHandle == IntPtr.Zero; attempt++)
@@ -302,26 +370,51 @@ internal static class Program
         var process = Process.GetProcessById(processId);
         var root = AutomationElement.FromHandle(process.MainWindowHandle)
             ?? throw new InvalidOperationException("The application window is unavailable.");
-        return Snapshot(root, 0);
+        var remainingNodes = MaxSnapshotNodes;
+        return Snapshot(root, 0, ref remainingNodes);
     }
 
-    private static object Snapshot(AutomationElement element, int depth)
+    private static object Snapshot(AutomationElement element, int depth, ref int remainingNodes)
     {
+        remainingNodes--;
         var properties = element.Current;
-        var children = depth >= 5 ? [] : element.FindAll(TreeScope.Children, Condition.TrueCondition)
-            .Cast<AutomationElement>().Take(250).Select(item => Snapshot(item, depth + 1)).ToArray();
+        var children = new List<object>();
+        if (depth < 5 && remainingNodes > 0)
+        {
+            var found = element.FindAll(TreeScope.Children, Condition.TrueCondition);
+            foreach (AutomationElement child in found.Cast<AutomationElement>().Take(MaxSnapshotChildren))
+            {
+                if (remainingNodes <= 0) break;
+                children.Add(Snapshot(child, depth + 1, ref remainingNodes));
+            }
+        }
         var bounds = properties.BoundingRectangle;
         return new
         {
-            name = properties.Name,
-            automationId = properties.AutomationId,
+            name = TruncateSnapshotText(properties.Name),
+            automationId = TruncateSnapshotText(properties.AutomationId),
             controlType = properties.ControlType?.ProgrammaticName,
             enabled = properties.IsEnabled,
             offscreen = properties.IsOffscreen,
-            bounds = new { x = bounds.X, y = bounds.Y, width = bounds.Width, height = bounds.Height },
-            children
+            bounds = JsonBounds(bounds),
+            children = children.ToArray()
         };
     }
+
+    private static string TruncateSnapshotText(string? value) =>
+        string.IsNullOrEmpty(value) || value.Length <= MaxSnapshotTextChars
+            ? value ?? ""
+            : value[..MaxSnapshotTextChars];
+
+    private static object JsonBounds(System.Windows.Rect bounds) => new
+    {
+        x = JsonNumber(bounds.X),
+        y = JsonNumber(bounds.Y),
+        width = JsonNumber(bounds.Width),
+        height = JsonNumber(bounds.Height)
+    };
+
+    private static double JsonNumber(double value) => double.IsFinite(value) ? value : 0;
 
     private static object CaptureWindow(int processId)
     {
@@ -408,7 +501,7 @@ internal static class Program
                 name = element.Current.Name,
                 automationId = element.Current.AutomationId,
                 controlType = element.Current.ControlType?.ProgrammaticName,
-                bounds = new { x = bounds.X, y = bounds.Y, width = bounds.Width, height = bounds.Height }
+                bounds = JsonBounds(bounds)
             };
         }
         catch
@@ -499,6 +592,21 @@ internal static class Program
         return new { pressed = true, virtualKey };
     }
 
+    private static object PressShortcut(HostRequest request, string keys)
+    {
+        if (!AllowedShortcuts.TryGetValue(keys.Trim(), out var virtualKey))
+            throw new InvalidOperationException($"Shortcut {keys} is not in Alfred's allowed shortcut set.");
+        FocusProcess(ResolveProcess(request));
+        const ushort control = 0x11;
+        Send([
+            VirtualKeyInput(control, false),
+            VirtualKeyInput(virtualKey, false),
+            VirtualKeyInput(virtualKey, true),
+            VirtualKeyInput(control, true)
+        ]);
+        return new { pressed = true, keys = keys.ToUpperInvariant() };
+    }
+
     private static int GetInt(JsonElement? value, string property) =>
         value?.GetProperty(property).GetInt32() ?? throw new InvalidOperationException($"Missing {property}.");
     private static int? GetOptionalInt(JsonElement? value, string property) =>
@@ -507,6 +615,7 @@ internal static class Program
         value?.GetProperty(property).GetString() ?? throw new InvalidOperationException($"Missing {property}.");
     private static string? GetOptionalString(JsonElement? value, string property) =>
         value.HasValue && value.Value.TryGetProperty(property, out var item) ? item.GetString() : null;
+    private static string Truncate(string value, int max) => value.Length <= max ? value : value[..max];
     private static void Reply(object value) { Console.Out.WriteLine(JsonSerializer.Serialize(value, Json)); Console.Out.Flush(); }
 
     private static INPUT MouseInput(uint flags) => new() { type = INPUT_MOUSE, U = new InputUnion { mi = new MOUSEINPUT { dwFlags = flags } } };

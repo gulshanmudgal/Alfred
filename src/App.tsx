@@ -3,32 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Icon } from "./icons";
-import type { AppSettings, PermissionGrant, ProviderEvent, ProviderStatus, RunCheckpoint, RunEvent, SystemInfo, View, Workflow, WorkflowSchedule, WorkflowStep } from "./types";
-
-const starterWorkflows: Workflow[] = [
-  {
-    id: "starter-invoices",
-    name: "Weekly invoice summary",
-    goal: "Collect new supplier invoices, append them to a workbook, and prepare a summary.",
-    version: "0.1.0",
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    status: "example",
-    requiredApps: ["Microsoft Edge", "Microsoft Excel"],
-    steps: [],
-  },
-  {
-    id: "starter-research",
-    name: "Website to workbook",
-    goal: "Collect approved information from a website and append it to a local workbook.",
-    version: "0.1.0",
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    status: "example",
-    requiredApps: ["Microsoft Edge", "Microsoft Excel"],
-    steps: [],
-  },
-];
+import type { AppSettings, ProviderStatus, RunCheckpoint, RunEvent, SystemInfo, View, Workflow, WorkflowSchedule } from "./types";
 
 function relativeDate(date: string) {
   const minutes = Math.max(1, Math.round((Date.now() - new Date(date).getTime()) / 60000));
@@ -44,12 +19,13 @@ function App() {
   const [providers, setProviders] = useState<ProviderStatus[]>([]);
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
   const [view, setView] = useState<View>("home");
-  const [createOpen, setCreateOpen] = useState(false);
   const [activeWorkflow, setActiveWorkflow] = useState<Workflow | null>(null);
 
   const refreshWorkflows = useCallback(async (libraryPath: string) => {
     const result = await invoke<Workflow[]>("list_workflows", { libraryPath });
-    setWorkflows(result);
+    // Legacy recorder drafts remain on disk for recovery, but the product now
+    // has one authoring path: run a goal, then save the successful run.
+    setWorkflows(result.filter((workflow) => workflow.status !== "recording"));
   }, []);
 
   useEffect(() => {
@@ -85,17 +61,17 @@ function App() {
 
   return (
     <div className="app-shell">
-      <Sidebar view={view} onView={setView} onCreate={() => setCreateOpen(true)} />
+      <Sidebar view={view} onView={setView} />
       <main className="main-stage">
-        <TopBar provider={settings.provider} providers={providers} onCreate={() => setCreateOpen(true)} />
+        <TopBar provider={activeWorkflow?.plannerProvider ?? settings.provider} providers={providers} />
         {activeWorkflow ? (
-          <RunCockpit workflow={activeWorkflow} settings={settings} onWorkflowChanged={async () => refreshWorkflows(settings.libraryPath)} onClose={() => setActiveWorkflow(null)} />
+          <ExecutionCockpit workflow={activeWorkflow} settings={settings} onWorkflowChanged={async () => refreshWorkflows(settings.libraryPath)} onClose={() => setActiveWorkflow(null)} />
         ) : (
           <>
-            {view === "home" && <Home workflows={workflows} onCreate={() => setCreateOpen(true)} onRun={setActiveWorkflow} />}
-            {view === "workflows" && <WorkflowLibrary workflows={workflows} onCreate={() => setCreateOpen(true)} onRun={setActiveWorkflow} />}
-            {view === "runs" && <RunsView workflows={workflows} onRun={setActiveWorkflow} />}
-            {view === "schedules" && <SchedulesView workflows={workflows} />}
+            {view === "home" && <Home workflows={workflows} providers={providers} defaultProvider={settings.provider} onRun={setActiveWorkflow} />}
+            {view === "workflows" && <WorkflowLibrary workflows={workflows} onStartGoal={() => setView("home")} onRun={setActiveWorkflow} />}
+            {view === "runs" && <RunsView workflows={workflows} onStartGoal={() => setView("home")} onRun={setActiveWorkflow} />}
+            {view === "schedules" && <SchedulesView workflows={workflows} onStartGoal={() => setView("home")} />}
             {view === "settings" && (
               <SettingsView
                 settings={settings}
@@ -111,17 +87,6 @@ function App() {
           </>
         )}
       </main>
-      {createOpen && (
-        <CreateWorkflowModal
-          libraryPath={settings.libraryPath}
-          onClose={() => setCreateOpen(false)}
-          onCreated={(workflow) => {
-            setWorkflows((current) => [workflow, ...current]);
-            setCreateOpen(false);
-            setActiveWorkflow(workflow);
-          }}
-        />
-      )}
     </div>
   );
 }
@@ -135,7 +100,7 @@ function LoadingScreen() {
   );
 }
 
-function Sidebar({ view, onView, onCreate }: { view: View; onView: (view: View) => void; onCreate: () => void }) {
+function Sidebar({ view, onView }: { view: View; onView: (view: View) => void }) {
   const items: { id: View; label: string; icon: string }[] = [
     { id: "home", label: "Home", icon: "home" },
     { id: "workflows", label: "Workflows", icon: "workflow" },
@@ -145,7 +110,7 @@ function Sidebar({ view, onView, onCreate }: { view: View; onView: (view: View) 
   return (
     <aside className="sidebar">
       <div className="brand"><div className="alfred-mark"><Icon name="sparkle" size={18} /></div><span>Alfred</span></div>
-      <button className="new-workflow-button" onClick={onCreate}><Icon name="plus" size={18} /> New workflow</button>
+      <button className="new-workflow-button" onClick={() => onView("home")}><Icon name="brain" size={18} /> Run a goal</button>
       <nav>
         {items.map((item) => (
           <button key={item.id} className={view === item.id ? "nav-item active" : "nav-item"} onClick={() => onView(item.id)}>
@@ -163,36 +128,30 @@ function Sidebar({ view, onView, onCreate }: { view: View; onView: (view: View) 
   );
 }
 
-function TopBar({ provider, providers, onCreate }: { provider: string; providers: ProviderStatus[]; onCreate: () => void }) {
+function TopBar({ provider, providers }: { provider: string; providers: ProviderStatus[] }) {
   const providerName = providers.find((item) => item.id === provider)?.name ?? provider;
   return (
     <header className="topbar">
       <div className="search-box"><Icon name="search" size={17} /><span>Search workflows and runs</span><kbd>⌘ K</kbd></div>
-      <div className="topbar-actions"><span className="engine-status"><i />{providerName}</span><button className="icon-button" onClick={onCreate}><Icon name="plus" size={20} /></button></div>
+      <div className="topbar-actions"><span className="engine-status"><i />{providerName}</span></div>
     </header>
   );
 }
 
-function Home({ workflows, onCreate, onRun }: { workflows: Workflow[]; onCreate: () => void; onRun: (workflow: Workflow) => void }) {
-  const visible = workflows.length ? workflows.slice(0, 4) : starterWorkflows;
+function Home({ workflows, providers, defaultProvider, onRun }: { workflows: Workflow[]; providers: ProviderStatus[]; defaultProvider: string; onRun: (workflow: Workflow) => void }) {
+  const visible = workflows.slice(0, 4);
   return (
     <div className="page home-page">
       <section className="hero-row">
-        <div><span className="eyebrow">YOUR AUTOMATION WORKSPACE</span><h1>Good morning.</h1><p>What would you like Alfred to take care of?</p></div>
-        <button className="primary-button" onClick={onCreate}><Icon name="plus" size={18} /> Create workflow</button>
+        <div><span className="eyebrow">YOUR AUTOMATION WORKSPACE</span><h1>Good morning.</h1><p>Describe an outcome. Alfred will plan and execute it step by step.</p></div>
       </section>
-      <section className="command-card">
-        <div className="command-icon"><Icon name="sparkle" size={22} /></div>
-        <div className="command-copy"><strong>Describe your everyday task</strong><span>Alfred will plan it, show every action, and help you refine it.</span></div>
-        <button onClick={onCreate}>Start describing <Icon name="arrow" size={17} /></button>
-      </section>
-      <GoalLauncher onRun={onRun} />
-      <section className="section-block">
-        <div className="section-heading"><div><h2>{workflows.length ? "Your workflows" : "See how Alfred works"}</h2><p>{workflows.length ? "Continue where you left off or run something again." : "Try a safe simulation, then create your own workflow."}</p></div><button className="text-button">View all <Icon name="arrow" size={15} /></button></div>
+      <GoalLauncher providers={providers} defaultProvider={defaultProvider} onRun={onRun} />
+      {visible.length > 0 && <section className="section-block">
+        <div className="section-heading"><div><h2>Your saved workflows</h2><p>Successful goal runs you chose to reuse.</p></div></div>
         <div className="workflow-grid">
           {visible.map((workflow, index) => <WorkflowCard key={workflow.id} workflow={workflow} index={index} onRun={() => onRun(workflow)} />)}
         </div>
-      </section>
+      </section>}
       <section className="insight-strip">
         <div className="insight-icon"><Icon name="shield" size={22} /></div>
         <div><strong>Every action passes through Alfred’s safety engine</strong><span>Persistent-data deletion is blocked before a provider or automation host can perform it.</span></div>
@@ -202,9 +161,11 @@ function Home({ workflows, onCreate, onRun }: { workflows: Workflow[]; onCreate:
   );
 }
 
-function GoalLauncher({ onRun }: { onRun: (workflow: Workflow) => void }) {
+function GoalLauncher({ providers, defaultProvider, onRun }: { providers: ProviderStatus[]; defaultProvider: string; onRun: (workflow: Workflow) => void }) {
   const [goal, setGoal] = useState("");
   const [apps, setApps] = useState("");
+  const [provider, setProvider] = useState(() => providers.find((item) => item.id === defaultProvider && item.installed)?.id ?? providers.find((item) => item.installed)?.id ?? defaultProvider);
+  const brainReady = providers.find((item) => item.id === provider)?.installed ?? false;
   const start = () => {
     const applications = apps.split(",").map((app) => app.trim()).filter(Boolean);
     if (!goal.trim()) return;
@@ -217,6 +178,7 @@ function GoalLauncher({ onRun }: { onRun: (workflow: Workflow) => void }) {
       createdAt: now,
       updatedAt: now,
       status: "goal",
+      plannerProvider: provider,
       requiredApps: applications,
       steps: [],
     });
@@ -226,11 +188,12 @@ function GoalLauncher({ onRun }: { onRun: (workflow: Workflow) => void }) {
       <div className="command-icon"><Icon name="brain" size={22} /></div>
       <div className="command-copy goal-launcher-fields">
         <strong>Run a goal with the live planner</strong>
-        <span>The planner observes your apps and acts step by step, with Alfred's safety engine and your approvals supervising every action.</span>
+        <span>Pick the brain, describe the outcome naturally, and Alfred will observe, act, remember, and verify each step.</span>
+        <label className="brain-picker"><span>Brain</span><select value={provider} onChange={(event) => setProvider(event.target.value)}>{providers.map((item) => <option key={item.id} value={item.id} disabled={!item.installed}>{item.name}{item.installed ? "" : " · not installed"}</option>)}</select></label>
         <input value={goal} onChange={(event) => setGoal(event.target.value)} placeholder="Goal, e.g. Copy the invoice total from the open Edge page into Notepad" />
         <input value={apps} onChange={(event) => setApps(event.target.value)} placeholder="Target apps (optional) — leave blank and Alfred infers them from your goal" />
       </div>
-      <button disabled={!goal.trim()} onClick={start}>Run goal <Icon name="arrow" size={17} /></button>
+      <button disabled={!goal.trim() || !brainReady} onClick={start}>{brainReady ? "Run goal" : "Install brain"} <Icon name="arrow" size={17} /></button>
     </section>
   );
 }
@@ -247,12 +210,12 @@ function WorkflowCard({ workflow, index, onRun }: { workflow: Workflow; index: n
   );
 }
 
-function WorkflowLibrary({ workflows, onCreate, onRun }: { workflows: Workflow[]; onCreate: () => void; onRun: (workflow: Workflow) => void }) {
+function WorkflowLibrary({ workflows, onStartGoal, onRun }: { workflows: Workflow[]; onStartGoal: () => void; onRun: (workflow: Workflow) => void }) {
   return (
     <div className="page">
-      <section className="page-title"><div><span className="eyebrow">LOCAL LIBRARY</span><h1>Workflows</h1><p>Your automations stay in the folder you chose.</p></div><button className="primary-button" onClick={onCreate}><Icon name="plus" size={18} /> Create workflow</button></section>
+      <section className="page-title"><div><span className="eyebrow">LOCAL LIBRARY</span><h1>Workflows</h1><p>Reusable workflows saved from successful goal runs.</p></div><button className="primary-button" onClick={onStartGoal}><Icon name="brain" size={18} /> Run a new goal</button></section>
       {workflows.length === 0 ? (
-        <EmptyState icon="folder" title="Your workflow library is empty" description="Describe a repetitive task and Alfred will help you turn a successful run into a reusable workflow." action="Create your first workflow" onAction={onCreate} />
+        <EmptyState icon="folder" title="Your workflow library is empty" description="Run a goal end to end, then save its successful action sequence as a reusable workflow." action="Run your first goal" onAction={onStartGoal} />
       ) : (
         <div className="workflow-list">{workflows.map((workflow, index) => <WorkflowCard key={workflow.id} workflow={workflow} index={index} onRun={() => onRun(workflow)} />)}</div>
       )}
@@ -260,16 +223,16 @@ function WorkflowLibrary({ workflows, onCreate, onRun }: { workflows: Workflow[]
   );
 }
 
-function RunsView({ workflows, onRun }: { workflows: Workflow[]; onRun: (workflow: Workflow) => void }) {
+function RunsView({ workflows, onStartGoal, onRun }: { workflows: Workflow[]; onStartGoal: () => void; onRun: (workflow: Workflow) => void }) {
   return (
     <div className="page">
       <section className="page-title"><div><span className="eyebrow">ACTIVITY</span><h1>Runs</h1><p>Watch current work and review the evidence from previous runs.</p></div></section>
-      <EmptyState icon="runs" title="No runs yet" description="When Alfred runs a workflow, its action timeline, safety decisions, and results will appear here." action={workflows.length ? "Run a workflow" : "Create a workflow"} onAction={() => workflows[0] && onRun(workflows[0])} />
+      <EmptyState icon="runs" title="No runs yet" description="When Alfred runs a goal or saved workflow, its action timeline, safety decisions, and results will appear here." action={workflows.length ? "Run a saved workflow" : "Run a goal"} onAction={() => workflows[0] ? onRun(workflows[0]) : onStartGoal()} />
     </div>
   );
 }
 
-function SchedulesView({ workflows }: { workflows: Workflow[] }) {
+function SchedulesView({ workflows, onStartGoal }: { workflows: Workflow[]; onStartGoal: () => void }) {
   const [schedules, setSchedules] = useState<WorkflowSchedule[]>([]);
   const [workflowId, setWorkflowId] = useState(workflows[0]?.id ?? "");
   const [time, setTime] = useState("09:00");
@@ -283,9 +246,9 @@ function SchedulesView({ workflows }: { workflows: Workflow[] }) {
     catch (caught) { setError(String(caught)); }
   };
   return <div className="page"><section className="page-title"><div><span className="eyebrow">LOCAL AUTOMATION</span><h1>Schedules</h1><p>On Windows, saved schedules are registered with Task Scheduler for unattended runs. Other platforms run them while Alfred is open.</p></div></section>
-    <section className="settings-section schedule-builder"><h2>New weekday schedule</h2><div className="schedule-form"><select value={workflowId} onChange={event => setWorkflowId(event.target.value)}><option value="">Choose workflow</option>{workflows.filter(item => item.status !== "recording").map(item => <option value={item.id} key={item.id}>{item.name}</option>)}</select><input type="time" value={time} onChange={event => setTime(event.target.value)}/><button className="primary-button" disabled={!workflowId} onClick={add}>Add schedule</button></div>{error && <div className="error-message">{error}</div>}</section>
+    <section className="settings-section schedule-builder"><h2>New weekday schedule</h2><div className="schedule-form"><select value={workflowId} onChange={event => setWorkflowId(event.target.value)}><option value="">Choose workflow</option>{workflows.map(item => <option value={item.id} key={item.id}>{item.name}</option>)}</select><input type="time" value={time} onChange={event => setTime(event.target.value)}/><button className="primary-button" disabled={!workflowId} onClick={add}>Add schedule</button></div>{error && <div className="error-message">{error}</div>}</section>
     <div className="schedule-list">{schedules.map(schedule => <article className="settings-section schedule-row" key={schedule.id}><div><strong>{schedule.workflowName}</strong><span>Weekdays at {String(schedule.hour).padStart(2,"0")}:{String(schedule.minute).padStart(2,"0")}</span></div><button className={schedule.enabled ? "status-badge ready" : "status-badge"} onClick={async () => { const next = await invoke<WorkflowSchedule[]>("set_schedule_enabled", { scheduleId: schedule.id, enabled: !schedule.enabled }); setSchedules(next); }}>{schedule.enabled ? "Enabled" : "Disabled"}</button></article>)}</div>
-    {!schedules.length && <EmptyState icon="runs" title="No schedules yet" description="Finalize a workflow, then choose when it should run." action="Create after finalizing a workflow" onAction={() => {}}/>}
+    {!schedules.length && <EmptyState icon="runs" title="No schedules yet" description="Save a successful goal run as a workflow, then choose when it should run." action="Run a goal" onAction={onStartGoal}/>}
   </div>;
 }
 
@@ -293,142 +256,16 @@ function EmptyState({ icon, title, description, action, onAction }: { icon: stri
   return <div className="empty-state"><div className="empty-icon"><Icon name={icon} size={29} /></div><h2>{title}</h2><p>{description}</p><button className="primary-button" onClick={onAction}>{action}</button></div>;
 }
 
-function CreateWorkflowModal({ libraryPath, onClose, onCreated }: { libraryPath: string; onClose: () => void; onCreated: (workflow: Workflow) => void }) {
-  const [name, setName] = useState("");
-  const [goal, setGoal] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
-  const submit = async () => {
-    setSaving(true); setError("");
-    try {
-      const workflow = await invoke<Workflow>("create_workflow", { libraryPath, name, goal });
-      onCreated(workflow);
-    } catch (caught) {
-      setError(String(caught)); setSaving(false);
-    }
-  };
-  return (
-    <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <div className="modal-panel">
-        <div className="modal-heading"><div className="modal-mark"><Icon name="sparkle" size={22} /></div><div><h2>Create a workflow</h2><p>Describe the outcome. Alfred will help discover the steps.</p></div><button className="icon-button" onClick={onClose}><Icon name="close" size={19} /></button></div>
-        <label className="field-label">Workflow name<input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="For example, Weekly invoice summary" /></label>
-        <label className="field-label">What should Alfred accomplish?<textarea value={goal} onChange={(event) => setGoal(event.target.value)} placeholder="Open the supplier portal, collect new invoices, append them to my workbook, and prepare a summary…" rows={5} /></label>
-        <div className="safety-note"><Icon name="shield" size={18} /><span>Alfred will show its plan before interacting with your applications. Deletion remains blocked.</span></div>
-        {error && <div className="error-message">{error}</div>}
-        <div className="modal-actions"><button className="secondary-button" onClick={onClose}>Cancel</button><button className="primary-button" disabled={saving || !name.trim() || !goal.trim()} onClick={submit}>{saving ? "Creating…" : "Create and preview"}<Icon name="arrow" size={16} /></button></div>
-      </div>
-    </div>
-  );
-}
 
-function RunCockpit({ workflow, settings, onWorkflowChanged, onClose }: { workflow: Workflow; settings: AppSettings; onWorkflowChanged: () => Promise<void>; onClose: () => void }) {
-  if (workflow.status === "recording") return <WorkflowStudio workflow={workflow} settings={settings} onWorkflowChanged={onWorkflowChanged} onClose={onClose}/>;
-  return <ExecutionCockpit workflow={workflow} settings={settings} onClose={onClose}/>;
-}
-
-function WorkflowStudio({ workflow, settings, onWorkflowChanged, onClose }: { workflow: Workflow; settings: AppSettings; onWorkflowChanged: () => Promise<void>; onClose: () => void }) {
-  const initialApplication = /notepad/i.test(workflow.goal) ? "Notepad" : /calculator/i.test(workflow.goal) ? "Calculator" : /edge|browser|website/i.test(workflow.goal) ? "Microsoft Edge" : "";
-  const [steps, setSteps] = useState(workflow.steps);
-  const [application, setApplication] = useState(initialApplication);
-  const [method, setMethod] = useState(initialApplication ? "launchApplication" : "observeWindow");
-  const [target, setTarget] = useState("");
-  const [parameters, setParameters] = useState(initialApplication ? JSON.stringify({ application: initialApplication }, null, 2) : "{}");
-  const [waitFor, setWaitFor] = useState("");
-  const [expect, setExpect] = useState("");
-  const [saveAs, setSaveAs] = useState("");
-  const [providerLines, setProviderLines] = useState<string[]>([]);
-  const [providerSession, setProviderSession] = useState("");
-  const [proposedSteps, setProposedSteps] = useState<WorkflowStep[]>([]);
-  const [proposedParameters, setProposedParameters] = useState<Record<string, string>>({});
-  const [recordingPlan, setRecordingPlan] = useState(false);
-  const [error, setError] = useState("");
-  const activeProvider = useRef("");
-  const providerOutput = useRef<string[]>([]);
-  useEffect(() => {
-    let dispose: (() => void) | undefined;
-    listen<ProviderEvent>("alfred://provider-event", ({ payload }) => {
-      if (payload.sessionId !== activeProvider.current) return;
-      providerOutput.current = [...providerOutput.current.slice(-199), payload.line];
-      setProviderLines(current => [...current.slice(-80), payload.line]);
-      if (payload.status === "completed") {
-        setProviderSession("");
-        invoke<WorkflowStep[]>("parse_provider_plan", { output: providerOutput.current })
-          .then(next => {
-            setProposedSteps(next);
-            setProposedParameters(Object.fromEntries(next.map(step => [step.id, JSON.stringify(step.payload ?? {}, null, 2)])));
-          })
-          .catch(caught => setError(`The provider finished, but its plan could not be reviewed: ${String(caught)}`));
-      } else if (payload.status === "failed") {
-        setProviderSession("");
-        setError("The selected brain could not complete the planning session. Review its output and try again.");
-      }
-    }).then(value => dispose = value);
-    return () => dispose?.();
-  }, []);
-  const askProvider = async () => {
-    setError(""); setProviderLines([]); setProposedSteps([]); providerOutput.current = [];
-    const prompt = `Plan a safe Windows desktop workflow for this goal: ${workflow.goal}
-Return ONLY one JSON object with this exact shape:
-{"steps":[{"title":"Human-readable action","application":"Notepad","method":"launchApplication","targetLabel":"Notepad","params":{}}]}
-Allowed methods: launchApplication, focusApplication, observeWindow, captureWindow, findElement, getValue, invokeElement, setValue, click, typeText, key, browser.observe, browser.navigate, browser.click, browser.type, browser.getText, browser.read, browser.scroll, browser.find, browser.wait.
-For launchApplication use one of: Notepad, Calculator, Paint, File Explorer, Microsoft Edge, Google Chrome, Brave. Use {"text":"..."} for typeText. Never propose deletion, trash, purge, destructive overwrite, password entry, shell commands, credentials, or arbitrary executables.`;
-    const sessionId = crypto.randomUUID();
-    activeProvider.current = sessionId; setProviderSession(sessionId);
-    try { await invoke<string>("start_provider_run", { provider: settings.provider, prompt, workingDirectory: settings.libraryPath, sessionId }); }
-    catch (caught) { activeProvider.current = ""; setProviderSession(""); setError(String(caught)); }
-  };
-  const recordStep = async (step: WorkflowStep) => {
-    const saved = await invoke<Workflow>("record_action", { libraryPath: settings.libraryPath, workflowId: workflow.id, step });
-    if (step.effect !== "observe") await invoke("grant_permission", { application: step.kind.startsWith("browser.") ? "Installed browser" : step.application, allowedEffects: [step.effect], allowedIntents: [step.kind.split(".").at(-1)] });
-    setSteps(saved.steps);
-    return saved;
-  };
-  const addStep = async () => {
-    setError("");
-    try {
-      if (!application.trim()) throw new Error("Choose an application.");
-      const payload = JSON.parse(parameters);
-      const effect = method.endsWith("observe") || method === "observeWindow" || method === "captureWindow" || method === "findElement" || method === "getValue" || method === "browser.getText" || method === "browser.read" || method === "browser.scroll" || method === "browser.find" || method === "browser.wait" ? "observe" : "modify_reversible";
-      await recordStep({
-        id: crypto.randomUUID(), title: target || method, kind: method, effect, application,
-        intent: `${method} ${target}`.trim(), targetLabel: target || undefined, payload, timeoutMs: 30000, retries: 1,
-        waitFor: waitFor.trim() ? { name: waitFor.trim() } : undefined,
-        expect: expect.trim() ? { name: expect.trim() } : undefined,
-        saveAs: saveAs.trim() ? saveAs.trim() : undefined,
-      });
-      setTarget(""); setParameters("{}"); setWaitFor(""); setExpect(""); setSaveAs("");
-    } catch (caught) { setError(`Could not record action: ${String(caught)}`); }
-  };
-  const approvePlan = async () => {
-    setError(""); setRecordingPlan(true);
-    try {
-      const approved = proposedSteps.map(step => ({ ...step, intent: `${step.kind} ${step.targetLabel ?? ""}`.trim(), payload: JSON.parse(proposedParameters[step.id] ?? "{}") }));
-      const saved = await invoke<Workflow>("record_actions", { libraryPath: settings.libraryPath, workflowId: workflow.id, steps: approved });
-      for (const step of approved.filter(step => step.effect !== "observe")) {
-        await invoke("grant_permission", { application: step.kind.startsWith("browser.") ? "Installed browser" : step.application, allowedEffects: [step.effect], allowedIntents: [step.kind.split(".").at(-1)] });
-      }
-      setSteps(saved.steps);
-      setProposedSteps([]);
-    } catch (caught) { setError(`Could not record the approved plan: ${String(caught)}`); }
-    finally { setRecordingPlan(false); }
-  };
-  const finalize = async () => { try { await invoke("finalize_recording", { libraryPath: settings.libraryPath, workflowId: workflow.id }); await onWorkflowChanged(); onClose(); } catch (caught) { setError(String(caught)); } };
-  return <div className="page workflow-studio"><section className="page-title"><div><button className="back-button" onClick={onClose}>‹</button><span className="eyebrow">WORKFLOW RECORDER</span><h1>{workflow.name}</h1><p>{workflow.goal}</p></div><button className="primary-button" disabled={!steps.length} onClick={finalize}>Finalize workflow</button></section>
-    <div className="studio-grid"><section className="settings-section"><h2>1. Ask the selected brain</h2><p>Alfred runs the installed {settings.provider} CLI in a supervised, read-only planning session.</p><div className="studio-actions"><button className="secondary-button" disabled={!!providerSession} onClick={askProvider}><Icon name="brain" size={17}/> {providerSession ? "Planning…" : "Generate plan"}</button>{providerSession && <button className="secondary-button" onClick={async () => { await invoke("cancel_provider_run", { sessionId: providerSession }); setProviderSession(""); }}>Stop planner</button>}</div><pre className="provider-console">{providerLines.length ? providerLines.join("\n") : "Provider output appears here. Alfred will extract safe actions for your review."}</pre></section>
-      <section className="settings-section"><h2>2. Add an action manually</h2><p>Use this only to refine the provider plan. Parameters stay in the portable workflow YAML.</p><div className="record-form"><label>Application<input value={application} onChange={event => setApplication(event.target.value)} placeholder="For example, Notepad"/></label><label>Method<select value={method} onChange={event => setMethod(event.target.value)}><option>launchApplication</option><option>focusApplication</option><option>observeWindow</option><option>captureWindow</option><option>findElement</option><option>getValue</option><option>invokeElement</option><option>setValue</option><option>click</option><option>typeText</option><option>key</option><option>browser.observe</option><option>browser.navigate</option><option>browser.click</option><option>browser.type</option><option>browser.getText</option><option>browser.read</option><option>browser.scroll</option><option>browser.find</option><option>browser.wait</option></select></label><label>Target label<input value={target} onChange={event => setTarget(event.target.value)} placeholder="For example, Notepad editor"/></label><label>Parameters (JSON)<textarea value={parameters} onChange={event => setParameters(event.target.value)} rows={4}/></label><label>Wait for (optional label)<input value={waitFor} onChange={event => setWaitFor(event.target.value)} placeholder="Results table"/></label><label>Expect after (optional label)<input value={expect} onChange={event => setExpect(event.target.value)} placeholder="Saved confirmation"/></label><label>Save result as (optional variable)<input value={saveAs} onChange={event => setSaveAs(event.target.value)} placeholder="invoiceNumber"/></label><button className="primary-button" onClick={addStep}>Record action</button></div></section></div>
-    {error && <div className="error-message">{error}</div>}
-    {proposedSteps.length > 0 && <section className="panel-surface proposed-plan"><div className="panel-heading"><span>Review the proposed plan</span><button className="primary-button" disabled={recordingPlan} onClick={approvePlan}>{recordingPlan ? "Recording…" : "Approve and record all"}</button></div><p>Every step has passed Alfred’s base safety policy. Edit any field before approving.</p>{proposedSteps.map((step, index) => <div className="proposed-step" key={step.id}><span className="step-marker">{index + 1}</span><div><input aria-label={`Step ${index + 1} title`} value={step.title} onChange={event => setProposedSteps(current => current.map(item => item.id === step.id ? { ...item, title: event.target.value } : item))}/><div className="proposed-step-fields"><input aria-label={`Step ${index + 1} application`} value={step.application ?? ""} onChange={event => setProposedSteps(current => current.map(item => item.id === step.id ? { ...item, application: event.target.value } : item))}/><select aria-label={`Step ${index + 1} method`} value={step.kind} onChange={event => setProposedSteps(current => current.map(item => item.id === step.id ? { ...item, kind: event.target.value, effect: event.target.value.endsWith("observe") || ["observeWindow","captureWindow","findElement","getValue","browser.getText","browser.read","browser.scroll","browser.find","browser.wait"].includes(event.target.value) ? "observe" : "modify_reversible" } : item))}><option>launchApplication</option><option>focusApplication</option><option>observeWindow</option><option>captureWindow</option><option>invokeElement</option><option>click</option><option>typeText</option><option>key</option><option>browser.observe</option><option>browser.navigate</option><option>browser.click</option><option>browser.type</option><option>browser.getText</option><option>browser.read</option><option>browser.scroll</option><option>browser.find</option><option>browser.wait</option></select></div><textarea aria-label={`Step ${index + 1} parameters`} value={proposedParameters[step.id] ?? "{}"} onChange={event => setProposedParameters(current => ({ ...current, [step.id]: event.target.value }))}/></div></div>)}</section>}
-    <section className="panel-surface recorded-steps"><div className="panel-heading"><span>Recorded steps</span><b>{steps.length}</b></div>{steps.map((step, index) => <div className="plan-step done" key={step.id}><span className="step-marker">{index + 1}</span><div><strong>{step.title}</strong><small>{step.application} · {step.kind} · {step.effect}</small></div></div>)}{!steps.length && <p>No actions recorded yet.</p>}</section>
-  </div>;
-}
-
-function ExecutionCockpit({ workflow, settings, onClose }: { workflow: Workflow; settings: AppSettings; onClose: () => void }) {
+function ExecutionCockpit({ workflow, settings, onWorkflowChanged, onClose }: { workflow: Workflow; settings: AppSettings; onWorkflowChanged: () => Promise<void>; onClose: () => void }) {
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [runId, setRunId] = useState("");
   const [paused, setPaused] = useState(false);
   const [takeover, setTakeover] = useState(false);
   const [startError, setStartError] = useState("");
   const [steer, setSteer] = useState("");
+  const [savingWorkflow, setSavingWorkflow] = useState(false);
+  const [savedWorkflow, setSavedWorkflow] = useState<Workflow | null>(null);
   const queued = useRef<RunEvent[]>([]);
   const activeRun = useRef("");
   // The backend starts emitting run events as soon as the run spawns, which can
@@ -439,6 +276,7 @@ function ExecutionCockpit({ workflow, settings, onClose }: { workflow: Workflow;
   const early = useRef<RunEvent[]>([]);
   const pausedRef = useRef(false);
   const takeoverRef = useRef(false);
+  const livePlanner = workflow.status !== "example";
 
   useEffect(() => {
     pausedRef.current = paused;
@@ -463,12 +301,13 @@ function ExecutionCockpit({ workflow, settings, onClose }: { workflow: Workflow;
   }, []);
 
   useEffect(() => {
-    const command = workflow.status === "example" ? "start_demo_run" : workflow.status === "goal" ? "start_goal_run" : "start_workflow_run";
+    // Saved workflows are durable goal definitions, not brittle recordings.
+    // Re-plan from the current desktop on every run; stored steps remain an
+    // audit trail and a useful learned outline.
+    const command = workflow.status === "example" ? "start_demo_run" : "start_goal_run";
     const args = workflow.status === "example"
       ? { workflowId: workflow.id }
-      : workflow.status === "goal"
-        ? { goal: workflow.goal, applications: workflow.requiredApps }
-        : { libraryPath: settings.libraryPath, workflowId: workflow.id, resumeRunId: null };
+      : { goal: workflow.goal, applications: workflow.requiredApps, provider: workflow.plannerProvider ?? settings.provider };
     invoke<string>(command, args).then((id) => {
       activeRun.current = id;
       setRunId(id);
@@ -477,56 +316,90 @@ function ExecutionCockpit({ workflow, settings, onClose }: { workflow: Workflow;
       if (held.length) setEvents((current) => [...current, ...held]);
     }).catch((caught) => setStartError(String(caught)));
     return () => { activeRun.current = ""; early.current = []; };
-  }, [workflow.id, workflow.status, workflow.goal, workflow.requiredApps, settings.libraryPath]);
+  }, [workflow.id, workflow.status, workflow.goal, workflow.requiredApps, workflow.plannerProvider, settings.provider]);
 
-  // Silence watchdog: if the run reached a terminal state before any timeline
-  // event could be displayed, surface its checkpoint instead of spinning with
-  // no explanation.
+  // Terminal-state watchdog: events can race the listener or a WebView reload.
+  // Poll until the checkpoint is terminal so a finished run can never keep
+  // looking active merely because its last event was missed.
   useEffect(() => {
-    if (!runId || events.length > 0 || startError || workflow.status === "example") return;
+    if (!runId || startError || workflow.status === "example" || ["completed", "failed", "stopped"].includes(events.at(-1)?.status ?? "")) return;
     let cancelled = false;
     const timer = window.setInterval(() => {
       invoke<RunCheckpoint | null>("get_checkpoint", { runId }).then((checkpoint) => {
         if (cancelled || !checkpoint || checkpoint.status === "running") return;
         if (checkpoint.status === "completed") {
-          setEvents((current) => current.length ? current : [{
+          setEvents((current) => current.at(-1)?.status === "completed" ? current : [...current, {
             runId,
             sequence: checkpoint.nextStepIndex,
             stepId: "recovered",
             title: "Run completed",
-            detail: "The run finished before its timeline could be displayed.",
+            detail: "The end-to-end run reached its completed checkpoint.",
             application: "Alfred",
             status: "completed",
             progress: 100,
             timestamp: checkpoint.updatedAt,
           }]);
         } else {
-          setStartError(`The run ended before it could show progress: ${checkpoint.error ?? "it was stopped."}`);
+          setEvents((current) => ["failed", "stopped"].includes(current.at(-1)?.status ?? "") ? current : [...current, {
+            runId,
+            sequence: checkpoint.nextStepIndex,
+            stepId: "terminal",
+            title: checkpoint.status === "failed" ? "Run failed" : "Run stopped",
+            detail: checkpoint.error ?? "The run was stopped before completion.",
+            application: "Alfred",
+            status: checkpoint.status,
+            progress: current.at(-1)?.progress ?? 0,
+            timestamp: checkpoint.updatedAt,
+          }]);
         }
       }).catch(() => undefined);
     }, 3000);
     return () => { cancelled = true; window.clearInterval(timer); };
-  }, [runId, events.length, startError, workflow.status]);
+  }, [runId, events, startError, workflow.status]);
 
   const resume = () => {
     setPaused(false); setTakeover(false);
-    if (runId && workflow.status !== "example") invoke("set_run_control", { runId, control: "running" });
+    if (runId && livePlanner) invoke("set_run_control", { runId, control: "running" });
     if (queued.current.length) { setEvents((current) => [...current, ...queued.current]); queued.current = []; }
   };
   const controlRun = (control: "paused" | "stop") => {
-    if (runId && workflow.status !== "example") invoke("set_run_control", { runId, control }).catch(() => undefined);
+    if (runId && livePlanner) invoke("set_run_control", { runId, control }).catch(() => undefined);
     if (control === "paused") setPaused(true); else onClose();
-  };
-  const retryFromCheckpoint = async () => {
-    try {
-      setStartError("");
-      const id = await invoke<string>("start_workflow_run", { libraryPath: settings.libraryPath, workflowId: workflow.id, resumeRunId: runId });
-      activeRun.current = id; setPaused(false); setTakeover(false);
-    } catch (caught) { setStartError(String(caught)); }
   };
   const approveWaitingStep = async () => {
     try { await invoke("approve_run_step", { runId }); }
     catch (caught) { setStartError(String(caught)); }
+  };
+  const markGoalComplete = async () => {
+    try {
+      const checkpoint = await invoke<RunCheckpoint>("complete_goal_run", { runId });
+      setPaused(false); setTakeover(false); queued.current = [];
+      setEvents((current) => current.at(-1)?.status === "completed" ? current : [...current, {
+        runId,
+        sequence: checkpoint.nextStepIndex,
+        stepId: "user-completed",
+        title: "Goal completed",
+        detail: "You confirmed that the requested outcome is complete.",
+        application: "Alfred",
+        status: "completed",
+        progress: 100,
+        timestamp: checkpoint.updatedAt,
+      }]);
+    } catch (caught) { setStartError(String(caught)); }
+  };
+  const saveAsWorkflow = async () => {
+    setSavingWorkflow(true); setStartError("");
+    try {
+      const saved = await invoke<Workflow>("save_goal_run_as_workflow", {
+        libraryPath: settings.libraryPath,
+        runId,
+        name: workflow.name,
+        goal: workflow.goal,
+      });
+      setSavedWorkflow(saved);
+      await onWorkflowChanged();
+    } catch (caught) { setStartError(String(caught)); }
+    finally { setSavingWorkflow(false); }
   };
   const sendSteer = async () => {
     const note = steer.trim();
@@ -535,8 +408,8 @@ function ExecutionCockpit({ workflow, settings, onClose }: { workflow: Workflow;
     let title = "You steered the run";
     if (workflow.status === "example") {
       title = "Simulations can't change course";
-    } else if (workflow.status !== "goal") {
-      title = "Steering is only available for live goal runs";
+    } else if (!livePlanner) {
+      title = "Simulations can't change course";
     } else if (!runId) {
       title = "The run is still starting — send again in a moment";
     } else {
@@ -550,10 +423,10 @@ function ExecutionCockpit({ workflow, settings, onClose }: { workflow: Workflow;
 
   const current = events.at(-1);
   const progress = current?.progress ?? 3;
-  const complete = progress === 100 && current?.status !== "failed";
+  const complete = progress === 100 && current?.status === "completed";
   const waitingApproval = current?.status === "waiting";
-  const completedSteps = workflow.status === "goal" ? events.filter((event) => event.status === "completed").slice(-8) : [];
-  const planned = workflow.status === "goal"
+  const completedSteps = livePlanner ? events.filter((event) => event.status === "completed").slice(-8) : [];
+  const planned = livePlanner
     ? (completedSteps.length ? completedSteps.map((event) => event.title) : ["The planner decides each step live — actions appear here as they happen."])
     : workflow.steps.length ? workflow.steps.map(step => step.title) : ["Prepare workspace", "Open approved website", "Read invoice table", "Check safety policy", "Append workbook rows", "Verify the result"];
 
@@ -562,21 +435,24 @@ function ExecutionCockpit({ workflow, settings, onClose }: { workflow: Workflow;
       <div className="cockpit-header">
         <div><button className="back-button" onClick={onClose}>‹</button><span className="run-kicker">{complete ? "RUN COMPLETED" : waitingApproval ? "WAITING FOR APPROVAL" : takeover ? "USER IN CONTROL" : paused ? "RUN PAUSED" : "RUNNING SAFELY"}</span><h1>{workflow.name}</h1></div>
         <div className="run-controls">
-          {current?.status === "failed" && workflow.status !== "example" && workflow.status !== "goal" && <button className="primary-button" onClick={retryFromCheckpoint}>Retry from checkpoint</button>}
-          {(paused || takeover || current?.status === "paused") ? <button className="secondary-button" onClick={resume}><Icon name="runs" size={16} /> Resume</button> : <button className="secondary-button" onClick={() => controlRun("paused")}><Icon name="pause" size={16} /> Pause</button>}
-          <button className="secondary-button" onClick={() => { controlRun("paused"); setTakeover(true); }}><Icon name="hand" size={16} /> Take over</button>
-          <button className="danger-button" onClick={() => controlRun("stop")}><Icon name="stop" size={15} /> Stop</button>
+          {!complete && ((paused || takeover || current?.status === "paused") ? <button className="secondary-button" onClick={resume}><Icon name="runs" size={16} /> Resume</button> : <button className="secondary-button" onClick={() => controlRun("paused")}><Icon name="pause" size={16} /> Pause</button>)}
+          {!complete && <button className="secondary-button" onClick={() => { controlRun("paused"); setTakeover(true); }}><Icon name="hand" size={16} /> Take over</button>}
+          {!complete && livePlanner && (paused || takeover) && <button className="primary-button" onClick={markGoalComplete}><Icon name="check" size={16} /> Mark goal complete</button>}
+          {!complete && <button className="danger-button" onClick={() => controlRun("stop")}><Icon name="stop" size={15} /> Stop</button>}
+          {complete && workflow.status === "goal" && !savedWorkflow && <button className="primary-button" disabled={savingWorkflow} onClick={saveAsWorkflow}><Icon name="workflow" size={16} /> {savingWorkflow ? "Saving…" : "Save as workflow"}</button>}
+          {complete && <button className="secondary-button" onClick={onClose}>Done</button>}
         </div>
       </div>
       {startError && <div className="error-message">{startError}</div>}
-      {waitingApproval && <div className="approval-banner panel-surface"><div><strong>Alfred needs your approval</strong><span>{current?.detail}</span></div><div className="run-controls"><button className="primary-button" onClick={approveWaitingStep}>Approve this action</button><button className="danger-button" onClick={() => controlRun("stop")}>Deny and stop</button></div></div>}
+      {complete && <div className="completion-banner panel-surface"><div><Icon name="check" size={20} /><div><strong>End-to-end run completed</strong><span>{savedWorkflow ? `Saved to Workflows as ${savedWorkflow.name}. It is ready to run again or schedule.` : "Alfred reached a completed checkpoint. You can now save the successful action sequence as a reusable workflow."}</span></div></div>{workflow.status === "goal" && !savedWorkflow && <button className="primary-button" disabled={savingWorkflow} onClick={saveAsWorkflow}>{savingWorkflow ? "Saving…" : "Save as workflow"}</button>}</div>}
+      {waitingApproval && <div className="approval-banner panel-surface"><div><strong>Alfred needs a safety exception</strong><span>{current?.detail}</span></div><div className="run-controls"><button className="primary-button" onClick={approveWaitingStep}>Approve exception</button><button className="danger-button" onClick={() => controlRun("stop")}>Deny and stop</button></div></div>}
       <div className="progress-track"><span style={{ width: `${progress}%` }} /></div>
       <div className="cockpit-grid">
         <section className="plan-panel panel-surface">
           <div className="panel-heading"><span>Workflow</span><b>{progress}%</b></div>
           <div className="plan-list">
             {planned.map((step, index) => {
-              const event = workflow.status === "goal"
+              const event = livePlanner
                 ? completedSteps[index]
                 : workflow.steps.length ? [...events].reverse().find(item => item.stepId === workflow.steps[index]?.id) : events.find(item => item.sequence === index);
               const done = event?.status === "completed"; const active = event?.status === "running" || event?.status === "failed" || (!event && index === 0);
@@ -601,7 +477,7 @@ function ExecutionCockpit({ workflow, settings, onClose }: { workflow: Workflow;
             </div></> : current?.evidenceDataUrl ? <img className="native-screenshot" src={current.evidenceDataUrl} alt={`Captured ${current.application} window`}/> : <div className="native-preview"><Icon name="monitor" size={38}/><strong>{current?.application ?? "Waiting for native host"}</strong><span>Screen evidence appears here after a capture step. Alfred continues to show each semantic action in Activity.</span></div>}
             {(paused || takeover) && <div className="paused-overlay"><div><Icon name={takeover ? "hand" : "pause"} size={28} /><strong>{takeover ? "You have control" : "Workflow paused"}</strong><span>Alfred will not interact until you resume.</span></div></div>}
           </div>
-          <div className="now-doing"><div className="pulse-icon"><Icon name={complete ? "check" : "sparkle"} size={18} /></div><div><small>{complete ? "COMPLETED" : "ALFRED IS WORKING"}</small><strong>{current?.title ?? "Preparing the run"}</strong><span>{current?.detail ?? "Loading workflow context and checking permissions."}</span></div></div>
+          <div className="now-doing"><div className="pulse-icon"><Icon name={complete ? "check" : "sparkle"} size={18} /></div><div><small>{complete ? "COMPLETED" : "ALFRED IS WORKING"}</small><strong>{current?.title ?? "Preparing the run"}</strong><span>{current?.detail ?? "Loading durable run memory and observing the desktop."}</span></div></div>
         </section>
         <section className="activity-panel panel-surface">
           <div className="panel-heading"><span>Activity</span><button>Evidence</button></div>
@@ -678,7 +554,7 @@ function AccessStep({ os }: { os: string }) {
     ["Keyboard and pointer", "Interact only after the safety engine approves"],
     ["Emergency stop", "Immediately release control from any application"],
   ];
-  return <div className="setup-step"><span className="eyebrow">COMPUTER ACCESS</span><h1>Visible, scoped control</h1><p className="setup-lead">The native automation host will verify these capabilities. Alfred asks before using a new application.</p><div className="capability-list">{capabilities.map(([title, detail], index) => <div className="capability-row" key={title}><span className="capability-icon"><Icon name={index === 0 ? "monitor" : index === 3 ? "hand" : "check"} size={20}/></span><div><strong>{title}</strong><span>{detail}</span></div><span className="planned-badge">Verified at first use</span></div>)}</div><div className="shortcut-preview"><kbd>Ctrl</kbd><span>+</span><kbd>Shift</kbd><span>+</span><kbd>Esc</kbd><div><strong>Emergency stop</strong><span>This shortcut is reserved by Alfred.</span></div></div></div>;
+  return <div className="setup-step"><span className="eyebrow">COMPUTER ACCESS</span><h1>Visible, scoped control</h1><p className="setup-lead">The native automation host verifies these capabilities. Alfred automatically performs actions it can classify as safe and blocks destructive actions.</p><div className="capability-list">{capabilities.map(([title, detail], index) => <div className="capability-row" key={title}><span className="capability-icon"><Icon name={index === 0 ? "monitor" : index === 3 ? "hand" : "check"} size={20}/></span><div><strong>{title}</strong><span>{detail}</span></div><span className="planned-badge">Verified at first use</span></div>)}</div><div className="shortcut-preview"><kbd>Ctrl</kbd><span>+</span><kbd>Shift</kbd><span>+</span><kbd>Esc</kbd><div><strong>Emergency stop</strong><span>This shortcut is reserved by Alfred.</span></div></div></div>;
 }
 
 function LibraryStep({ path, onPath, onChoose, retention, onRetention }: { path: string; onPath: (path: string) => void; onChoose: () => void; retention: string; onRetention: (value: "all"|"failures"|"none") => void }) {
@@ -694,12 +570,9 @@ function SettingsView({ settings, providers, system, onSave }: { settings: AppSe
   const [saved, setSaved] = useState(false);
   const [secrets, setSecrets] = useState<Record<string, string>>({});
   const [credentialSaved, setCredentialSaved] = useState<Record<string, boolean>>(() => Object.fromEntries(providers.map(item => [item.id, item.credentialStored])));
-  const [permissions, setPermissions] = useState<PermissionGrant[]>([]);
   const [browserConnected, setBrowserConnected] = useState(false);
-  const [permissionApp, setPermissionApp] = useState("Microsoft Excel");
   const [message, setMessage] = useState("");
   useEffect(() => {
-    invoke<PermissionGrant[]>("list_permissions").then(setPermissions);
     invoke<boolean>("browser_bridge_status").then(setBrowserConnected).catch(() => setBrowserConnected(false));
   }, []);
   const choose = async () => { const selected = await open({ directory: true, multiple: false }); if (typeof selected === "string") setDraft({ ...draft, libraryPath: selected }); };
@@ -707,16 +580,12 @@ function SettingsView({ settings, providers, system, onSave }: { settings: AppSe
     try { await invoke("store_provider_secret", { provider: provider.id, secret: secrets[provider.id] ?? "" }); setCredentialSaved(current => ({ ...current, [provider.id]: true })); setSecrets(current => ({ ...current, [provider.id]: "" })); setMessage(`${provider.name} credential saved in the OS vault.`); }
     catch (caught) { setMessage(String(caught)); }
   };
-  const addPermission = async () => {
-    const next = await invoke<PermissionGrant>("grant_permission", { application: permissionApp, allowedEffects: ["modify_reversible"], allowedIntents: [] }); setPermissions(current => [...current, next]);
-  };
   return <div className="page settings-page"><section className="page-title"><div><span className="eyebrow">PREFERENCES</span><h1>Settings</h1><p>Configure engines, credentials, computer access, and local storage without editing files.</p></div></section><div className="settings-layout">
     <section className="settings-section"><h2>AI engines and credentials</h2><p>CLI sessions use the provider's existing sign-in or a secret stored in Windows Credential Manager / macOS Keychain.</p><div className="provider-settings">{providers.map(provider => <div className={draft.provider === provider.id ? "provider-setting selected" : "provider-setting"} key={provider.id}><button onClick={() => setDraft({ ...draft, provider: provider.id })}><span className={`provider-logo small provider-${provider.id}`}>{provider.name.charAt(0)}</span><div><strong>{provider.name}</strong><small>{provider.installed ? `${provider.version ?? provider.command} detected` : `${provider.command} not found`}</small></div><i>{draft.provider === provider.id && <Icon name="check" size={13}/>}</i></button><div className="credential-row"><input type="password" autoComplete="off" value={secrets[provider.id] ?? ""} onChange={event => setSecrets(current => ({ ...current, [provider.id]: event.target.value }))} placeholder={credentialSaved[provider.id] ? "Credential stored · enter to replace" : "Optional API token"}/><button disabled={!secrets[provider.id]} onClick={() => saveCredential(provider)}>Save to vault</button></div></div>)}</div></section>
-    <section className="settings-section"><h2>Computer and browser bridge</h2><p>Native host: <strong>{system.nativeHost}</strong></p><div className="bridge-status"><i className={browserConnected ? "connected" : ""}/><div><strong>{browserConnected ? "Installed browser connected" : "Browser bridge not connected"}</strong><span>{browserConnected ? "Semantic DOM actions and visible-tab capture are available." : "Load the Chromium extension and native host manifest, then reopen the browser."}</span></div><button onClick={async () => setBrowserConnected(await invoke<boolean>("browser_bridge_status"))}>Check</button></div></section>
-    <section className="settings-section"><h2>Application permissions</h2><p>Alfred observes app state by default. Reversible changes require an explicit application grant.</p><div className="permission-add"><input value={permissionApp} onChange={event => setPermissionApp(event.target.value)} placeholder="Application name"/><button onClick={addPermission}>Allow reversible changes</button></div><div className="permission-list">{permissions.map(permission => <div key={permission.id}><div><strong>{permission.application}</strong><span>{permission.allowedEffects.join(", ")}</span></div><button onClick={async () => setPermissions(await invoke<PermissionGrant[]>("set_permission_enabled", { permissionId: permission.id, enabled: !permission.enabled }))}>{permission.enabled ? "Enabled" : "Disabled"}</button></div>)}</div></section>
+    <section className="settings-section"><h2>Computer control</h2><p>Native host: <strong>{system.nativeHost}</strong>. Safe actions run automatically; destructive actions remain blocked.</p><div className="bridge-status"><i className={browserConnected ? "connected" : ""}/><div><strong>{browserConnected ? "Optional browser accelerator connected" : "Native visual browser control active"}</strong><span>{browserConnected ? "DOM-backed browser actions are available in addition to native control." : "The extension is optional. Alfred can operate the browser through screenshots and Windows UI Automation."}</span></div><button onClick={async () => setBrowserConnected(await invoke<boolean>("browser_bridge_status"))}>Check</button></div></section>
     <section className="settings-section"><h2>Workflow library</h2><p>Automations are portable YAML files in a folder you control.</p><div className="settings-path"><Icon name="folder" size={18}/><span>{draft.libraryPath}</span><button onClick={choose}>Change</button></div><small className="platform-note">Running on {system.os} · {system.architecture}</small></section>
     <section className="settings-section"><h2>Screenshot retention</h2><select value={draft.screenshotRetention} onChange={(event) => setDraft({ ...draft, screenshotRetention: event.target.value as AppSettings["screenshotRetention"] })}><option value="failures">Only when a run needs attention</option><option value="all">Every run</option><option value="none">Discard immediately</option></select></section>
-    <section className="settings-section"><h2>Planner vision</h2><p>Attach a screenshot of each target app to planner turns so the planner can see the desktop, not just read it. Images leave this device to the provider's API.</p><label className="toggle-row"><input type="checkbox" checked={draft.shareScreenshotsWithPlanner} onChange={(event) => setDraft({ ...draft, shareScreenshotsWithPlanner: event.target.checked })}/><span>Share screenshots with the planner (Codex and Copilot attach them directly; Grok and Cursor read the screenshot files Alfred lists in the prompt)</span></label></section>
+    <section className="settings-section"><h2>Hybrid visual grounding</h2><p>Alfred combines screenshots with accessibility data. This is more reliable than either vision-only or UI Automation-only control. Images leave this device through the selected provider.</p><label className="toggle-row"><input type="checkbox" checked={draft.shareScreenshotsWithPlanner} onChange={(event) => setDraft({ ...draft, shareScreenshotsWithPlanner: event.target.checked })}/><span>Share target-app screenshots with the selected brain (recommended for reliable control)</span></label></section>
     <section className="settings-section danger-zone"><h2>Safety policy</h2><div className="immutable-setting"><Icon name="shield" size={19}/><div><strong>Persistent-data deletion blocked</strong><span>This protection is enforced in Core, the Windows host, and the browser extension.</span></div><span>Always on</span></div></section>
   </div>{message && <div className="info-callout"><Icon name="check" size={18}/><span>{message}</span></div>}<div className="settings-save"><span>{saved ? "Settings saved" : "Changes stay local to this machine."}</span><button className="primary-button" onClick={async () => { await onSave(draft); setSaved(true); setTimeout(() => setSaved(false), 1800); }}>Save changes</button></div></div>;
 }

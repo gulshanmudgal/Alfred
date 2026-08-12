@@ -113,7 +113,17 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .approval-banner { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 14px; padding: 14px 18px; border-left: 4px solid #b98a1d; }
 .approval-banner strong { display: block; font-size: 13px; }
 .approval-banner span { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; }
+.completion-banner { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 14px; padding: 14px 18px; border-left: 4px solid #2e9b68; }
+.completion-banner > div { display: flex; align-items: center; gap: 10px; }
+.completion-banner strong { display: block; font-size: 13px; }
+.completion-banner span { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; }
 .goal-launcher-fields input { width: 100%; margin-top: 8px; padding: 10px 12px; border: 1px solid #dddde3; border-radius: 9px; outline: 0; font-size: 12px; background: #fcfcfd; }
 .goal-launcher-fields input:focus { border-color: #8b79e5; box-shadow: 0 0 0 3px #eeeaff; }
+.brain-picker { width: min(360px, 100%); margin-top: 7px; display: flex; align-items: center; gap: 10px; }
+.brain-picker > span { font-weight: 700; color: var(--ink); }
+.brain-picker select { flex: 1; padding: 8px 10px; border: 1px solid #dddde3; border-radius: 9px; background: #fcfcfd; color: var(--ink); }
 .toggle-row { display: flex; align-items: center; gap: 9px; margin-top: 10px; font-size: 11px; color: var(--ink); }
 .toggle-row input { width: 15px; height: 15px; accent-color: #6d5bd0; }
+@media (prefers-color-scheme: dark) {
+  .goal-launcher-fields input, .brain-picker select { color: var(--ink); background: #292a31; border-color: #41424a; }
+}

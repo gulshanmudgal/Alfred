@@ -2,7 +2,7 @@
 
 ## Trust boundary
 
-Provider CLIs are planners. They never receive direct access to keyboard, pointer, accessibility, screen-capture, browser Native Messaging, or filesystem mutation APIs.
+Provider CLIs are planners. Alfred never gives them its keyboard, pointer, accessibility, screen-capture, browser Native Messaging, or native-host capability. Each adapter also applies the strongest planner-only restrictions exposed by that CLI.
 
 Every proposed action follows this path:
 
@@ -21,26 +21,30 @@ Deletion and persistent-data-loss decisions are `hard_deny` and cannot be change
 A goal run closes the observe → plan → act loop with the provider inside the trust boundary:
 
 1. Core observes every target application (UIA control summaries; DOM element refs for the pinned browser tab).
-2. Core sends the goal, the observation bundle, and the capped action history to a fresh, sandboxed provider process (one process per turn; state lives in Core, not the CLI; stop kills the turn via `kill_on_drop`).
-3. The provider replies with exactly one JSON action or `done`. Core parses tolerantly (whole output, trailing JSON lines, widest brace span).
-4. The action is executed through the same policy gate as recorded steps. `request_user` parks the run in a `waiting` checkpoint until the user approves (durable grant + one-step override) or stops; `hard_deny` is absolute.
-5. Outcomes append to the history and the loop repeats.
+2. Core atomically persists a versioned `GoalRunMemory` ledger (goal, chosen provider, provider session id, evolving app set, observations, plan, history, pending action, failures, and completion evidence) before invoking the provider.
+3. Core sends that complete durable state to a supervised provider process. When the CLI exposes session continuation, Alfred resumes the exact Codex thread, Copilot session, Cursor chat, or Grok session as a second source of conversational context. Core remains authoritative if a provider session disappears.
+4. The provider replies with exactly one JSON action or a completion claim. Core parses provider-specific structured envelopes tolerantly.
+5. The action is executed through the policy gate. Methods Alfred understands and classifies as non-destructive run automatically; destructive actions are hard-denied; genuinely unknown effects are the only actions that can park for an exception.
+6. A completion claim never closes the run. Alfred takes a fresh observation and requires a separate evidence-review response with concrete visible facts or successful results. Only then does the checkpoint become `completed`.
+7. Outcomes are committed to memory and the reusable run ledger before the loop repeats.
 
 Guardrails: a machine-wide run lock, a per-run step limit, a consecutive-failure breaker, an optional human check-in cadence (the run pauses for review), and fail-closed exit for unattended scheduled runs that hit a `waiting` state.
 
 ### Prompt-injection posture
 
-Observations contain untrusted content (web page text, window titles), so planner output is treated as adversarial by construction: the declared `effect` is never trusted — Core derives a floor from the method (mutating methods can never run as `observe`, which would skip the permission grant), destructive language and the Delete key are hard-denied regardless of phrasing, unknown effects park for human approval, and every action is scoped to the user-granted applications. The planner can therefore never authorize anything on its own; it can only propose.
+Observations contain untrusted content (web page text, window titles), so planner output is treated as adversarial by construction: the declared `effect` is never trusted — Core derives a floor from the method, destructive language and the Delete key are hard-denied regardless of phrasing, unknown effects park for human approval, coordinate input is constrained to the named application's window, and application launch accepts only fixed aliases or exact installed Start-menu names. The planner can therefore never authorize a native action on its own; it can only propose one.
 
-### Visual grounding (opt-in)
+### Hybrid visual grounding
 
-Text observations miss canvas-rendered and image-heavy content. When the user enables **Share screenshots with the planner**, each turn also captures one image per target application (`PrintWindow` for native windows, visible-tab capture for the browser) into a per-run folder under the app-data directory. The models behind every supported CLI are multimodal; only the delivery pipe differs per CLI, and each pipe is verified before Alfred uses it:
+Vision-only control is feasible, but it is not the reliability target: screenshots are essential for canvas-rendered and image-heavy content, while accessibility selectors are more deterministic for ordinary controls and survive display scaling better than coordinates. Alfred therefore uses both. New installations enable screenshot sharing by default and users can disable it because images leave the machine through the selected provider.
+
+Each turn captures one image per target application (`PrintWindow` for native windows, visible-tab capture when the optional browser bridge is present) into a per-run folder under the app-data directory. The delivery pipe differs per CLI:
 
 - **Codex**: attached with `-i/--image <FILE>...`.
 - **Copilot**: attached with `--attachment <path>` (valid in the non-interactive `-p` mode Alfred uses).
 - **Grok / Cursor**: no image flag exists, but their built-in file-reading tools hand image files to the multimodal model — verified live against the Grok CLI (a single `read_file` on a screenshot returned full visual understanding, including embedded text). Alfred lists the screenshot paths in the prompt for these providers.
 
-Captures double as cockpit evidence. Because images leave the device to the provider's API, the setting defaults to off. Retention follows the existing screenshot policy (`all` / `failures` / `none`), the folder prunes to the newest dozen files during a run, and stale folders are swept at startup.
+Captures double as cockpit evidence. Retention follows the screenshot policy (`all` / `failures` / `none`), the folder prunes to the newest dozen files during a run, and stale folders are swept at startup.
 
 ## Processes
 
@@ -54,19 +58,25 @@ The Rust core owns workflow state, policy, local persistence, provider supervisi
 
 ### Provider adapters
 
-Core detects and supervises Codex, GitHub Copilot, Cursor, and Grok CLIs. It starts non-interactive planning sessions, streams stdout/stderr separately, supports cancellation, uses existing CLI sign-in or credentials retrieved from the OS vault, and never gives a provider the native capability token.
+Core detects and supervises Codex, GitHub Copilot, Cursor, and Grok CLIs. It starts non-interactive planning turns, extracts the documented session/thread id from structured output, resumes that exact conversation, streams stdout/stderr separately, supports cancellation, uses existing CLI sign-in or credentials retrieved from the OS vault, and never gives a provider the native capability token. Codex runs in its read-only sandbox; Copilot is denied shell/write/URL/memory tools; Grok receives only `read_file` (needed for screenshot-path delivery) and no subagents.
 
 ### Native automation hosts
 
-The Windows .NET host implements application enumeration, UI Automation tree observation and semantic invocation, window screenshot capture, and narrowly-scoped `SendInput` click/type/key operations. It communicates over capability-authenticated JSON Lines and repeats the destructive-language block in-process. A Swift AXUIElement/ScreenCaptureKit host remains the macOS platform milestone; the shared shell and Core already build on macOS.
+The Windows .NET host implements running/installed application enumeration, UI Automation tree observation and semantic invocation, window screenshot capture, and narrowly-scoped `SendInput` click/type/key operations. Known inbox apps use fixed executable aliases; any other app can launch only through an exact installed Start-menu shortcut, never an arbitrary executable path or command line. It communicates over capability-authenticated JSON Lines and repeats the destructive-language block in-process. A Swift AXUIElement/ScreenCaptureKit host remains the macOS platform milestone; the shared shell and Core already build on macOS.
 
 ### Browser bridge
 
-The Chromium Manifest V3 extension provides DOM-backed observation, navigation, screenshot capture, click, and type through an installed Native Messaging host. Webpages cannot address the host. Element references expire after page changes; password fields and destructive actions are blocked in the extension.
+The Chromium Manifest V3 extension is an optional accelerator for DOM-backed observation, navigation, screenshot capture, click, and type. It is not required for browser control: without it, Edge/Chrome/Brave are ordinary native targets observed through screenshots and UI Automation. Webpages cannot address the bridge. Element references expire after page changes; password fields and destructive actions are blocked in the extension.
 
 ## Persistence
 
-Workflow definitions live in the user-selected library as YAML files. Secrets, provider authentication, schedules, screenshots, and machine-specific run state are never embedded in shareable workflow files.
+Workflow definitions live in the user-selected library as YAML files. A saved workflow is a goal definition with the brain that learned it, target-app hints, and a successful action audit trail. Running it re-enters the live planner instead of blindly replaying stale browser refs or coordinates. Secrets, provider authentication, screenshots, provider session ids, and machine-specific run state are never embedded in shareable workflow files.
+
+Machine-specific goal memory lives under app data in `goal-runs/<run-id>.json`; successful reusable steps live in the separate run-step ledger. Both use atomic replacement.
+
+## Windows-Use evaluation
+
+[Windows-Use](https://github.com/Jeomon/Windows-Use) validates Alfred's accessibility-first, optional-vision direction and provides useful patterns for bounded observations, event subscribers, and persistent memory. It is MIT licensed, but Alfred does not embed it in the trusted path today: it is Python-based, exposes PowerShell/filesystem tools, and explicitly provides no sandbox or isolation. Selective adaptation remains possible after Alfred's native protocol and safety invariants have equivalent tests.
 
 ## Windows release gate
 

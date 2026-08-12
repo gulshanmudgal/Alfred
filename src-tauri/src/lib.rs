@@ -1,6 +1,8 @@
 use chrono::{DateTime, Datelike, Local, Timelike, Utc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt as _;
 use std::{
     collections::HashMap,
     fs,
@@ -11,10 +13,7 @@ use std::{
     sync::{mpsc, Arc, Mutex},
     time::Duration,
 };
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt as _;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
 const PROTOCOL_VERSION: &str = "1.0";
@@ -22,7 +21,6 @@ const VAULT_SERVICE: &str = "com.alfred.desktop";
 
 #[derive(Default)]
 struct RuntimeState {
-    provider_pids: Arc<Mutex<HashMap<String, u32>>>,
     native_host: Arc<Mutex<Option<NativeHostProcess>>>,
     run_controls: Arc<Mutex<HashMap<String, String>>>,
     /// One-step policy overrides granted by the user at the "waiting" prompt:
@@ -69,12 +67,16 @@ fn spawn_native_host(app: &AppHandle) -> Result<NativeHostProcess, String> {
     std::thread::spawn(move || {
         while let Ok(line) = worker_inbox.recv() {
             let result = (|| {
-                writeln!(stdin, "{line}").map_err(|error| error.to_string())?;
-                stdin.flush().map_err(|error| error.to_string())?;
+                writeln!(stdin, "{line}").map_err(|error| {
+                    format!("Could not write to the Windows automation host: {error}")
+                })?;
+                stdin.flush().map_err(|error| {
+                    format!("Could not flush the Windows automation host request: {error}")
+                })?;
                 let mut response = String::new();
-                stdout
-                    .read_line(&mut response)
-                    .map_err(|error| error.to_string())?;
+                stdout.read_line(&mut response).map_err(|error| {
+                    format!("Could not read the Windows automation host response: {error}")
+                })?;
                 if response.is_empty() {
                     return Err("The native host closed the connection.".to_string());
                 }
@@ -103,8 +105,8 @@ pub struct AppSettings {
     screenshot_retention: String,
     theme: String,
     /// Screenshots leave the machine when attached to a cloud planner CLI, so
-    /// visual grounding is opt-in. Only providers with verified image-input
-    /// support (Codex today) receive attachments; others stay text-only.
+    /// visual grounding can be disabled, but is on for new installations because
+    /// it is the fallback for canvas-based and accessibility-poor applications.
     #[serde(default)]
     share_screenshots_with_planner: bool,
 }
@@ -117,7 +119,7 @@ impl Default for AppSettings {
             library_path: String::new(),
             screenshot_retention: "failures".into(),
             theme: "system".into(),
-            share_screenshots_with_planner: false,
+            share_screenshots_with_planner: true,
         }
     }
 }
@@ -223,6 +225,10 @@ pub struct Workflow {
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     status: String,
+    /// The brain used while the workflow was learned. Re-running a saved goal
+    /// defaults to this provider, while still allowing the user to choose another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    planner_provider: Option<String>,
     required_apps: Vec<String>,
     steps: Vec<WorkflowStep>,
 }
@@ -292,6 +298,52 @@ pub struct RunCheckpoint {
     updated_at: DateTime<Utc>,
 }
 
+/// Alfred-owned memory for a live goal. Provider sessions are useful context,
+/// but never the source of truth: this ledger is atomically persisted after
+/// every observation, plan, action, failure, and completion claim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalRunMemory {
+    schema_version: u32,
+    run_id: String,
+    provider: String,
+    #[serde(default)]
+    provider_session_id: Option<String>,
+    goal: String,
+    #[serde(default)]
+    applications: Vec<String>,
+    #[serde(default)]
+    planner_turns: u32,
+    #[serde(default)]
+    provider_session_resets: u8,
+    #[serde(default)]
+    next_step_index: usize,
+    #[serde(default)]
+    pinned_browser_tab: Option<i64>,
+    #[serde(default)]
+    history: Vec<String>,
+    #[serde(default)]
+    working_plan: Vec<String>,
+    #[serde(default)]
+    consecutive_failures: u32,
+    #[serde(default)]
+    actions_since_check_in: u32,
+    #[serde(default)]
+    last_observation: String,
+    #[serde(default)]
+    pending_action: Option<WorkflowStep>,
+    #[serde(default)]
+    completion_claim: Option<String>,
+    #[serde(default)]
+    completion_evidence: Vec<String>,
+    #[serde(default)]
+    verification_attempts: u32,
+    status: String,
+    #[serde(default)]
+    completion_summary: Option<String>,
+    updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RunEvent {
@@ -307,17 +359,6 @@ struct RunEvent {
     timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ProviderEvent {
-    session_id: String,
-    provider: String,
-    stream: String,
-    line: String,
-    status: String,
-    timestamp: DateTime<Utc>,
-}
-
 #[derive(Debug)]
 struct ProviderInvocation {
     command: String,
@@ -325,12 +366,14 @@ struct ProviderInvocation {
     stdin: Option<String>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProviderPlan {
     steps: Vec<ProviderPlanStep>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProviderPlanStep {
@@ -345,6 +388,7 @@ struct ProviderPlanStep {
     params: Value,
 }
 
+#[cfg(test)]
 fn empty_json_object() -> Value {
     serde_json::json!({})
 }
@@ -371,6 +415,29 @@ fn checkpoints_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let path = app_data_dir(app)?.join("checkpoints");
     fs::create_dir_all(&path).map_err(|error| error.to_string())?;
     Ok(path)
+}
+
+fn goal_run_memory_path(app: &AppHandle, run_id: &str) -> Result<PathBuf, String> {
+    let path = app_data_dir(app)?.join("goal-runs");
+    fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+    Ok(path.join(format!("{run_id}.json")))
+}
+
+fn save_goal_run_memory(app: &AppHandle, memory: &mut GoalRunMemory) -> Result<(), String> {
+    memory.updated_at = Utc::now();
+    write_json(&goal_run_memory_path(app, &memory.run_id)?, memory)
+}
+
+#[tauri::command]
+fn get_goal_run_memory(app: AppHandle, run_id: String) -> Result<Option<GoalRunMemory>, String> {
+    let path = goal_run_memory_path(&app, &run_id)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    serde_json::from_str(&raw)
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
@@ -493,7 +560,11 @@ fn select_resolved_command(paths: Vec<PathBuf>, windows: bool) -> Option<PathBuf
                 .unwrap_or(false)
         })
         .cloned()
-        .or_else(|| paths.into_iter().find(|path| is_windows_command_script(path)))
+        .or_else(|| {
+            paths
+                .into_iter()
+                .find(|path| is_windows_command_script(path))
+        })
 }
 
 fn resolve_provider_command(command: &str) -> Option<PathBuf> {
@@ -642,28 +713,108 @@ fn provider_invocation(
     prompt: &str,
     images: &[PathBuf],
 ) -> Result<ProviderInvocation, String> {
-    let (args, stdin) = match provider {
-        "codex" => (vec![
-            "exec",
-            "--json",
-            "--ephemeral",
-            "--ignore-user-config",
-            "--ask-for-approval",
-            "never",
-            "--skip-git-repo-check",
-            "--sandbox",
-            "read-only",
-            "-",
-        ], Some(prompt.to_string())),
-        "copilot" => (vec!["-p", prompt, "-s"], None),
-        "cursor" => (vec!["-p", "--output-format", "stream-json", prompt], None),
-        // Prefer whole-message JSON: streaming-json emits token-level
-        // {"type":"text","data":"…"} fragments that must be reassembled. The
-        // `json` format returns one object with a complete `text` field.
-        "grok" => (vec!["-p", prompt, "--output-format", "json"], None),
-        _ => return Err(format!("Unknown provider: {provider}")),
-    };
-    let mut args: Vec<String> = args.into_iter().map(str::to_string).collect();
+    provider_invocation_for_session(provider, prompt, images, None, false)
+}
+
+/// Builds either the first turn of a provider conversation or an explicit
+/// continuation. Alfred still sends the complete durable memory each turn, so a
+/// provider losing its own session can never erase the run's state.
+fn provider_invocation_for_session(
+    provider: &str,
+    prompt: &str,
+    images: &[PathBuf],
+    session_id: Option<&str>,
+    resume: bool,
+) -> Result<ProviderInvocation, String> {
+    let (args, stdin) =
+        match provider {
+            "codex" => {
+                let mut args = vec![
+                    "--ask-for-approval",
+                    "never",
+                    "--sandbox",
+                    "read-only",
+                    "exec",
+                ];
+                if resume {
+                    args.push("resume");
+                }
+                args.extend(["--json", "--ignore-user-config", "--skip-git-repo-check"]);
+                if resume {
+                    args.push(session_id.ok_or_else(|| {
+                        "Codex continuation is missing its session id.".to_string()
+                    })?);
+                }
+                args.push("-");
+                (args, Some(prompt.to_string()))
+            }
+            "copilot" => {
+                let mut args = vec![
+                    "-p",
+                    prompt,
+                    "-s",
+                    "--output-format",
+                    "json",
+                    "--no-ask-user",
+                    "--no-custom-instructions",
+                    "--disable-builtin-mcps",
+                    "--deny-tool=shell,write,url,memory",
+                ];
+                if let Some(id) = session_id {
+                    args.extend(["--session-id", id]);
+                }
+                (args, None)
+            }
+            "cursor" => {
+                let mut args = vec!["-p", "--output-format", "stream-json"];
+                let resume_arg;
+                if resume {
+                    resume_arg = format!(
+                        "--resume={}",
+                        session_id.ok_or_else(|| {
+                            "Cursor continuation is missing its session id.".to_string()
+                        })?
+                    );
+                    args.push(&resume_arg);
+                }
+                args.push(prompt);
+                let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+                return finish_provider_invocation(provider, args, None, images);
+            }
+            // Prefer whole-message JSON: streaming-json emits token-level
+            // {"type":"text","data":"…"} fragments that must be reassembled. The
+            // `json` format returns one object with a complete `text` field.
+            "grok" => {
+                let mut args = vec![
+                    "-p",
+                    prompt,
+                    "--output-format",
+                    "json",
+                    "--tools",
+                    "read_file",
+                    "--no-subagents",
+                ];
+                if let Some(id) = session_id {
+                    args.extend(if resume {
+                        vec!["--resume", id]
+                    } else {
+                        vec!["--session-id", id]
+                    });
+                }
+                (args, None)
+            }
+            _ => return Err(format!("Unknown provider: {provider}")),
+        };
+    let args: Vec<String> = args.into_iter().map(str::to_string).collect();
+    finish_provider_invocation(provider, args, stdin, images)
+}
+
+fn finish_provider_invocation(
+    provider: &str,
+    mut args: Vec<String>,
+    stdin: Option<String>,
+    images: &[PathBuf],
+) -> Result<ProviderInvocation, String> {
     if !images.is_empty() {
         match provider {
             "codex" => {
@@ -710,11 +861,14 @@ fn provider_invocation(
 /// OS-vault credential injected into the environment. Shared by design-time
 /// planning sessions and runtime agent-loop turns.
 fn provider_command(
+    app: &AppHandle,
     provider: &str,
     prompt: &str,
     images: &[PathBuf],
+    session_id: Option<&str>,
+    resume: bool,
 ) -> Result<(tokio::process::Command, Option<String>), String> {
-    let invocation = provider_invocation(provider, prompt, images)?;
+    let invocation = provider_invocation_for_session(provider, prompt, images, session_id, resume)?;
     let resolved = resolve_provider_command(&invocation.command).ok_or_else(|| {
         format!(
             "{} is not available to Alfred. Install it, sign in, then restart Alfred.",
@@ -722,9 +876,12 @@ fn provider_command(
         )
     })?;
     let resolved = resolved_process(&resolved, &invocation.args, provider == "codex")?;
+    let planner_workspace = app_data_dir(app)?.join("planner-workspace");
+    fs::create_dir_all(&planner_workspace).map_err(|error| error.to_string())?;
     let mut process = tokio::process::Command::new(&resolved.program);
     process
         .args(resolved.args)
+        .current_dir(planner_workspace)
         .stdin(if invocation.stdin.is_some() {
             Stdio::piped()
         } else {
@@ -776,158 +933,9 @@ fn preflight_provider(provider: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-async fn start_provider_run(
-    app: AppHandle,
-    state: State<'_, RuntimeState>,
-    provider: String,
-    prompt: String,
-    working_directory: Option<String>,
-    session_id: Option<String>,
-) -> Result<String, String> {
-    if prompt.trim().is_empty() {
-        return Err("The provider prompt cannot be empty.".into());
-    }
-    let _ = working_directory;
-    let (mut process, prompt_input) = provider_command(&provider, &prompt, &[])?;
-    let planning_directory = app_data_dir(&app)?.join("planner");
-    fs::create_dir_all(&planning_directory).map_err(|error| error.to_string())?;
-    process.current_dir(planning_directory);
-    let mut child = process
-        .spawn()
-        .map_err(|error| format!("Could not start {provider}: {error}"))?;
-    if let Some(prompt_input) = prompt_input {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| format!("Could not open {provider} input."))?;
-        stdin
-            .write_all(prompt_input.as_bytes())
-            .await
-            .map_err(|error| format!("Could not send the plan request to {provider}: {error}"))?;
-        stdin
-            .shutdown()
-            .await
-            .map_err(|error| format!("Could not finish the plan request to {provider}: {error}"))?;
-    }
-    let session_id = session_id
-        .filter(|value| Uuid::parse_str(value).is_ok())
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    if let Some(pid) = child.id() {
-        state
-            .provider_pids
-            .lock()
-            .map_err(|_| "Provider state is unavailable")?
-            .insert(session_id.clone(), pid);
-    }
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let emitted_session = session_id.clone();
-    let emitted_provider = provider.clone();
-    let pids = state.provider_pids.clone();
-    tauri::async_runtime::spawn(async move {
-        let stdout_app = app.clone();
-        let stdout_session = emitted_session.clone();
-        let stdout_provider = emitted_provider.clone();
-        let stdout_task = tauri::async_runtime::spawn(async move {
-            if let Some(stdout) = stdout {
-                let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let _ = stdout_app.emit(
-                        "alfred://provider-event",
-                        ProviderEvent {
-                            session_id: stdout_session.clone(),
-                            provider: stdout_provider.clone(),
-                            stream: "stdout".into(),
-                            line,
-                            status: "running".into(),
-                            timestamp: Utc::now(),
-                        },
-                    );
-                }
-            }
-        });
-        let stderr_app = app.clone();
-        let stderr_session = emitted_session.clone();
-        let stderr_provider = emitted_provider.clone();
-        let stderr_task = tauri::async_runtime::spawn(async move {
-            if let Some(stderr) = stderr {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let _ = stderr_app.emit(
-                        "alfred://provider-event",
-                        ProviderEvent {
-                            session_id: stderr_session.clone(),
-                            provider: stderr_provider.clone(),
-                            stream: "stderr".into(),
-                            line,
-                            status: "running".into(),
-                            timestamp: Utc::now(),
-                        },
-                    );
-                }
-            }
-        });
-        let status = child
-            .wait()
-            .await
-            .map(|value| {
-                if value.success() {
-                    "completed"
-                } else {
-                    "failed"
-                }
-            })
-            .unwrap_or("failed");
-        let _ = stdout_task.await;
-        let _ = stderr_task.await;
-        let _ = app.emit(
-            "alfred://provider-event",
-            ProviderEvent {
-                session_id: emitted_session.clone(),
-                provider: emitted_provider,
-                stream: "system".into(),
-                line: format!("Provider run {status}"),
-                status: status.into(),
-                timestamp: Utc::now(),
-            },
-        );
-        if let Ok(mut map) = pids.lock() {
-            map.remove(&emitted_session);
-        }
-    });
-    Ok(session_id)
-}
-
-#[tauri::command]
-fn cancel_provider_run(state: State<'_, RuntimeState>, session_id: String) -> Result<(), String> {
-    let pid = state
-        .provider_pids
-        .lock()
-        .map_err(|_| "Provider state is unavailable")?
-        .get(&session_id)
-        .copied()
-        .ok_or_else(|| "Provider session is no longer running.".to_string())?;
-    let status = if cfg!(target_os = "windows") {
-        Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T"])
-            .status()
-    } else {
-        Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status()
-    };
-    status.map_err(|error| error.to_string()).and_then(|value| {
-        if value.success() {
-            Ok(())
-        } else {
-            Err("The provider process could not be stopped.".into())
-        }
-    })
-}
-
 const ALLOWED_PLAN_METHODS: &[&str] = &[
     "launchApplication",
+    "listInstalledApplications",
     "focusApplication",
     "observeWindow",
     "captureWindow",
@@ -938,6 +946,7 @@ const ALLOWED_PLAN_METHODS: &[&str] = &[
     "click",
     "typeText",
     "key",
+    "shortcut",
     "browser.observe",
     "browser.navigate",
     "browser.click",
@@ -947,16 +956,6 @@ const ALLOWED_PLAN_METHODS: &[&str] = &[
     "browser.scroll",
     "browser.find",
     "browser.wait",
-];
-
-const SAFE_LAUNCH_APPLICATIONS: &[&str] = &[
-    "Notepad",
-    "Calculator",
-    "Paint",
-    "File Explorer",
-    "Microsoft Edge",
-    "Google Chrome",
-    "Brave",
 ];
 
 fn method_effect(method: &str) -> &'static str {
@@ -972,25 +971,21 @@ fn validate_workflow_step(step: &WorkflowStep) -> Result<(), String> {
     if !ALLOWED_PLAN_METHODS.contains(&step.kind.as_str()) {
         return Err(format!("Unsupported workflow method: {}", step.kind));
     }
-    let application = step
+    let _application = step
         .application
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "Every workflow step must name an application.".to_string())?;
-    if step.kind == "launchApplication"
-        && !SAFE_LAUNCH_APPLICATIONS
-            .iter()
-            .any(|allowed| allowed.eq_ignore_ascii_case(application))
-    {
-        return Err(format!("Alfred cannot safely launch {application}."));
-    }
     let params = step
         .payload
         .as_ref()
         .ok_or_else(|| format!("Parameters for {} must be a JSON object.", step.kind))?;
     if !params.is_object() {
-        return Err(format!("Parameters for {} must be a JSON object.", step.kind));
+        return Err(format!(
+            "Parameters for {} must be a JSON object.",
+            step.kind
+        ));
     }
     if step.kind == "typeText"
         && params
@@ -1001,10 +996,17 @@ fn validate_workflow_step(step: &WorkflowStep) -> Result<(), String> {
     {
         return Err("A typeText step must include non-empty text.".into());
     }
-    if step.kind == "key"
-        && params.get("virtualKey").and_then(Value::as_u64) == Some(0x2e)
-    {
+    if step.kind == "key" && params.get("virtualKey").and_then(Value::as_u64) == Some(0x2e) {
         return Err("The Delete key is blocked by Alfred's deletion policy.".into());
+    }
+    if step.kind == "shortcut"
+        && !params
+            .get("keys")
+            .and_then(Value::as_str)
+            .map(|keys| matches!(keys.to_ascii_uppercase().as_str(), "CTRL+L" | "CTRL+S"))
+            .unwrap_or(false)
+    {
+        return Err("Only CTRL+L and CTRL+S are allowed shortcuts.".into());
     }
     if matches!(
         step.kind.as_str(),
@@ -1019,7 +1021,10 @@ fn validate_workflow_step(step: &WorkflowStep) -> Result<(), String> {
         return Err(format!("{} requires a visible target label.", step.kind));
     }
     if step.effect != method_effect(&step.kind) {
-        return Err(format!("The effect for {} does not match its method.", step.kind));
+        return Err(format!(
+            "The effect for {} does not match its method.",
+            step.kind
+        ));
     }
     Ok(())
 }
@@ -1038,6 +1043,7 @@ fn strip_json_fence(value: &str) -> &str {
         .trim()
 }
 
+#[cfg(test)]
 fn plan_from_json_value(value: Value) -> Option<ProviderPlan> {
     if value.is_array() {
         return serde_json::from_value::<Vec<ProviderPlanStep>>(value)
@@ -1047,6 +1053,7 @@ fn plan_from_json_value(value: Value) -> Option<ProviderPlan> {
     serde_json::from_value(value).ok()
 }
 
+#[cfg(test)]
 fn plan_from_text(value: &str) -> Option<ProviderPlan> {
     let candidate = strip_json_fence(value);
     if let Ok(parsed) = serde_json::from_str::<Value>(candidate) {
@@ -1111,6 +1118,7 @@ fn collect_provider_text(value: &Value, output: &mut Vec<String>) {
     }
 }
 
+#[cfg(test)]
 fn validate_provider_plan(plan: ProviderPlan) -> Result<Vec<WorkflowStep>, String> {
     if plan.steps.is_empty() {
         return Err("The provider returned an empty plan.".into());
@@ -1124,17 +1132,12 @@ fn validate_provider_plan(plan: ProviderPlan) -> Result<Vec<WorkflowStep>, Strin
             let method = item.method.trim().to_string();
             let application = item.application.trim().to_string();
             if !ALLOWED_PLAN_METHODS.contains(&method.as_str()) {
-                return Err(format!("The provider proposed an unsupported method: {method}"));
+                return Err(format!(
+                    "The provider proposed an unsupported method: {method}"
+                ));
             }
             if application.is_empty() {
                 return Err("Every provider step must name an application.".into());
-            }
-            if method == "launchApplication"
-                && !SAFE_LAUNCH_APPLICATIONS
-                    .iter()
-                    .any(|allowed| allowed.eq_ignore_ascii_case(&application))
-            {
-                return Err(format!("Alfred cannot safely launch {application}."));
             }
             if !item.params.is_object() {
                 return Err(format!("Parameters for {method} must be a JSON object."));
@@ -1151,9 +1154,7 @@ fn validate_provider_plan(plan: ProviderPlan) -> Result<Vec<WorkflowStep>, Strin
             }
             let effect = method_effect(&method).to_string();
             let title = if item.title.trim().is_empty() {
-                item.target_label
-                    .clone()
-                    .unwrap_or_else(|| method.clone())
+                item.target_label.clone().unwrap_or_else(|| method.clone())
             } else {
                 item.title.trim().to_string()
             };
@@ -1163,7 +1164,11 @@ fn validate_provider_plan(plan: ProviderPlan) -> Result<Vec<WorkflowStep>, Strin
                 kind: method.clone(),
                 effect: effect.clone(),
                 application: Some(application.clone()),
-                intent: Some(format!("{method} {}", item.target_label.clone().unwrap_or_default()).trim().to_string()),
+                intent: Some(
+                    format!("{method} {}", item.target_label.clone().unwrap_or_default())
+                        .trim()
+                        .to_string(),
+                ),
                 target_label: item.target_label,
                 payload: Some(item.params),
                 timeout_ms: default_timeout(),
@@ -1191,6 +1196,7 @@ fn validate_provider_plan(plan: ProviderPlan) -> Result<Vec<WorkflowStep>, Strin
         .collect()
 }
 
+#[cfg(test)]
 fn parse_provider_plan_output(output: &[String]) -> Result<Vec<WorkflowStep>, String> {
     let mut candidates = Vec::new();
     for line in output.iter().rev() {
@@ -1208,11 +1214,6 @@ fn parse_provider_plan_output(output: &[String]) -> Result<Vec<WorkflowStep>, St
         }
     }
     Err("Alfred could not find a valid JSON workflow plan in the provider output.".into())
-}
-
-#[tauri::command]
-fn parse_provider_plan(output: Vec<String>) -> Result<Vec<WorkflowStep>, String> {
-    parse_provider_plan_output(&output)
 }
 
 fn workflow_path(library_path: &str, workflow: &Workflow) -> PathBuf {
@@ -1284,119 +1285,6 @@ fn list_workflows(library_path: String) -> Result<Vec<Workflow>, String> {
     Ok(workflows)
 }
 
-#[tauri::command]
-fn create_workflow(library_path: String, name: String, goal: String) -> Result<Workflow, String> {
-    if name.trim().is_empty() || goal.trim().is_empty() {
-        return Err("A workflow needs both a name and a goal.".into());
-    }
-    let now = Utc::now();
-    let workflow = Workflow {
-        id: Uuid::new_v4().to_string(),
-        name: name.trim().into(),
-        goal: goal.trim().into(),
-        version: "0.2.0".into(),
-        created_at: now,
-        updated_at: now,
-        status: "recording".into(),
-        required_apps: Vec::new(),
-        steps: Vec::new(),
-    };
-    save_workflow(&workflow_path(&library_path, &workflow), &workflow)?;
-    Ok(workflow)
-}
-
-#[tauri::command]
-fn record_action(
-    library_path: String,
-    workflow_id: String,
-    mut step: WorkflowStep,
-) -> Result<Workflow, String> {
-    validate_workflow_step(&step)?;
-    let application = step.application.clone().unwrap_or_else(|| "Alfred".into());
-    let request = ActionRequest {
-        protocol_version: protocol_version(),
-        run_id: "recording".into(),
-        workflow_step: step.id.clone(),
-        application: application.clone(),
-        intent: step.intent.clone().unwrap_or_else(|| step.title.clone()),
-        effect: step.effect.clone(),
-        target_label: step.target_label.clone(),
-        payload: step.payload.clone(),
-    };
-    let decision = evaluate_base_policy(&request);
-    if decision.decision == "hard_deny" {
-        return Err(decision.reason);
-    }
-    let (path, mut workflow) = load_workflow(&library_path, &workflow_id)?;
-    if !workflow.required_apps.contains(&application) {
-        workflow.required_apps.push(application);
-    }
-    if step.id.trim().is_empty() {
-        step.id = Uuid::new_v4().to_string();
-    }
-    workflow.steps.push(step);
-    workflow.updated_at = Utc::now();
-    workflow.status = "recording".into();
-    save_workflow(&path, &workflow)?;
-    Ok(workflow)
-}
-
-#[tauri::command]
-fn record_actions(
-    library_path: String,
-    workflow_id: String,
-    mut steps: Vec<WorkflowStep>,
-) -> Result<Workflow, String> {
-    if steps.is_empty() {
-        return Err("The approved plan is empty.".into());
-    }
-    for step in &steps {
-        validate_workflow_step(step)?;
-        let application = step.application.clone().unwrap_or_else(|| "Alfred".into());
-        let decision = evaluate_base_policy(&ActionRequest {
-            protocol_version: protocol_version(),
-            run_id: "recording".into(),
-            workflow_step: step.id.clone(),
-            application,
-            intent: step.intent.clone().unwrap_or_else(|| step.title.clone()),
-            effect: step.effect.clone(),
-            target_label: step.target_label.clone(),
-            payload: step.payload.clone(),
-        });
-        if decision.decision == "hard_deny" {
-            return Err(decision.reason);
-        }
-    }
-    let (path, mut workflow) = load_workflow(&library_path, &workflow_id)?;
-    for step in &mut steps {
-        let application = step.application.clone().unwrap_or_else(|| "Alfred".into());
-        if !workflow.required_apps.contains(&application) {
-            workflow.required_apps.push(application);
-        }
-        if step.id.trim().is_empty() {
-            step.id = Uuid::new_v4().to_string();
-        }
-    }
-    workflow.steps.extend(steps);
-    workflow.updated_at = Utc::now();
-    workflow.status = "recording".into();
-    save_workflow(&path, &workflow)?;
-    Ok(workflow)
-}
-
-#[tauri::command]
-fn finalize_recording(library_path: String, workflow_id: String) -> Result<Workflow, String> {
-    let (path, mut workflow) = load_workflow(&library_path, &workflow_id)?;
-    if workflow.steps.is_empty() {
-        return Err("Record at least one action before saving the workflow.".into());
-    }
-    workflow.status = "ready".into();
-    workflow.updated_at = Utc::now();
-    workflow.version = "1.0.0".into();
-    save_workflow(&path, &workflow)?;
-    Ok(workflow)
-}
-
 pub fn evaluate_base_policy(request: &ActionRequest) -> ActionDecision {
     let intent = request.intent.to_lowercase();
     let effect = request.effect.to_lowercase();
@@ -1426,6 +1314,7 @@ pub fn evaluate_base_policy(request: &ActionRequest) -> ActionDecision {
         "overwrite existing",
         "replace file",
         "drop table",
+        "uninstall",
     ];
     let destructive = effect == "destructive"
         || destructive_terms
@@ -1453,7 +1342,8 @@ pub fn evaluate_base_policy(request: &ActionRequest) -> ActionDecision {
     if virtual_key == Some(0x2E) {
         return ActionDecision {
             decision: "hard_deny".into(),
-            reason: "Alfred blocked the Delete key. Deletion keystrokes are never automated.".into(),
+            reason: "Alfred blocked the Delete key. Deletion keystrokes are never automated."
+                .into(),
             rule: "persistent-data-loss".into(),
         };
     }
@@ -1494,12 +1384,19 @@ fn kind_is_observe(kind: &str) -> bool {
             | "browser.find"
             | "browser.wait"
             | "listapplications"
+            | "listinstalledapplications"
             | "resolveapplication"
             | "health"
     )
 }
 
 fn effective_effect(kind: &str, declared: &str) -> String {
+    // Supported methods have an Alfred-owned classification. A planner may omit
+    // or mislabel `effect`, but that must neither bypass the safety floor nor
+    // create an approval prompt for a method Alfred already understands.
+    if ALLOWED_PLAN_METHODS.contains(&kind) {
+        return method_effect(kind).into();
+    }
     if declared == "observe" && !kind_is_observe(kind) {
         "unknown".into()
     } else {
@@ -1558,40 +1455,16 @@ fn evaluate_action(app: AppHandle, request: ActionRequest) -> Result<ActionDecis
     if base.decision != "allow" {
         return Ok(base);
     }
-    if request.effect == "observe" {
-        return Ok(base);
-    }
-    let authorized = read_permissions(&app)?.into_iter().any(|grant| {
-        grant.enabled
-            && grant.application.eq_ignore_ascii_case(&request.application)
-            && grant
-                .allowed_effects
-                .iter()
-                .any(|effect| effect == &request.effect)
-            && (grant.allowed_intents.is_empty()
-                || grant.allowed_intents.iter().any(|intent| {
-                    request
-                        .intent
-                        .to_lowercase()
-                        .contains(&intent.to_lowercase())
-                }))
-    });
-    if authorized {
-        Ok(ActionDecision {
-            decision: "allow".into(),
-            reason: "The action matches an enabled application permission.".into(),
-            rule: "explicit-application-permission".into(),
-        })
-    } else {
-        Ok(ActionDecision {
-            decision: "request_user".into(),
-            reason: format!(
-                "{} has not been allowed to perform this kind of action.",
-                request.application
-            ),
-            rule: "permission-required".into(),
-        })
-    }
+    // The safety engine, rather than a pre-existing per-application grant, is
+    // authoritative for ordinary actions. Once the base policy has classified
+    // an action as non-destructive it may run immediately. Unknown effects still
+    // request review above, and destructive actions remain an absolute denial.
+    let _ = app;
+    Ok(ActionDecision {
+        decision: "allow".into(),
+        reason: "The safety engine classified this action as non-destructive.".into(),
+        rule: "safe-action-auto-approved".into(),
+    })
 }
 
 fn browser_token_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1683,6 +1556,8 @@ fn send_browser_command(app: AppHandle, command: BrowserCommand) -> Result<Value
     send_browser_command_inner(app, command, false)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn substitute_text(text: &str, variables: &HashMap<String, String>) -> String {
     let mut result = text.to_string();
     for (key, replacement) in variables {
@@ -1693,6 +1568,8 @@ fn substitute_text(text: &str, variables: &HashMap<String, String>) -> String {
 
 /// Replaces `${name}` placeholders in every string of a step payload with values
 /// captured by earlier steps, so data can flow from one application into another.
+#[cfg(test)]
+#[allow(dead_code)]
 fn substitute_variables(value: &mut Value, variables: &HashMap<String, String>) {
     match value {
         Value::String(text) => *text = substitute_text(text, variables),
@@ -1712,6 +1589,8 @@ fn substitute_variables(value: &mut Value, variables: &HashMap<String, String>) 
 
 /// Pulls the savable value out of a step result: native actions return the result
 /// directly, browser actions wrap it in an envelope.
+#[cfg(test)]
+#[allow(dead_code)]
 fn extract_saved_value(value: &Value) -> Option<String> {
     for key in ["value", "text", "label", "url", "title"] {
         if let Some(found) = value.get(key).and_then(Value::as_str) {
@@ -1749,7 +1628,8 @@ fn approve_run_step(app: AppHandle, run_id: String) -> Result<(), String> {
     let path = approval_path(&app, &run_id)?;
     let contents = fs::read_to_string(&path)
         .map_err(|_| "This run is not waiting for approval.".to_string())?;
-    let pending: PendingApproval = serde_json::from_str(&contents).map_err(|error| error.to_string())?;
+    let pending: PendingApproval =
+        serde_json::from_str(&contents).map_err(|error| error.to_string())?;
     // A durable grant covers future runs of this application and effect kind...
     let _ = grant_permission(
         app.clone(),
@@ -1836,7 +1716,9 @@ fn execute_native_action_inner(
     });
     if host.to_host.send(message.to_string()).is_err() {
         *guard = None;
-        return Err("The native host is not responding; it will restart on the next action.".into());
+        return Err(
+            "The native host is not responding; it will restart on the next action.".into(),
+        );
     }
     let response = match host.from_host.recv_timeout(timeout) {
         Ok(Ok(line)) => line,
@@ -1917,17 +1799,28 @@ fn execute_native_action(
     request: ActionRequest,
     method: String,
 ) -> Result<Value, String> {
-    execute_native_action_inner(&app, &state, request, method, Duration::from_secs(30), false)
+    execute_native_action_inner(
+        &app,
+        &state,
+        request,
+        method,
+        Duration::from_secs(30),
+        false,
+    )
 }
 
 fn checkpoint_path(app: &AppHandle, run_id: &str) -> Result<PathBuf, String> {
     Ok(checkpoints_dir(app)?.join(format!("{run_id}.json")))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn variables_path(app: &AppHandle, run_id: &str) -> Result<PathBuf, String> {
     Ok(checkpoints_dir(app)?.join(format!("{run_id}.variables.json")))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn load_variables(app: &AppHandle, run_id: &str) -> HashMap<String, String> {
     variables_path(app, run_id)
         .ok()
@@ -1936,6 +1829,8 @@ fn load_variables(app: &AppHandle, run_id: &str) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn save_variables(app: &AppHandle, run_id: &str, variables: &HashMap<String, String>) {
     if let Ok(path) = variables_path(app, run_id) {
         let _ = write_json(&path, variables);
@@ -1945,6 +1840,8 @@ fn save_variables(app: &AppHandle, run_id: &str, variables: &HashMap<String, Str
 /// Evaluates one step condition against live application state. Native steps use a
 /// UIA lookup in the resolved process; browser steps use a DOM observation of the
 /// pinned (or active) tab. `${variable}` placeholders are resolved first.
+#[cfg(test)]
+#[allow(dead_code)]
 fn evaluate_step_condition(
     app: &AppHandle,
     application: &str,
@@ -2043,6 +1940,8 @@ fn evaluate_step_condition(
     Ok(if condition.absent { !found } else { found })
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 enum WaitOutcome {
     Satisfied,
     TimedOut,
@@ -2052,6 +1951,8 @@ enum WaitOutcome {
 /// Polls a condition until it holds or the deadline passes. Transient lookup
 /// errors (busy app, restarting host) keep the wait alive; stop/pause from the
 /// user are honored between polls.
+#[cfg(test)]
+#[allow(dead_code)]
 async fn wait_for_condition(
     app: &AppHandle,
     run_id: &str,
@@ -2103,7 +2004,11 @@ fn read_run_lock(path: &Path) -> Option<(String, DateTime<Utc>)> {
     let contents = fs::read_to_string(path).ok()?;
     let value: Value = serde_json::from_str(&contents).ok()?;
     let run_id = value.get("runId")?.as_str()?.to_string();
-    let updated = value.get("updatedAt")?.as_str()?.parse::<DateTime<Utc>>().ok()?;
+    let updated = value
+        .get("updatedAt")?
+        .as_str()?
+        .parse::<DateTime<Utc>>()
+        .ok()?;
     Some((run_id, updated))
 }
 
@@ -2149,6 +2054,131 @@ fn get_checkpoint(app: AppHandle, run_id: String) -> Result<Option<RunCheckpoint
     Ok(Some(checkpoint))
 }
 
+fn goal_run_steps_path(app: &AppHandle, run_id: &str) -> Result<PathBuf, String> {
+    let directory = app_data_dir(app)?.join("goal-run-steps");
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    Ok(directory.join(format!("{run_id}.json")))
+}
+
+fn append_goal_run_step(app: &AppHandle, run_id: &str, step: &WorkflowStep) {
+    let Ok(path) = goal_run_steps_path(app, run_id) else {
+        return;
+    };
+    let mut steps: Vec<WorkflowStep> = read_json_or_default(&path).unwrap_or_default();
+    let duplicate_launch = step.kind == "launchApplication"
+        && steps.iter().any(|saved| {
+            saved.kind == "launchApplication"
+                && saved.application.as_deref() == step.application.as_deref()
+        });
+    let duplicate_last = steps.last().is_some_and(|saved| {
+        saved.kind == step.kind
+            && saved.application == step.application
+            && saved.target_label == step.target_label
+            && saved.payload == step.payload
+    });
+    if !duplicate_launch && !duplicate_last {
+        steps.push(step.clone());
+        let _ = write_json(&path, &steps);
+    }
+}
+
+#[tauri::command]
+fn complete_goal_run(app: AppHandle, run_id: String) -> Result<RunCheckpoint, String> {
+    let current = get_checkpoint(app.clone(), run_id.clone())?
+        .ok_or_else(|| "The run checkpoint was not found.".to_string())?;
+    if current.status == "failed" || current.status == "stopped" {
+        return Err(format!(
+            "A {} run cannot be marked complete.",
+            current.status
+        ));
+    }
+    let checkpoint = RunCheckpoint {
+        run_id: run_id.clone(),
+        workflow_id: current.workflow_id,
+        next_step_index: current.next_step_index,
+        status: "completed".into(),
+        error: None,
+        updated_at: Utc::now(),
+    };
+    save_checkpoint(&app, &checkpoint)?;
+    if let Ok(Some(mut memory)) = get_goal_run_memory(app.clone(), run_id.clone()) {
+        memory.status = "completed".into();
+        memory.completion_summary = Some("The user verified the outcome on the desktop.".into());
+        memory.completion_evidence = vec!["User-confirmed visible outcome".into()];
+        memory.pending_action = None;
+        let _ = save_goal_run_memory(&app, &mut memory);
+    }
+    let _ = app.emit(
+        "alfred://run-event",
+        RunEvent {
+            run_id: run_id.clone(),
+            sequence: checkpoint.next_step_index,
+            step_id: "user-completed".into(),
+            title: "Goal completed".into(),
+            detail: "You confirmed that the requested outcome is complete.".into(),
+            application: "Alfred".into(),
+            status: "completed".into(),
+            progress: 100,
+            evidence_data_url: None,
+            timestamp: checkpoint.updated_at,
+        },
+    );
+    if let Ok(mut controls) = app.state::<RuntimeState>().run_controls.lock() {
+        controls.insert(run_id, "stop".into());
+    }
+    Ok(checkpoint)
+}
+
+#[tauri::command]
+fn save_goal_run_as_workflow(
+    app: AppHandle,
+    library_path: String,
+    run_id: String,
+    name: String,
+    goal: String,
+) -> Result<Workflow, String> {
+    let checkpoint = get_checkpoint(app.clone(), run_id.clone())?
+        .ok_or_else(|| "The run checkpoint was not found.".to_string())?;
+    if checkpoint.status != "completed" {
+        return Err("Finish the run before saving it as a workflow.".into());
+    }
+    let path = goal_run_steps_path(&app, &run_id)?;
+    let mut steps: Vec<WorkflowStep> = read_json_or_default(&path)?;
+    steps.retain(|step| validate_workflow_step(step).is_ok());
+    if steps.is_empty() {
+        return Err("This run did not capture any reusable actions.".into());
+    }
+    for step in &mut steps {
+        step.id = Uuid::new_v4().to_string();
+    }
+    let mut required_apps = Vec::new();
+    for application in steps.iter().filter_map(|step| step.application.clone()) {
+        if application != "Alfred" && !required_apps.contains(&application) {
+            required_apps.push(application);
+        }
+    }
+    let now = Utc::now();
+    let planner_provider =
+        get_goal_run_memory(app.clone(), run_id.clone())?.map(|memory| memory.provider);
+    let workflow = Workflow {
+        id: Uuid::new_v4().to_string(),
+        name: name.trim().to_string(),
+        goal: goal.trim().to_string(),
+        version: "1.0.0".into(),
+        created_at: now,
+        updated_at: now,
+        status: "ready".into(),
+        planner_provider,
+        required_apps,
+        steps,
+    };
+    if workflow.name.is_empty() || workflow.goal.is_empty() {
+        return Err("A saved workflow needs both a name and a goal.".into());
+    }
+    save_workflow(&workflow_path(&library_path, &workflow), &workflow)?;
+    Ok(workflow)
+}
+
 fn run_mode(app: &AppHandle, run_id: &str) -> String {
     app.state::<RuntimeState>()
         .run_controls
@@ -2170,6 +2200,8 @@ async fn wait_if_paused(app: &AppHandle, run_id: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+#[allow(dead_code)]
 fn fail_run_step(
     app: &AppHandle,
     run_id: &str,
@@ -2209,6 +2241,13 @@ fn fail_run_step(
 }
 
 fn stop_run(app: &AppHandle, run_id: &str, workflow_id: &str, index: usize) {
+    if get_checkpoint(app.clone(), run_id.to_string())
+        .ok()
+        .flatten()
+        .is_some_and(|checkpoint| checkpoint.status == "completed")
+    {
+        return;
+    }
     let _ = save_checkpoint(
         app,
         &RunCheckpoint {
@@ -2297,7 +2336,8 @@ async fn park_run_for_approval(
 /// Async for the same reason as start_goal_run: the Windows app-resolution
 /// preflight below performs native-host round-trips that must not block the
 /// WebView's main thread.
-#[tauri::command]
+#[cfg(test)]
+#[allow(dead_code)]
 async fn start_workflow_run(
     app: AppHandle,
     library_path: String,
@@ -2375,7 +2415,14 @@ async fn start_workflow_run(
     Ok(run_id)
 }
 
-async fn drive_workflow_run(app: AppHandle, run_id: String, workflow: Workflow, start_index: usize) {
+#[cfg(test)]
+#[allow(dead_code)]
+async fn drive_workflow_run(
+    app: AppHandle,
+    run_id: String,
+    workflow: Workflow,
+    start_index: usize,
+) {
     let total = workflow.steps.len().max(1);
     let lock_path = run_lock_path(&app).ok();
     // Browser steps in one run stick to the tab Alfred last used, so the user or
@@ -2402,8 +2449,7 @@ async fn drive_workflow_run(app: AppHandle, run_id: String, workflow: Workflow, 
                 sequence: index,
                 step_id: step.id.clone(),
                 title: step.title.clone(),
-                detail: "Checking permission and handing the action to the trusted host."
-                    .into(),
+                detail: "Checking permission and handing the action to the trusted host.".into(),
                 application: application.clone(),
                 status: "running".into(),
                 progress: (index * 100 / total) as u8,
@@ -2477,7 +2523,10 @@ async fn drive_workflow_run(app: AppHandle, run_id: String, workflow: Workflow, 
                 stop_run(&app, &run_id, &workflow.id, index);
                 return;
             }
-            let mut payload = step.payload.clone().unwrap_or_else(|| serde_json::json!({}));
+            let mut payload = step
+                .payload
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({}));
             substitute_variables(&mut payload, &variables);
             let mut target_label = step.target_label.clone();
             if let Some(label) = &mut target_label {
@@ -2595,12 +2644,12 @@ async fn drive_workflow_run(app: AppHandle, run_id: String, workflow: Workflow, 
                                 return;
                             }
                             WaitOutcome::TimedOut => {
-                                last_error = "The action ran but the expected state did not appear in time."
-                                    .into();
+                                last_error =
+                                    "The action ran but the expected state did not appear in time."
+                                        .into();
                                 attempt += 1;
                                 if attempt <= attempts {
-                                    tokio::time::sleep(std::time::Duration::from_millis(500))
-                                        .await;
+                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                 }
                                 continue;
                             }
@@ -2743,6 +2792,12 @@ struct PlannerReply {
     title: Option<String>,
     #[serde(default)]
     summary: Option<String>,
+    /// Set only by the explicit completion-review turn. A normal `done` is a
+    /// claim, not a terminal state.
+    #[serde(default)]
+    verified: Option<bool>,
+    #[serde(default)]
+    evidence: Option<Vec<String>>,
     #[serde(default, alias = "method", alias = "action")]
     kind: Option<String>,
     #[serde(default, alias = "app")]
@@ -2828,7 +2883,10 @@ fn normalize_planner_json_value(mut value: Value) -> Value {
             }
         }
         if !map.contains_key("kind") {
-            if let Some(method) = map.get("method").cloned().or_else(|| map.get("action").cloned())
+            if let Some(method) = map
+                .get("method")
+                .cloned()
+                .or_else(|| map.get("action").cloned())
             {
                 if method.is_string() {
                     map.insert("kind".into(), method);
@@ -2837,10 +2895,7 @@ fn normalize_planner_json_value(mut value: Value) -> Value {
             }
         }
         if !map.contains_key("targetLabel") {
-            if let Some(target) = map
-                .remove("target_label")
-                .or_else(|| map.remove("target"))
-            {
+            if let Some(target) = map.remove("target_label").or_else(|| map.remove("target")) {
                 map.insert("targetLabel".into(), target);
             }
         }
@@ -3004,10 +3059,7 @@ fn planner_result_digest(value: &Value) -> String {
                 parts.push(snippet);
             }
             if map.get("hasMore").and_then(Value::as_bool) == Some(true) {
-                let next = map
-                    .get("nextOffset")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
+                let next = map.get("nextOffset").and_then(Value::as_u64).unwrap_or(0);
                 parts.push(format!("[hasMore nextOffset={next}]"));
             }
             if let Some(count) = map.get("count").and_then(Value::as_u64) {
@@ -3166,20 +3218,83 @@ fn parse_planner_action(output: &str) -> Result<PlannerReply, String> {
 
 const PLANNER_TURN_TIMEOUT_SECS: u64 = 180;
 
-/// One agent-loop turn: a fresh, sandboxed provider process per turn. The loop
-/// keeps the state (goal, observations, history), so sessions stay stateless and
-/// each turn is independently cancellable — stopping the run drops the child,
-/// and kill_on_drop terminates the CLI.
+fn find_string_field(value: &Value, keys: &[&str]) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(value) = map.get(*key).and_then(Value::as_str) {
+                    if !value.trim().is_empty() {
+                        return Some(value.to_string());
+                    }
+                }
+            }
+            map.values()
+                .find_map(|child| find_string_field(child, keys))
+        }
+        Value::Array(items) => items
+            .iter()
+            .find_map(|child| find_string_field(child, keys)),
+        _ => None,
+    }
+}
+
+/// Session identifiers are emitted in different envelopes by each CLI. Keep
+/// this tolerant just like action parsing, but only inspect provider-documented
+/// session/thread fields (never request ids or per-event UUIDs).
+fn provider_session_id_from_output(provider: &str, output: &str) -> Option<String> {
+    let keys: &[&str] = if provider == "codex" {
+        &["thread_id", "threadId"]
+    } else {
+        &["session_id", "sessionId"]
+    };
+    if let Ok(value) = serde_json::from_str::<Value>(output.trim()) {
+        if let Some(id) = find_string_field(&value, keys) {
+            return Some(id);
+        }
+    }
+    output.lines().find_map(|line| {
+        serde_json::from_str::<Value>(line.trim())
+            .ok()
+            .and_then(|value| find_string_field(&value, keys))
+    })
+}
+
+/// Some CLIs report setup/authentication failures as ordinary stdout while
+/// still returning exit code 0. Treat those diagnostics as failed turns so the
+/// cockpit shows the real remedy instead of retrying an "unusable action".
+fn provider_output_error(provider: &str, output: &str) -> Option<String> {
+    let lower = output.to_lowercase();
+    let authentication_failure = [
+        "no authentication information found",
+        "authentication required",
+        "not logged in. please",
+        "run the '/login' command",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    authentication_failure.then(|| {
+        format!(
+            "{provider} is not authenticated. Sign in with its CLI (or add its token in Alfred), then retry."
+        )
+    })
+}
+
+/// One agent-loop turn: a fresh, sandboxed provider process that resumes the
+/// provider's exact conversation. Alfred's durable ledger remains authoritative,
+/// and each process is independently cancellable.
 async fn run_planner_turn(
     app: &AppHandle,
     run_id: &str,
     provider: &str,
     prompt: &str,
     images: &[PathBuf],
+    session_id: Option<&str>,
+    resume: bool,
     step_index: usize,
     progress: u8,
-) -> Result<String, String> {
-    let (mut process, prompt_input) = provider_command(provider, prompt, images)?;
+) -> Result<(String, Option<String>), String> {
+    let (mut process, prompt_input) =
+        provider_command(app, provider, prompt, images, session_id, resume)?;
     let mut child = process
         .spawn()
         .map_err(|error| format!("Could not start {provider}: {error}"))?;
@@ -3204,7 +3319,19 @@ async fn run_planner_turn(
             Ok(Ok(output)) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                return Ok(format!("{stdout}\n{stderr}"));
+                let combined = format!("{stdout}\n{stderr}");
+                if !output.status.success() {
+                    let detail: String = combined.trim().chars().take(600).collect();
+                    return Err(format!(
+                        "{provider} exited with {}: {detail}",
+                        output.status
+                    ));
+                }
+                if let Some(error) = provider_output_error(provider, &combined) {
+                    return Err(error);
+                }
+                let session = provider_session_id_from_output(provider, &combined);
+                return Ok((combined, session));
             }
             Ok(Err(error)) => return Err(format!("The planner process failed: {error}")),
             Err(_) => {
@@ -3239,15 +3366,29 @@ fn summarize_native_tree(node: &Value, out: &mut Vec<String>, depth: usize) {
     if out.len() >= 40 || depth > 6 {
         return;
     }
-    let control = node.get("controlType").and_then(Value::as_str).unwrap_or("");
+    let control = node
+        .get("controlType")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let name = node.get("name").and_then(Value::as_str).unwrap_or("");
-    let automation_id = node.get("automationId").and_then(Value::as_str).unwrap_or("");
+    let automation_id = node
+        .get("automationId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let interesting = matches!(
         control,
-        "ControlType.Button" | "ControlType.Edit" | "ControlType.MenuItem"
-            | "ControlType.ListItem" | "ControlType.Hyperlink" | "ControlType.TabItem"
-            | "ControlType.ComboBox" | "ControlType.CheckBox" | "ControlType.RadioButton"
-            | "ControlType.Document" | "ControlType.Text" | "ControlType.Window"
+        "ControlType.Button"
+            | "ControlType.Edit"
+            | "ControlType.MenuItem"
+            | "ControlType.ListItem"
+            | "ControlType.Hyperlink"
+            | "ControlType.TabItem"
+            | "ControlType.ComboBox"
+            | "ControlType.CheckBox"
+            | "ControlType.RadioButton"
+            | "ControlType.Document"
+            | "ControlType.Text"
+            | "ControlType.Window"
     );
     if interesting && !(name.is_empty() && automation_id.is_empty()) {
         let short = control.replace("ControlType.", "");
@@ -3334,7 +3475,8 @@ fn browser_skill_block() -> &'static str {
     r#"
 
 BROWSER SKILL (use for any website / portal / dashboard task):
-You control the user's already-logged-in Chromium tab through Alfred — similar to Playwright, but every action is policy-gated.
+Alfred is hybrid: use the DOM bridge when CURRENT DESKTOP STATE contains a connected "Installed browser" observation. The extension is optional. If the bridge is unavailable, operate Microsoft Edge / Google Chrome / Brave as a normal native application with launchApplication, observeWindow, UIA selectors, screenshots, and safe keyboard input. Never keep retrying a missing bridge.
+When the DOM bridge is connected, you control the user's already-logged-in Chromium tab through Alfred — similar to Playwright, but every action is policy-gated.
 1. browser.navigate {"url":"..."} when the goal includes a link or you must change pages.
 2. browser.wait {"text":"visible fragment","timeoutMs":12000} after navigations while SPAs load.
 3. browser.observe lists interactive controls with refs (e1, e2, …). Use it before click/type when you need refs.
@@ -3342,7 +3484,7 @@ You control the user's already-logged-in Chromium tab through Alfred — similar
 5. Page long content: browser.scroll {"direction":"down"} or {"text":"Error"} then browser.read again; or browser.read {"offset":N} while history says hasMore.
 6. browser.find {"text":"RUM"} returns matching refs — then browser.click {"ref":"e3"}. Prefer find when labels are known.
 7. browser.getText {"ref"} for a single field; prefer browser.read for analysis of lists/tables.
-8. Login wall or CAPTCHA signals: reply {"done":true,"summary":"Blocked on login/CAPTCHA — user must complete it in the browser, then re-run."}. Never invent portal data.
+8. Login wall or CAPTCHA signals: report the concrete blocker. Never invent portal data.
 9. Analysis goals (Datadog RUM, logs, dashboards): navigate → wait → read → scroll/read more → summarize ONLY facts present in CURRENT DESKTOP STATE or ACTION HISTORY digests. If text is empty, say so; do not fabricate error rates or stack traces.
 10. One small action per reply. Prefer browser.find+click over coordinate clicks."#
 }
@@ -3363,6 +3505,10 @@ fn goal_needs_browser_skill(goal: &str, applications: &[String]) -> bool {
         || lower.contains("dashboard")
         || lower.contains("datadog")
         || lower.contains("reddit")
+        || lower.contains("x.com")
+        || lower.contains("tweet")
+        || lower.contains("twitter")
+        || lower.contains("social media")
         || lower.contains("docs.google")
         || lower.contains("chrome")
         || lower.contains("edge")
@@ -3383,7 +3529,22 @@ fn infer_applications_from_goal(goal: &str) -> Vec<String> {
         (&["microsoft edge", "edge"], "Microsoft Edge"),
         (&["google chrome", "chrome"], "Google Chrome"),
         (&["brave"], "Brave"),
-        (&["browser", "website", "web page", "webpage", "portal", "dashboard", "site"], "Installed browser"),
+        (
+            &[
+                "browser",
+                "website",
+                "web page",
+                "webpage",
+                "portal",
+                "dashboard",
+                "site",
+                "x.com",
+                "tweet",
+                "twitter",
+                "social media",
+            ],
+            "Microsoft Edge",
+        ),
         (&["excel", "spreadsheet", "workbook"], "Microsoft Excel"),
         (&["ms word", "word document", "word"], "Microsoft Word"),
         (&["powerpoint", "presentation"], "Microsoft PowerPoint"),
@@ -3456,11 +3617,15 @@ fn build_planner_prompt(
     } else {
         ""
     };
-    format!(
-        "You are the planning brain of Alfred, a supervised desktop automation agent running on the user's machine. Propose the next single action toward the goal.\n\nGOAL: {goal}\n\nTARGET APPLICATIONS: {apps}\n\nCURRENT DESKTOP STATE:\n{observations}\n\nACTION HISTORY (oldest first):\n{history_text}{plan_text}{skill}\n\nReply with exactly one JSON object and nothing else (no markdown fences, no prose):\n{{\"done\": false, \"title\": \"short human label\", \"kind\": \"<method>\", \"application\": \"<exact app name>\", \"intent\": \"what and why\", \"effect\": \"observe|create|modify_reversible|external_write\", \"targetLabel\": \"<element label>\", \"payload\": {{...}}}}\nWhen the goal is fully complete, reply: {{\"done\": true, \"summary\": \"what was accomplished\"}}.\nIf the goal has multiple phases, you may instead reply {{\"plan\": [\"short phase\", ...]}} (no \"kind\") to outline or revise your approach; it is pinned below as CURRENT PLAN.\n\nMethods: listApplications (application \"Alfred\"; lists running app windows) | browser.observe | browser.navigate {{\"url\"}} | browser.click {{\"ref\"}} | browser.type {{\"ref\",\"text\"}} | browser.getText {{\"ref\"}} | browser.read {{\"offset\":0}} (page text: headings/tables/grids/articles; ~6000 chars/chunk; page with offset while hasMore) | browser.scroll {{\"direction\":\"down\"}} or {{\"text\":\"find visible text\"}} | browser.find {{\"text\":\"label\"}} (returns refs) | browser.wait {{\"text\":\"fragment\",\"timeoutMs\":12000}} | launchApplication (allow-list only: Notepad, Calculator, Paint, File Explorer, Microsoft Edge, Google Chrome, Brave) | focusApplication | activate {{}} | observeWindow | findElement {{\"automationId\"|\"name\"|\"controlType\"}} | getValue (same selectors) | invokeElement (same selectors) | setValue (selectors + \"value\") | click {{\"x\",\"y\"}} | typeText {{\"text\"}} | key {{\"virtualKey\": 13|9|27}} (Enter, Tab, Escape only).\n\nRules:\n- One small action per reply; observe or find before click/type when unsure.\n- browser.observe lists interactive elements only; for page CONTENT use browser.read (auto-preview may already appear under CURRENT DESKTOP STATE).\n- NEVER propose deletion, trash, purge, overwrite, password entry, shell commands, or credential handling. Alfred hard-blocks them regardless of what you return.\n- Prefer setValue/invokeElement (semantic, focus-independent) over click/typeText.\n- Never include processId; Alfred injects the live one.\n- {app_rule}\n- If the last action failed or changed nothing, try a different approach instead of repeating it.\n- If a target application is not running, propose launchApplication when it is on the allow-list; otherwise reply done with a summary of the blocker.\n- Never claim to have read or analyzed content that does not appear in CURRENT DESKTOP STATE or ACTION HISTORY; if you cannot access the content the goal needs, reply done with a summary explaining the blocker instead of inventing results.",
+    let mut prompt = format!(
+        "You are the planning brain of Alfred, a supervised desktop automation agent running on the user's machine. Propose the next single action toward the goal.\n\nGOAL: {goal}\n\nTARGET APPLICATIONS: {apps}\n\nCURRENT DESKTOP STATE:\n{observations}\n\nACTION HISTORY (oldest first):\n{history_text}{plan_text}{skill}\n\nReply with exactly one JSON object and nothing else (no markdown fences, no prose):\n{{\"done\": false, \"title\": \"short human label\", \"kind\": \"<method>\", \"application\": \"<exact app name>\", \"intent\": \"what and why\", \"effect\": \"observe|create|modify_reversible|external_write\", \"targetLabel\": \"<element label>\", \"payload\": {{...}}}}\nWhen the goal appears fully complete, reply: {{\"done\": true, \"summary\": \"what was accomplished\"}}. Alfred treats this as a completion claim and performs a fresh evidence-review turn before closing the run.\nIf the goal has multiple phases, you may instead reply {{\"plan\": [\"short phase\", ...]}} (no \"kind\") to outline or revise your approach; it is pinned below as CURRENT PLAN.\n\nMethods: listApplications (application \"Alfred\"; lists running app windows) | listInstalledApplications (application \"Alfred\"; lists exact launchable Start-menu names) | browser.observe | browser.navigate {{\"url\"}} | browser.click {{\"ref\"}} | browser.type {{\"ref\",\"text\"}} | browser.getText {{\"ref\"}} | browser.read {{\"offset\":0}} (page text: headings/tables/grids/articles; ~6000 chars/chunk; page with offset while hasMore) | browser.scroll {{\"direction\":\"down\"}} or {{\"text\":\"find visible text\"}} | browser.find {{\"text\":\"label\"}} (returns refs) | browser.wait {{\"text\":\"fragment\",\"timeoutMs\":12000}} | launchApplication (an exact installed Start-menu application) | focusApplication | activate {{}} | observeWindow | findElement {{\"automationId\"|\"name\"|\"controlType\"}} | getValue (same selectors) | invokeElement (same selectors) | setValue (selectors + \"value\") | click {{\"x\",\"y\"}} | typeText {{\"text\"}} | key {{\"virtualKey\": 13|9|27}} (Enter, Tab, Escape only).\n\nRules:\n- One small action per reply; observe or find before click/type when unsure.\n- browser.observe lists interactive elements only; for page CONTENT use browser.read (auto-preview may already appear under CURRENT DESKTOP STATE).\n- NEVER propose deletion, trash, purge, overwrite, password entry, shell commands, or credential handling. Alfred hard-blocks them regardless of what you return.\n- Prefer setValue/invokeElement (semantic, focus-independent) over click/typeText.\n- Never include processId; Alfred injects the live one.\n- {app_rule}\n- If the last action failed or changed nothing, try a different approach instead of repeating it.\n- If a target application is not running, propose launchApplication. If the exact installed name is uncertain, call listInstalledApplications first.\n- Never claim to have read or analyzed content that does not appear in CURRENT DESKTOP STATE or ACTION HISTORY; if you cannot access the content the goal needs, reply done with a summary explaining the blocker instead of inventing results.",
         apps = planner_app_list(applications),
         app_rule = planner_app_rule(applications),
-    )
+    );
+    prompt.push_str(
+        "\n- `shortcut` is available for two allow-listed combinations only: {\"keys\":\"CTRL+L\"} focuses a browser/Explorer address bar; {\"keys\":\"CTRL+S\"} opens Save/Save As.",
+    );
+    prompt
 }
 
 fn emit_goal_event(
@@ -3569,8 +3734,8 @@ fn gather_observations(
             }
         } else if cfg!(windows) {
             let runtime = app.state::<RuntimeState>();
-            let section = resolve_application_process_id(app, &runtime, application)
-                .and_then(|pid| {
+            let section =
+                resolve_application_process_id(app, &runtime, application).and_then(|pid| {
                     let request = ActionRequest {
                         protocol_version: protocol_version(),
                         run_id: run_id.into(),
@@ -3610,8 +3775,23 @@ fn gather_observations(
 }
 
 /// Ends a goal run with a failure: event + checkpoint.
-fn fail_goal_run(app: &AppHandle, run_id: &str, goal: &str, step: usize, progress: u8, error: String) {
-    emit_goal_event(app, run_id, step, "Goal run failed", &error, "failed", progress);
+fn fail_goal_run(
+    app: &AppHandle,
+    run_id: &str,
+    goal: &str,
+    step: usize,
+    progress: u8,
+    error: String,
+) {
+    emit_goal_event(
+        app,
+        run_id,
+        step,
+        "Goal run failed",
+        &error,
+        "failed",
+        progress,
+    );
     let _ = save_checkpoint(
         app,
         &RunCheckpoint {
@@ -3626,7 +3806,61 @@ fn fail_goal_run(app: &AppHandle, run_id: &str, goal: &str, step: usize, progres
 }
 
 const GOAL_RUN_MAX_CONSECUTIVE_FAILURES: u32 = 3;
-const MAX_PLANNER_HISTORY: usize = 12;
+const MAX_PLANNER_HISTORY: usize = 40;
+
+fn remember_goal_event(memory: &mut GoalRunMemory, entry: String) {
+    memory.history.push(entry);
+    while memory.history.len() > MAX_PLANNER_HISTORY {
+        memory.history.remove(0);
+    }
+}
+
+fn append_completion_review(prompt: &mut String, claim: &str) {
+    prompt.push_str(&format!(
+        "\n\nCOMPLETION REVIEW — do not trust the earlier claim. Re-check it only against CURRENT DESKTOP STATE and concrete successful results in ACTION HISTORY. Earlier claim: {claim}\nIf every requested outcome is visibly evidenced, reply exactly {{\"done\":true,\"verified\":true,\"summary\":\"verified outcome\",\"evidence\":[\"specific visible fact\",\"specific successful result\"]}}. Evidence must name concrete UI text/state or an action result above. If anything is missing or uncertain, reply with verified:false and the next corrective action using the normal action schema. Never mark a blocker as successful completion."
+    ));
+}
+
+fn evidence_matches_grounding(evidence: &str, grounding: &str) -> bool {
+    const STOP_WORDS: &[&str] = &[
+        "this",
+        "that",
+        "with",
+        "from",
+        "shows",
+        "visible",
+        "successful",
+        "result",
+        "completed",
+        "application",
+    ];
+    let grounding = grounding.to_ascii_lowercase();
+    let mut matched = 0;
+    for token in evidence
+        .to_ascii_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| token.len() >= 4 && !STOP_WORDS.contains(token))
+    {
+        if grounding.contains(token) {
+            matched += 1;
+            if matched >= 2 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_verified_completion(reply: &PlannerReply, grounding: &str) -> bool {
+    reply.done
+        && reply.verified == Some(true)
+        && reply.evidence.as_ref().is_some_and(|items| {
+            !items.is_empty()
+                && items
+                    .iter()
+                    .all(|item| evidence_matches_grounding(item, grounding))
+        })
+}
 
 /// The agent loop: observe → plan → policy-gate → execute → record, until the
 /// planner declares the goal done, a guardrail trips, or the user stops the run.
@@ -3634,23 +3868,20 @@ const MAX_PLANNER_HISTORY: usize = 12;
 /// and targeted executors as recorded workflows — the planner only proposes.
 async fn drive_goal_run(
     app: AppHandle,
-    run_id: String,
-    provider: String,
-    goal: String,
-    applications: Vec<String>,
+    mut memory: GoalRunMemory,
     max_steps: u32,
     check_in_every: u32,
     share_screenshots: bool,
 ) {
+    let run_id = memory.run_id.clone();
+    let provider = memory.provider.clone();
+    let goal = memory.goal.clone();
     let lock_path = run_lock_path(&app).ok();
-    let mut pinned_tab: Option<i64> = None;
-    let mut history: Vec<String> = Vec::new();
-    // The planner's own outline for multi-phase goals; pinned into each prompt.
-    let mut working_plan: Vec<String> = Vec::new();
-    let mut consecutive_failures = 0u32;
-    let mut since_check_in = 0u32;
-    for step_index in 0..max_steps {
+    for step_index in memory.next_step_index as u32..max_steps {
+        memory.next_step_index = step_index as usize;
         if wait_if_paused(&app, &run_id).await {
+            memory.status = "stopped".into();
+            let _ = save_goal_run_memory(&app, &mut memory);
             stop_run(&app, &run_id, &goal, step_index as usize);
             return;
         }
@@ -3662,35 +3893,63 @@ async fn drive_goal_run(
         if let Ok(mut notes) = app.state::<RuntimeState>().steer_notes.lock() {
             if let Some(mut queued) = notes.remove(&run_id) {
                 for note in queued.drain(..) {
-                    history.push(format!("user guidance: {note}"));
-                }
-                while history.len() > MAX_PLANNER_HISTORY {
-                    history.remove(0);
+                    remember_goal_event(&mut memory, format!("user guidance: {note}"));
                 }
             }
         }
+        let _ = save_goal_run_memory(&app, &mut memory);
         let progress = ((step_index * 100) / max_steps.max(1)) as u8;
         emit_goal_event(
-            &app, &run_id, step_index as usize, "Observing the desktop",
-            "Reading the current state of every target application.", "running", progress,
+            &app,
+            &run_id,
+            step_index as usize,
+            "Observing the desktop",
+            "Reading the current state of every target application.",
+            "running",
+            progress,
         );
-        let (observations, new_pinned) =
-            gather_observations(&app, &run_id, &applications, pinned_tab);
-        pinned_tab = new_pinned;
+        let (observations, new_pinned) = gather_observations(
+            &app,
+            &run_id,
+            &memory.applications,
+            memory.pinned_browser_tab,
+        );
+        memory.pinned_browser_tab = new_pinned;
+        memory.last_observation = compact_planner_observations(&observations);
+        let _ = save_goal_run_memory(&app, &mut memory);
         // Visual grounding: one screenshot per target app. Attached to the planner
         // turn only for CLIs with verified image input (Codex); also shown in the
         // cockpit timeline as evidence.
         let (shot_paths, shot_evidence) = if share_screenshots {
-            capture_run_screenshots(&app, &run_id, &applications, step_index, pinned_tab)
+            capture_run_screenshots(
+                &app,
+                &run_id,
+                &memory.applications,
+                step_index,
+                memory.pinned_browser_tab,
+            )
         } else {
             (Vec::new(), None)
         };
         emit_goal_event(
-            &app, &run_id, step_index as usize, "Planning the next action",
-            &format!("{provider} is deciding the next step."), "running", progress,
+            &app,
+            &run_id,
+            step_index as usize,
+            "Planning the next action",
+            &format!("{provider} is deciding the next step."),
+            "running",
+            progress,
         );
-        let compact_obs = compact_planner_observations(&observations);
-        let mut prompt = build_planner_prompt(&goal, &applications, &compact_obs, &history, &working_plan);
+        let mut prompt = build_planner_prompt(
+            &goal,
+            &memory.applications,
+            &memory.last_observation,
+            &memory.history,
+            &memory.working_plan,
+        );
+        if let Some(claim) = memory.completion_claim.as_deref() {
+            append_completion_review(&mut prompt, claim);
+        }
         // Flag providers receive the files as CLI attachments; path providers get
         // the file list in the prompt and their file reader supplies the vision.
         let delivery = provider_image_delivery(&provider);
@@ -3729,11 +3988,30 @@ async fn drive_goal_run(
                     return;
                 }
             };
-        let output = match run_planner_turn(&app, &run_id, &provider, &prompt_for_cli, flag_images, step_index as usize, progress).await {
-            Ok(output) => {
+        let resume_provider_session =
+            memory.planner_turns > 0 && memory.provider_session_id.is_some();
+        let output = match run_planner_turn(
+            &app,
+            &run_id,
+            &provider,
+            &prompt_for_cli,
+            flag_images,
+            memory.provider_session_id.as_deref(),
+            resume_provider_session,
+            step_index as usize,
+            progress,
+        )
+        .await
+        {
+            Ok((output, emitted_session_id)) => {
                 if let Some(path) = spilled_prompt.as_ref() {
                     let _ = fs::remove_file(path);
                 }
+                if memory.provider_session_id.is_none() {
+                    memory.provider_session_id = emitted_session_id;
+                }
+                memory.planner_turns += 1;
+                let _ = save_goal_run_memory(&app, &mut memory);
                 output
             }
             Err(error) if error == "stopped" => {
@@ -3747,11 +4025,34 @@ async fn drive_goal_run(
                 if let Some(path) = spilled_prompt.as_ref() {
                     let _ = fs::remove_file(path);
                 }
-                consecutive_failures += 1;
-                history.push(format!("planner error: {error}"));
-                if history.len() > MAX_PLANNER_HISTORY {
-                    history.remove(0);
+                if resume_provider_session && memory.provider_session_resets < 1 {
+                    memory.provider_session_resets += 1;
+                    memory.planner_turns = 0;
+                    memory.provider_session_id = if matches!(provider.as_str(), "grok" | "copilot")
+                    {
+                        Some(Uuid::new_v4().to_string())
+                    } else {
+                        None
+                    };
+                    remember_goal_event(
+                        &mut memory,
+                        format!("provider session could not resume; rebuilt from Alfred memory: {error}"),
+                    );
+                    let _ = save_goal_run_memory(&app, &mut memory);
+                    emit_goal_event(
+                        &app,
+                        &run_id,
+                        step_index as usize,
+                        "Rebuilding planner context",
+                        "The provider session was unavailable. Alfred preserved the run and is starting a replacement session from durable memory.",
+                        "running",
+                        progress,
+                    );
+                    continue;
                 }
+                memory.consecutive_failures += 1;
+                remember_goal_event(&mut memory, format!("planner error: {error}"));
+                let _ = save_goal_run_memory(&app, &mut memory);
                 emit_goal_event(
                     &app,
                     &run_id,
@@ -3761,8 +4062,17 @@ async fn drive_goal_run(
                     "running",
                     progress,
                 );
-                if consecutive_failures >= GOAL_RUN_MAX_CONSECUTIVE_FAILURES {
-                    fail_goal_run(&app, &run_id, &goal, step_index as usize, progress, format!("The planner is unreachable: {error}"));
+                if memory.consecutive_failures >= GOAL_RUN_MAX_CONSECUTIVE_FAILURES {
+                    memory.status = "failed".into();
+                    let _ = save_goal_run_memory(&app, &mut memory);
+                    fail_goal_run(
+                        &app,
+                        &run_id,
+                        &goal,
+                        step_index as usize,
+                        progress,
+                        format!("The planner is unreachable: {error}"),
+                    );
                     return;
                 }
                 continue;
@@ -3771,15 +4081,13 @@ async fn drive_goal_run(
         let reply = match parse_planner_action(&output) {
             Ok(reply) => reply,
             Err(error) => {
-                consecutive_failures += 1;
+                memory.consecutive_failures += 1;
                 // Show the planner what its unusable output looked like so the
                 // next turn can fix the format instead of repeating it — and
                 // surface a short snippet in the cockpit so the user can see why.
                 let snippet: String = output.trim().chars().take(400).collect();
-                history.push(format!("{error} Output began: {snippet}"));
-                if history.len() > MAX_PLANNER_HISTORY {
-                    history.remove(0);
-                }
+                remember_goal_event(&mut memory, format!("{error} Output began: {snippet}"));
+                let _ = save_goal_run_memory(&app, &mut memory);
                 let detail = if snippet.is_empty() {
                     format!("{error} (empty planner output — often a CLI/argv or auth failure)")
                 } else {
@@ -3794,7 +4102,9 @@ async fn drive_goal_run(
                     "running",
                     progress,
                 );
-                if consecutive_failures >= GOAL_RUN_MAX_CONSECUTIVE_FAILURES {
+                if memory.consecutive_failures >= GOAL_RUN_MAX_CONSECUTIVE_FAILURES {
+                    memory.status = "failed".into();
+                    let _ = save_goal_run_memory(&app, &mut memory);
                     fail_goal_run(
                         &app,
                         &run_id,
@@ -3812,35 +4122,105 @@ async fn drive_goal_run(
             }
         };
         if reply.done {
+            let grounding = format!("{}\n{}", memory.last_observation, memory.history.join("\n"));
+            let verified_reply = is_verified_completion(&reply, &grounding);
             let summary = reply
                 .summary
                 .unwrap_or_else(|| "The planner reports the goal is complete.".into());
-            let _ = save_checkpoint(&app, &RunCheckpoint {
-                run_id: run_id.clone(),
-                workflow_id: goal.clone(),
-                next_step_index: max_steps as usize,
-                status: "completed".into(),
-                error: None,
-                updated_at: Utc::now(),
-            });
-            emit_goal_event(&app, &run_id, step_index as usize, "Goal completed", &summary, "completed", 100);
-            return;
+            if memory.completion_claim.is_none() {
+                memory.completion_claim = Some(summary.clone());
+                memory.verification_attempts = 0;
+                remember_goal_event(
+                    &mut memory,
+                    format!("completion claim awaiting evidence review: {summary}"),
+                );
+                let _ = save_goal_run_memory(&app, &mut memory);
+                emit_goal_event(
+                    &app,
+                    &run_id,
+                    step_index as usize,
+                    "Verifying the outcome",
+                    "The planner's completion claim is not final. Alfred is taking a fresh observation and checking concrete evidence.",
+                    "running",
+                    progress,
+                );
+                continue;
+            }
+            let evidence = reply.evidence.unwrap_or_default();
+            if verified_reply {
+                memory.status = "completed".into();
+                memory.completion_summary = Some(summary.clone());
+                memory.completion_evidence = evidence.clone();
+                memory.pending_action = None;
+                memory.next_step_index = step_index as usize;
+                let _ = save_goal_run_memory(&app, &mut memory);
+                let _ = save_checkpoint(
+                    &app,
+                    &RunCheckpoint {
+                        run_id: run_id.clone(),
+                        workflow_id: goal.clone(),
+                        next_step_index: step_index as usize,
+                        status: "completed".into(),
+                        error: None,
+                        updated_at: Utc::now(),
+                    },
+                );
+                let detail = format!("{summary} Evidence: {}", evidence.join(" · "));
+                emit_goal_event(
+                    &app,
+                    &run_id,
+                    step_index as usize,
+                    "Goal verified and completed",
+                    &detail,
+                    "completed",
+                    100,
+                );
+                return;
+            }
+            memory.verification_attempts += 1;
+            memory.completion_claim = None;
+            memory.completion_evidence.clear();
+            remember_goal_event(
+                &mut memory,
+                format!("completion review rejected the claim: {summary}"),
+            );
+            let _ = save_goal_run_memory(&app, &mut memory);
+            emit_goal_event(
+                &app,
+                &run_id,
+                step_index as usize,
+                "Completion not yet verified",
+                "The review found no concrete completion evidence. Planning will continue.",
+                "running",
+                progress,
+            );
+            continue;
+        }
+        if memory.completion_claim.take().is_some() {
+            remember_goal_event(
+                &mut memory,
+                "completion review found a gap; applying the proposed corrective action".into(),
+            );
         }
         // Multi-phase goals: the planner may outline or revise its approach
         // instead of acting. The outline is pinned into every later prompt and
         // shown in the cockpit timeline.
         if !reply.done && reply.kind.is_none() {
             if let Some(plan) = reply.plan.clone().filter(|plan| !plan.is_empty()) {
-                working_plan = plan;
-                consecutive_failures = 0;
-                let outline = working_plan.join(" → ");
+                memory.working_plan = plan;
+                memory.consecutive_failures = 0;
+                let outline = memory.working_plan.join(" → ");
                 emit_goal_event(
-                    &app, &run_id, step_index as usize, "Plan outlined", &outline, "running", progress,
+                    &app,
+                    &run_id,
+                    step_index as usize,
+                    "Plan outlined",
+                    &outline,
+                    "running",
+                    progress,
                 );
-                history.push(format!("plan: {outline}"));
-                if history.len() > MAX_PLANNER_HISTORY {
-                    history.remove(0);
-                }
+                remember_goal_event(&mut memory, format!("plan: {outline}"));
+                let _ = save_goal_run_memory(&app, &mut memory);
                 continue;
             }
         }
@@ -3851,9 +4231,21 @@ async fn drive_goal_run(
             if is_browser {
                 "Installed browser".into()
             } else {
-                applications.first().cloned().unwrap_or_else(|| "Alfred".into())
+                memory
+                    .applications
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "Alfred".into())
             }
         });
+        if application != "Alfred"
+            && !memory
+                .applications
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(&application))
+        {
+            memory.applications.push(application.clone());
+        }
         let title = reply.title.clone().unwrap_or_else(|| kind.clone());
         let declared_effect = reply.effect.clone().unwrap_or_else(|| "unknown".into());
         let step = WorkflowStep {
@@ -3871,7 +4263,10 @@ async fn drive_goal_run(
             expect: None,
             save_as: None,
         };
-        let mut payload = step.payload.clone().unwrap_or_else(|| serde_json::json!({}));
+        let mut payload = step
+            .payload
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
         if !is_browser && cfg!(windows) && needs_process_resolution(&kind, &application) {
             let runtime = app.state::<RuntimeState>();
             match resolve_application_process_id(&app, &runtime, &application) {
@@ -3881,10 +4276,23 @@ async fn drive_goal_run(
                     }
                 }
                 Err(error) => {
-                    consecutive_failures += 1;
-                    history.push(format!("{title} — target unavailable: {error}"));
-                    if consecutive_failures >= GOAL_RUN_MAX_CONSECUTIVE_FAILURES {
-                        fail_goal_run(&app, &run_id, &goal, step_index as usize, progress, format!("Target application never became available: {error}"));
+                    memory.consecutive_failures += 1;
+                    remember_goal_event(
+                        &mut memory,
+                        format!("{title} — target unavailable: {error}"),
+                    );
+                    let _ = save_goal_run_memory(&app, &mut memory);
+                    if memory.consecutive_failures >= GOAL_RUN_MAX_CONSECUTIVE_FAILURES {
+                        memory.status = "failed".into();
+                        let _ = save_goal_run_memory(&app, &mut memory);
+                        fail_goal_run(
+                            &app,
+                            &run_id,
+                            &goal,
+                            step_index as usize,
+                            progress,
+                            format!("Target application never became available: {error}"),
+                        );
                         return;
                     }
                     continue;
@@ -3892,13 +4300,20 @@ async fn drive_goal_run(
             }
         }
         if is_browser {
-            if let (Some(tab), Value::Object(map)) = (pinned_tab, &mut payload) {
+            if let (Some(tab), Value::Object(map)) = (memory.pinned_browser_tab, &mut payload) {
                 map.entry("tabId".to_string()).or_insert(Value::from(tab));
             }
         }
+        memory.pending_action = Some(step.clone());
+        let _ = save_goal_run_memory(&app, &mut memory);
         emit_goal_event(
-            &app, &run_id, step_index as usize, &title,
-            &format!("{kind} in {application}, checked by the safety engine."), "running", progress,
+            &app,
+            &run_id,
+            step_index as usize,
+            &title,
+            &format!("{kind} in {application}, checked by the safety engine."),
+            "running",
+            progress,
         );
         // A request_user parks the run; on approval the same action re-enters the
         // policy gate (now authorized) instead of being skipped.
@@ -3967,15 +4382,17 @@ async fn drive_goal_run(
         };
         match result {
             Ok(value) => {
+                append_goal_run_step(&app, &run_id, &step);
                 // Read actions (getText/getValue) put what they read into the
                 // history — without the digest the planner only learns "ok".
-                history.push(format!("{title} ({kind}) — ok{}", planner_result_digest(&value)));
-                if history.len() > MAX_PLANNER_HISTORY {
-                    history.remove(0);
-                }
-                consecutive_failures = 0;
+                remember_goal_event(
+                    &mut memory,
+                    format!("{title} ({kind}) — ok{}", planner_result_digest(&value)),
+                );
+                memory.pending_action = None;
+                memory.consecutive_failures = 0;
                 if step.effect != "observe" {
-                    since_check_in += 1;
+                    memory.actions_since_check_in += 1;
                 }
                 if is_browser {
                     if let Some(tab) = value
@@ -3983,7 +4400,7 @@ async fn drive_goal_run(
                         .and_then(|result| result.get("tabId"))
                         .and_then(Value::as_i64)
                     {
-                        pinned_tab = Some(tab);
+                        memory.pinned_browser_tab = Some(tab);
                     }
                 }
                 // A one-step approval override is consumed with its action.
@@ -3993,6 +4410,8 @@ async fn drive_goal_run(
                     }
                 }
                 let next_progress = (((step_index + 1) * 100) / max_steps.max(1)) as u8;
+                memory.next_step_index = (step_index + 1) as usize;
+                let _ = save_goal_run_memory(&app, &mut memory);
                 let _ = app.emit(
                     "alfred://run-event",
                     RunEvent {
@@ -4021,8 +4440,9 @@ async fn drive_goal_run(
                 );
                 // Human check-in cadence: pause so the cockpit's Resume button
                 // lets the user inspect the desktop before the agent continues.
-                if check_in_every > 0 && since_check_in >= check_in_every {
-                    since_check_in = 0;
+                if check_in_every > 0 && memory.actions_since_check_in >= check_in_every {
+                    memory.actions_since_check_in = 0;
+                    let _ = save_goal_run_memory(&app, &mut memory);
                     if let Ok(mut controls) = app.state::<RuntimeState>().run_controls.lock() {
                         controls.insert(run_id.clone(), "paused".into());
                     }
@@ -4031,18 +4451,19 @@ async fn drive_goal_run(
                         &run_id,
                         step_index as usize,
                         "Check-in pause",
-                        &format!("{check_in_every} actions completed. Review the desktop, then resume."),
+                        &format!(
+                            "{check_in_every} actions completed. Review the desktop, then resume."
+                        ),
                         "paused",
                         next_progress,
                     );
                 }
             }
             Err(error) => {
-                consecutive_failures += 1;
-                history.push(format!("{title} ({kind}) — failed: {error}"));
-                if history.len() > MAX_PLANNER_HISTORY {
-                    history.remove(0);
-                }
+                memory.pending_action = None;
+                memory.consecutive_failures += 1;
+                remember_goal_event(&mut memory, format!("{title} ({kind}) — failed: {error}"));
+                let _ = save_goal_run_memory(&app, &mut memory);
                 emit_goal_event(
                     &app,
                     &run_id,
@@ -4052,7 +4473,9 @@ async fn drive_goal_run(
                     "running",
                     progress,
                 );
-                if consecutive_failures >= GOAL_RUN_MAX_CONSECUTIVE_FAILURES {
+                if memory.consecutive_failures >= GOAL_RUN_MAX_CONSECUTIVE_FAILURES {
+                    memory.status = "failed".into();
+                    let _ = save_goal_run_memory(&app, &mut memory);
                     fail_goal_run(
                         &app,
                         &run_id,
@@ -4068,6 +4491,10 @@ async fn drive_goal_run(
             }
         }
     }
+    memory.status = "failed".into();
+    memory.pending_action = None;
+    memory.next_step_index = max_steps as usize;
+    let _ = save_goal_run_memory(&app, &mut memory);
     fail_goal_run(
         &app,
         &run_id,
@@ -4087,6 +4514,7 @@ async fn start_goal_run(
     app: AppHandle,
     goal: String,
     applications: Vec<String>,
+    provider: Option<String>,
     max_steps: Option<u32>,
     check_in_every: Option<u32>,
 ) -> Result<String, String> {
@@ -4106,12 +4534,49 @@ async fn start_goal_run(
         applications = infer_applications_from_goal(&goal);
     }
     let settings = get_settings(app.clone())?;
+    let provider = provider
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| settings.provider.clone());
+    if !provider_definitions()
+        .iter()
+        .any(|definition| definition.0 == provider)
+    {
+        return Err(format!("Unknown planner provider: {provider}"));
+    }
     // Fail fast when the planner CLI cannot be supervised on this machine;
     // otherwise the run dies off-screen and the cockpit looks stuck.
-    preflight_provider(&settings.provider)?;
+    preflight_provider(&provider)?;
     let max_steps = max_steps.unwrap_or(30).clamp(1, 100);
     let check_in_every = check_in_every.unwrap_or(0);
     let run_id = Uuid::new_v4().to_string();
+    // Grok and Copilot accept a caller-selected UUID. Codex and Cursor emit the
+    // session id on their first structured-output turn and Alfred records it.
+    let seeded_session_id = matches!(provider.as_str(), "grok" | "copilot").then(|| run_id.clone());
+    let mut memory = GoalRunMemory {
+        schema_version: 1,
+        run_id: run_id.clone(),
+        provider: provider.clone(),
+        provider_session_id: seeded_session_id,
+        goal: goal.clone(),
+        applications: applications.clone(),
+        planner_turns: 0,
+        provider_session_resets: 0,
+        next_step_index: 0,
+        pinned_browser_tab: None,
+        history: Vec::new(),
+        working_plan: Vec::new(),
+        consecutive_failures: 0,
+        actions_since_check_in: 0,
+        last_observation: String::new(),
+        pending_action: None,
+        completion_claim: None,
+        completion_evidence: Vec::new(),
+        verification_attempts: 0,
+        status: "running".into(),
+        completion_summary: None,
+        updated_at: Utc::now(),
+    };
     let lock_path = run_lock_path(&app)?;
     {
         let state = app.state::<RuntimeState>();
@@ -4146,7 +4611,8 @@ async fn start_goal_run(
                 error: None,
                 updated_at: Utc::now(),
             },
-        )
+        )?;
+        save_goal_run_memory(&app, &mut memory)
     })();
     if let Err(error) = start {
         release_run_lock(&lock_path, &run_id);
@@ -4162,10 +4628,7 @@ async fn start_goal_run(
     tauri::async_runtime::spawn(async move {
         drive_goal_run(
             app_for_run.clone(),
-            emitted_run.clone(),
-            settings.provider.clone(),
-            goal,
-            applications,
+            memory,
             max_steps,
             check_in_every,
             share_screenshots,
@@ -4176,7 +4639,12 @@ async fn start_goal_run(
             .flatten()
             .map(|checkpoint| checkpoint.status)
             .unwrap_or_default();
-        cleanup_run_screenshots(&app_for_run, &emitted_run, &screenshot_retention, &final_status);
+        cleanup_run_screenshots(
+            &app_for_run,
+            &emitted_run,
+            &screenshot_retention,
+            &final_status,
+        );
         release_run_lock(&lock_path, &emitted_run);
         if let Ok(mut controls) = app_for_run.state::<RuntimeState>().run_controls.lock() {
             controls.remove(&emitted_run);
@@ -4276,7 +4744,9 @@ fn capture_run_screenshots(
                     .and_then(Value::as_str)
                     .map(|data_url| {
                         (
-                            data_url.trim_start_matches("data:image/png;base64,").to_string(),
+                            data_url
+                                .trim_start_matches("data:image/png;base64,")
+                                .to_string(),
                             Some(data_url.to_string()),
                         )
                     })
@@ -4324,7 +4794,8 @@ fn capture_run_screenshots(
                     paths.push(path);
                     if evidence.is_none() {
                         evidence = Some(
-                            data_url.unwrap_or_else(|| format!("data:image/png;base64,{png_base64}")),
+                            data_url
+                                .unwrap_or_else(|| format!("data:image/png;base64,{png_base64}")),
                         );
                     }
                 }
@@ -4536,12 +5007,19 @@ fn start_scheduler(app: AppHandle) {
             }
             if let Ok(settings) = get_settings(app.clone()) {
                 for schedule in due {
-                    let _ = start_workflow_run(
-                        app.clone(),
-                        settings.library_path.clone(),
-                        schedule.workflow_id,
-                        None,
-                    );
+                    if let Ok((_, workflow)) =
+                        load_workflow(&settings.library_path, &schedule.workflow_id)
+                    {
+                        let _ = start_goal_run(
+                            app.clone(),
+                            workflow.goal,
+                            workflow.required_apps,
+                            workflow.planner_provider,
+                            None,
+                            Some(0),
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -4648,37 +5126,45 @@ pub fn run() {
                         let _ = window.hide();
                     }
                     if let Ok(settings) = get_settings(app.handle().clone()) {
-                        // setup is synchronous; drive the async command to
-                        // completion before wiring the exit watchdog.
-                        match tauri::async_runtime::block_on(start_workflow_run(
-                            app.handle().clone(),
-                            settings.library_path,
-                            workflow_id.clone(),
-                            None,
-                        )) {
+                        // Scheduled workflows re-enter the live goal loop so app
+                        // state is re-observed and stale refs/coordinates are
+                        // never replayed blindly.
+                        let scheduled = load_workflow(&settings.library_path, workflow_id)
+                            .map(|(_, workflow)| workflow)
+                            .and_then(|workflow| {
+                                tauri::async_runtime::block_on(start_goal_run(
+                                    app.handle().clone(),
+                                    workflow.goal,
+                                    workflow.required_apps,
+                                    workflow.planner_provider,
+                                    None,
+                                    Some(0),
+                                ))
+                            });
+                        match scheduled {
                             Ok(run_id) => {
                                 let scheduled_app = app.handle().clone();
-                            tauri::async_runtime::spawn(async move {
-                                loop {
-                                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                                    if let Ok(Some(checkpoint)) =
-                                        get_checkpoint(scheduled_app.clone(), run_id.clone())
-                                    {
-                                        if ["completed", "failed", "stopped", "waiting"]
-                                            .contains(&checkpoint.status.as_str())
+                                tauri::async_runtime::spawn(async move {
+                                    loop {
+                                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                        if let Ok(Some(checkpoint)) =
+                                            get_checkpoint(scheduled_app.clone(), run_id.clone())
                                         {
-                                            scheduled_app.exit(
-                                                if checkpoint.status == "completed" {
-                                                    0
-                                                } else {
-                                                    1
-                                                },
-                                            );
-                                            break;
+                                            if ["completed", "failed", "stopped", "waiting"]
+                                                .contains(&checkpoint.status.as_str())
+                                            {
+                                                scheduled_app.exit(
+                                                    if checkpoint.status == "completed" {
+                                                        0
+                                                    } else {
+                                                        1
+                                                    },
+                                                );
+                                                break;
+                                            }
                                         }
                                     }
-                                }
-                            });
+                                });
                             }
                             Err(_) => app.handle().exit(1),
                         }
@@ -4694,20 +5180,15 @@ pub fn run() {
             detect_providers,
             store_provider_secret,
             has_provider_secret,
-            start_provider_run,
-            cancel_provider_run,
-            parse_provider_plan,
             list_workflows,
-            create_workflow,
-            record_action,
-            record_actions,
-            finalize_recording,
             list_permissions,
             grant_permission,
             set_permission_enabled,
             evaluate_action,
             get_checkpoint,
-            start_workflow_run,
+            get_goal_run_memory,
+            complete_goal_run,
+            save_goal_run_as_workflow,
             start_goal_run,
             set_run_control,
             steer_run,
@@ -4791,17 +5272,97 @@ mod tests {
         );
     }
     #[test]
+    fn classifies_known_methods_without_planner_approval_labels() {
+        assert_eq!(
+            effective_effect("invokeElement", "unknown"),
+            "modify_reversible"
+        );
+        assert_eq!(
+            effective_effect("browser.click", "observe"),
+            "modify_reversible"
+        );
+        assert_eq!(effective_effect("observeWindow", "unknown"), "observe");
+    }
+    #[test]
     fn provider_commands_are_restricted() {
         let invocation = provider_invocation("codex", "plan", &[]).unwrap();
         assert!(invocation.args.contains(&"read-only".to_string()));
         assert!(invocation
             .args
             .contains(&"--skip-git-repo-check".to_string()));
-        assert!(invocation.args.contains(&"--ignore-user-config".to_string()));
+        assert!(invocation
+            .args
+            .contains(&"--ignore-user-config".to_string()));
         assert!(invocation.args.contains(&"never".to_string()));
         assert_eq!(invocation.args.last().map(String::as_str), Some("-"));
         assert_eq!(invocation.stdin.as_deref(), Some("plan"));
     }
+    #[test]
+    fn provider_turns_resume_the_exact_session() {
+        let session = "123e4567-e89b-12d3-a456-426614174000";
+        let codex =
+            provider_invocation_for_session("codex", "next", &[], Some(session), true).unwrap();
+        assert!(codex
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "exec" && pair[1] == "resume"));
+        assert!(codex.args.iter().any(|arg| arg == session));
+        assert!(!codex.args.iter().any(|arg| arg == "--ephemeral"));
+
+        let cursor =
+            provider_invocation_for_session("cursor", "next", &[], Some(session), true).unwrap();
+        assert!(cursor
+            .args
+            .iter()
+            .any(|arg| arg == &format!("--resume={session}")));
+
+        let grok_first =
+            provider_invocation_for_session("grok", "first", &[], Some(session), false).unwrap();
+        assert!(grok_first
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "--session-id" && pair[1] == session));
+        let grok_next =
+            provider_invocation_for_session("grok", "next", &[], Some(session), true).unwrap();
+        assert!(grok_next
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "--resume" && pair[1] == session));
+
+        let copilot =
+            provider_invocation_for_session("copilot", "next", &[], Some(session), true).unwrap();
+        assert!(copilot
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "--session-id" && pair[1] == session));
+        assert!(copilot.args.iter().any(|arg| arg.contains("deny-tool")));
+        assert!(copilot
+            .args
+            .iter()
+            .any(|arg| arg == "--no-custom-instructions"));
+    }
+    #[test]
+    fn extracts_documented_provider_session_ids() {
+        let codex = r#"{"type":"thread.started","thread_id":"codex-thread"}"#;
+        assert_eq!(
+            provider_session_id_from_output("codex", codex).as_deref(),
+            Some("codex-thread")
+        );
+        let cursor = r#"{"type":"system","session_id":"cursor-session","request_id":"ignore"}"#;
+        assert_eq!(
+            provider_session_id_from_output("cursor", cursor).as_deref(),
+            Some("cursor-session")
+        );
+    }
+
+    #[test]
+    fn treats_zero_exit_authentication_diagnostics_as_provider_errors() {
+        let output = "Error: No authentication information found. Run the '/login' command.";
+        let error = provider_output_error("copilot", output).unwrap();
+        assert!(error.contains("not authenticated"));
+        assert!(provider_output_error("copilot", r#"{"done":true}"#).is_none());
+    }
+
     #[test]
     fn recognizes_windows_command_wrappers() {
         assert!(is_windows_command_script(Path::new("C:/npm/codex.cmd")));
@@ -4833,9 +5394,7 @@ mod tests {
         assert_eq!(resolved.args, ["/D", "/S", "/C"]);
         assert_eq!(
             resolved.windows_raw_argument.as_deref(),
-            Some(
-                "\"\"C:/Users/Test User/AppData/Roaming/npm/codex.cmd\" \"exec\" \"--json\"\""
-            )
+            Some("\"\"C:/Users/Test User/AppData/Roaming/npm/codex.cmd\" \"exec\" \"--json\"\"")
         );
         assert!(!resolved
             .windows_raw_argument
@@ -4846,26 +5405,24 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn executes_cmd_wrapper_from_path_with_spaces() {
-        let directory = std::env::temp_dir().join(format!(
-            "Alfred provider wrapper {}",
-            Uuid::new_v4()
-        ));
+        let directory =
+            std::env::temp_dir().join(format!("Alfred provider wrapper {}", Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
         let script = directory.join("codex.cmd");
         fs::write(&script, "@echo off\r\necho [%~1][%~2]\r\n").unwrap();
-        let resolved = windows_command_script_process(
-            &script,
-            &["alpha beta".into(), "gamma".into()],
-            true,
-        )
-        .unwrap();
+        let resolved =
+            windows_command_script_process(&script, &["alpha beta".into(), "gamma".into()], true)
+                .unwrap();
         let mut process = Command::new(resolved.program);
         process.args(resolved.args);
         process.raw_arg(resolved.windows_raw_argument.unwrap());
         let output = process.output().unwrap();
         let _ = fs::remove_dir_all(&directory);
         assert!(output.status.success());
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "[alpha beta][gamma]");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "[alpha beta][gamma]"
+        );
     }
     #[test]
     fn parses_codex_jsonl_plan() {
@@ -4892,8 +5449,8 @@ mod tests {
             .contains("blocked"));
     }
     #[test]
-    fn rejects_edited_unsafe_launch_and_delete_key() {
-        let unsafe_launch = WorkflowStep {
+    fn accepts_named_app_launch_but_rejects_delete_key() {
+        let installed_launch = WorkflowStep {
             id: "one".into(),
             title: "Open PowerShell".into(),
             kind: "launchApplication".into(),
@@ -4908,9 +5465,9 @@ mod tests {
             expect: None,
             save_as: None,
         };
-        assert!(validate_workflow_step(&unsafe_launch)
-            .unwrap_err()
-            .contains("cannot safely launch"));
+        // Core accepts the semantic application name. The Windows host permits
+        // it only when it exactly matches an installed Start-menu shortcut.
+        assert!(validate_workflow_step(&installed_launch).is_ok());
 
         let delete_key = WorkflowStep {
             id: "two".into(),
@@ -4992,13 +5549,19 @@ mod tests {
     fn mutating_methods_cannot_masquerade_as_observe() {
         // A prompt-injected planner (or hand-edited YAML) declaring "observe" on a
         // mutating method must not skip the permission grant.
-        assert_eq!(effective_effect("typeText", "observe"), "unknown");
-        assert_eq!(effective_effect("setValue", "observe"), "unknown");
-        assert_eq!(effective_effect("browser.click", "observe"), "unknown");
+        assert_eq!(effective_effect("typeText", "observe"), "modify_reversible");
+        assert_eq!(effective_effect("setValue", "observe"), "modify_reversible");
+        assert_eq!(
+            effective_effect("browser.click", "observe"),
+            "modify_reversible"
+        );
         assert_eq!(effective_effect("observeWindow", "observe"), "observe");
         assert_eq!(effective_effect("browser.observe", "observe"), "observe");
         assert_eq!(effective_effect("getValue", "observe"), "observe");
-        assert_eq!(effective_effect("typeText", "modify_reversible"), "modify_reversible");
+        assert_eq!(
+            effective_effect("typeText", "modify_reversible"),
+            "modify_reversible"
+        );
     }
     #[test]
     fn screenshot_retention_policy() {
@@ -5099,9 +5662,37 @@ mod tests {
         let output = "Here is my next action:\n```json\n{\"done\": false, \"kind\": \"key\", \"payload\": {\"virtualKey\": 13}}\n```\nThat presses Enter.";
         let reply = parse_planner_action(output).unwrap();
         assert_eq!(reply.kind.as_deref(), Some("key"));
-        let done = parse_planner_action("All finished.\n{\"done\": true, \"summary\": \"Saved the file.\"}").unwrap();
+        let done = parse_planner_action(
+            "All finished.\n{\"done\": true, \"summary\": \"Saved the file.\"}",
+        )
+        .unwrap();
         assert!(done.done);
         assert_eq!(done.summary.as_deref(), Some("Saved the file."));
+    }
+    #[test]
+    fn completion_requires_explicit_nonempty_evidence() {
+        let claim = parse_planner_action(r#"{"done":true,"summary":"Saved the file."}"#).unwrap();
+        let grounding = "Notepad: title Alfred smoke.txt\nSave file (shortcut) — ok";
+        assert!(!is_verified_completion(&claim, grounding));
+        let empty = parse_planner_action(
+            r#"{"done":true,"verified":true,"summary":"Saved.","evidence":[]}"#,
+        )
+        .unwrap();
+        assert!(!is_verified_completion(&empty, grounding));
+        let verified = parse_planner_action(
+            r#"{"done":true,"verified":true,"summary":"Saved.","evidence":["Notepad title shows Alfred smoke.txt"]}"#,
+        )
+        .unwrap();
+        assert!(is_verified_completion(&verified, grounding));
+        let hallucinated = parse_planner_action(
+            r#"{"done":true,"verified":true,"summary":"Saved.","evidence":["Excel shows quarterly revenue 42 million"]}"#,
+        )
+        .unwrap();
+        assert!(!is_verified_completion(&hallucinated, grounding));
+        let mut prompt = String::from("state");
+        append_completion_review(&mut prompt, "Saved the file");
+        assert!(prompt.contains("do not trust the earlier claim"));
+        assert!(prompt.contains("specific visible fact"));
     }
     #[test]
     fn rejects_planner_output_without_an_action() {
@@ -5132,8 +5723,20 @@ mod tests {
         )
         .unwrap();
         assert!(reply.done);
-        assert!(reply.summary.as_ref().unwrap().to_lowercase().contains("can't help")
-            || reply.summary.as_ref().unwrap().to_lowercase().contains("posting"));
+        assert!(
+            reply
+                .summary
+                .as_ref()
+                .unwrap()
+                .to_lowercase()
+                .contains("can't help")
+                || reply
+                    .summary
+                    .as_ref()
+                    .unwrap()
+                    .to_lowercase()
+                    .contains("posting")
+        );
     }
     #[test]
     fn compacts_oversized_observations_for_cli_planners() {
@@ -5236,10 +5839,13 @@ mod tests {
         assert!(!reply.done);
 
         let stream = include_str!("../tests/fixtures/retest-live-stream.out");
-        let reply2 = parse_planner_action(stream).expect("streaming-json must reassemble after fix");
+        let reply2 =
+            parse_planner_action(stream).expect("streaming-json must reassemble after fix");
         assert_eq!(reply2.kind.as_deref(), Some("launchApplication"));
-        assert!(reply2.application.as_deref() == Some("Microsoft Edge")
-            || reply2.application.as_deref() == Some("Installed browser"));
+        assert!(
+            reply2.application.as_deref() == Some("Microsoft Edge")
+                || reply2.application.as_deref() == Some("Installed browser")
+        );
     }
 
     #[test]
@@ -5260,17 +5866,27 @@ mod tests {
             vec!["Notepad".to_string()]
         );
         let apps = infer_applications_from_goal("Copy the table from the website into Excel");
-        assert!(apps.contains(&"Installed browser".to_string()));
+        assert!(apps.contains(&"Microsoft Edge".to_string()));
         assert!(apps.contains(&"Microsoft Excel".to_string()));
         assert_eq!(
             infer_applications_from_goal("Open our Datadog portal and check the RUM errors"),
-            vec!["Installed browser".to_string()]
+            vec!["Microsoft Edge".to_string()]
+        );
+        assert_eq!(
+            infer_applications_from_goal("Post a tweet on X"),
+            vec!["Microsoft Edge".to_string()]
         );
         assert!(infer_applications_from_goal("organize my thoughts").is_empty());
     }
     #[test]
     fn planner_prompt_guides_app_choice_when_none_listed() {
-        let prompt = build_planner_prompt("Type hello somewhere safe", &[], "(no observations available)", &[], &[]);
+        let prompt = build_planner_prompt(
+            "Type hello somewhere safe",
+            &[],
+            "(no observations available)",
+            &[],
+            &[],
+        );
         assert!(prompt.contains("infer them from the goal"));
         assert!(prompt.contains("listApplications"));
     }
@@ -5287,7 +5903,10 @@ mod tests {
     #[test]
     fn planner_history_digests_read_results() {
         let read = serde_json::json!({"ok": true, "result": {"text": "Error rate spiked\n  to 4.2% of sessions"}});
-        assert_eq!(planner_result_digest(&read), ": Error rate spiked to 4.2% of sessions");
+        assert_eq!(
+            planner_result_digest(&read),
+            ": Error rate spiked to 4.2% of sessions"
+        );
         let click = serde_json::json!({"ok": true, "result": {"clicked": true}});
         assert_eq!(planner_result_digest(&click), "");
     }
@@ -5326,7 +5945,10 @@ mod tests {
             "anything",
             &["Installed browser".to_string()]
         ));
-        assert!(!goal_needs_browser_skill("Open Notepad and type hello", &[]));
+        assert!(!goal_needs_browser_skill(
+            "Open Notepad and type hello",
+            &[]
+        ));
         let prompt = build_planner_prompt(
             "Open https://app.datadoghq.com and read RUM errors",
             &["Installed browser".to_string()],
@@ -5382,8 +6004,12 @@ mod tests {
         });
         let mut lines = Vec::new();
         summarize_native_tree(&tree, &mut lines, 0);
-        assert!(lines.iter().any(|line| line.contains("MenuItem") && line.contains("mFile")));
-        assert!(lines.iter().any(|line| line.contains("Button") && line.contains("btnSave")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("MenuItem") && line.contains("mFile")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("Button") && line.contains("btnSave")));
         assert!(!lines.iter().any(|line| line.contains("Pane")));
     }
 }
