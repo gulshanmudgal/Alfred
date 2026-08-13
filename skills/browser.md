@@ -35,6 +35,7 @@ This skill is injected into the goal-run planner prompt whenever the goal or tar
 - Not a headless Playwright cluster
 - Not a Datadog API client (UI only)
 - Canvas-only UIs (Google Docs) still need native marks / probe; DOM refs miss the canvas
+- Contenteditable composers and some SPAs ignore untrusted DOM events; Alfred then uses a trusted OS click/type on the element's page box
 - Not unattended public posting
 - `browser.navigate` succeeds only on the requested path or a real committed URL change — staying on the same origin is not enough
 

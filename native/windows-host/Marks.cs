@@ -26,7 +26,7 @@ internal sealed record MarkRecord
 
 internal static partial class Program
 {
-    private const int MaxMarks = 24;
+    private const int MaxMarks = 40;
     private const int MaxMarkScan = 400;
     private const int QuerySearchLimit = 12;
     private const int MaxQueryMarks = 12;
@@ -200,9 +200,16 @@ internal static partial class Program
         return DismissiveLabels.Contains(normalized);
     }
 
+    private static bool IsTrustedPagePoint(HostRequest request)
+    {
+        var space = (GetOptionalString(request.Params, "space") ?? "").ToLowerInvariant();
+        return space is "page" or "viewport";
+    }
+
     private static void RefuseUnverifiedBrowserCoordinate(HostRequest request, AutomationElement? semanticTarget)
     {
         if (semanticTarget is not null) return;
+        if (IsTrustedPagePoint(request)) return;
         if (!BrowserApplications.Contains(GetApplication(request))) return;
         if (string.IsNullOrWhiteSpace(request.Target)) return;
         throw new InvalidOperationException(
@@ -786,6 +793,74 @@ internal static partial class Program
         return true;
     }
 
+    private static bool TryPageDocumentBounds(Process process, out RECT page)
+    {
+        page = default;
+        var root = AutomationElement.FromHandle(process.MainWindowHandle);
+        if (root is null) return false;
+        AutomationElement? best = null;
+        var bestArea = 0.0;
+        try
+        {
+            var documents = root.FindAll(TreeScope.Descendants,
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Document));
+            foreach (AutomationElement candidate in documents.Cast<AutomationElement>())
+            {
+                try
+                {
+                    if (!IsUsableElement(candidate) || IsBrowserChromeControl(candidate, process)) continue;
+                    var bounds = candidate.Current.BoundingRectangle;
+                    var area = bounds.Width * bounds.Height;
+                    if (area > bestArea)
+                    {
+                        best = candidate;
+                        bestArea = area;
+                    }
+                }
+                catch { /* Stale document node. */ }
+            }
+        }
+        catch { return false; }
+        if (best is null) return false;
+        var box = best.Current.BoundingRectangle;
+        page = new RECT
+        {
+            Left = (int)Math.Round(box.Left),
+            Top = (int)Math.Round(box.Top),
+            Right = (int)Math.Round(box.Right),
+            Bottom = (int)Math.Round(box.Bottom)
+        };
+        return page.Right > page.Left && page.Bottom > page.Top;
+    }
+
+    private static bool TryPageOrWindowPoint(HostRequest request, Process process, out int x, out int y)
+    {
+        x = 0;
+        y = 0;
+        var nx = GetOptionalDouble(request.Params, "nx");
+        var ny = GetOptionalDouble(request.Params, "ny");
+        if (nx is null || ny is null) return false;
+        if (nx < 0 || nx > 1 || ny < 0 || ny > 1)
+            throw new InvalidOperationException("Normalized click points must be between 0 and 1.");
+        var space = (GetOptionalString(request.Params, "space") ?? "window").ToLowerInvariant();
+        RECT rect;
+        if ((space is "page" or "viewport") && BrowserApplications.Contains(GetApplication(request)))
+        {
+            if (!TryPageDocumentBounds(process, out rect))
+                return TryNormalizedPoint(request, process, out x, out y);
+        }
+        else if (!GetWindowRect(process.MainWindowHandle, out rect))
+        {
+            throw new InvalidOperationException("Could not read the target window bounds.");
+        }
+        var width = Math.Max(1, rect.Right - rect.Left);
+        var height = Math.Max(1, rect.Bottom - rect.Top);
+        x = rect.Left + (int)Math.Round(nx.Value * width);
+        y = rect.Top + (int)Math.Round(ny.Value * height);
+        RequireInsideWindow(process.Id, x, y);
+        return true;
+    }
+
     private static object InvokeViaPatterns(Process process, AutomationElement element, string? target)
     {
         RefuseDestructiveControl(element);
@@ -830,15 +905,14 @@ internal static partial class Program
         }
         var (x, y) = CenterOf(element);
         RequireInsideWindow(process.Id, x, y);
-        SetCursorPos(x, y);
-        Send([MouseInput(MOUSEEVENTF_LEFTDOWN), MouseInput(MOUSEEVENTF_LEFTUP)]);
-        return new { invoked = true, how = "click", x, y, targetName, controlType };
+        HumanLeftClick(process.Id, x, y);
+        return new { invoked = true, how = "humanClick", x, y, targetName, controlType };
     }
 
     private static object Probe(HostRequest request)
     {
         var process = ResolveProcess(request);
-        if (!TryNormalizedPoint(request, process, out var x, out var y))
+        if (!TryPageOrWindowPoint(request, process, out var x, out var y))
             throw new InvalidOperationException("probe requires nx and ny in window bitmap space (0–1).");
         var hit = HitTest(x, y);
         if (hit is null || hit.Current.ProcessId != process.Id)
@@ -925,11 +999,10 @@ internal static partial class Program
         if (!TryWheelSafePoint(process, target, out var x, out var y))
             return new { scrolled = false, how = "none", reason = "No non-value surface to wheel over." };
         RequireInsideWindow(process.Id, x, y);
-        SetCursorPos(x, y);
         var wheelHorizontal = direction is "left" or "right";
         var delta = direction is "up" or "right" ? 360 : -360;
-        Send([WheelInput(delta, wheelHorizontal)]);
-        return new { scrolled = true, how = "wheel", direction };
+        HumanWheel(process.Id, x, y, delta, wheelHorizontal);
+        return new { scrolled = true, how = "humanWheel", direction };
     }
 
     private static bool TryWheelSafePoint(Process process, AutomationElement? preferred, out int x, out int y)
@@ -973,7 +1046,7 @@ internal static partial class Program
         var element = TryResolveMark(request);
         int x, y;
         if (element is not null) (x, y) = CenterOf(element);
-        else if (!TryNormalizedPoint(request, process, out x, out y))
+        else if (!TryPageOrWindowPoint(request, process, out x, out y))
             throw new InvalidOperationException($"{kind} requires a mark (or nx/ny after probe).");
         else
         {
@@ -989,24 +1062,21 @@ internal static partial class Program
         if (kind is "rightClick" or "doubleClick")
             RefuseDestructiveControl(element ?? throw new InvalidOperationException($"{kind} has no live control under that point to safety-check."));
         RequireInsideWindow(process.Id, x, y);
-        SetCursorPos(x, y);
         switch (kind)
         {
             case "rightClick":
-                Send([MouseInput(MOUSEEVENTF_RIGHTDOWN), MouseInput(MOUSEEVENTF_RIGHTUP)]);
+                HumanRightClick(process.Id, x, y);
                 break;
             case "doubleClick":
-                Send([MouseInput(MOUSEEVENTF_LEFTDOWN), MouseInput(MOUSEEVENTF_LEFTUP)]);
-                Thread.Sleep(40);
-                Send([MouseInput(MOUSEEVENTF_LEFTDOWN), MouseInput(MOUSEEVENTF_LEFTUP)]);
+                HumanDoubleClick(process.Id, x, y);
                 break;
             case "hover":
-                Thread.Sleep(200);
+                HumanHover(process.Id, x, y);
                 break;
             default:
                 throw new InvalidOperationException($"Unsupported pointer gesture: {kind}");
         }
-        return new { kind, x, y, mark = GetOptionalString(request.Params, "mark") };
+        return new { kind, how = "humanPointer", x, y, mark = GetOptionalString(request.Params, "mark") };
     }
 
     private static object Drag(HostRequest request)
@@ -1025,18 +1095,8 @@ internal static partial class Program
         var (x2, y2) = CenterOf(to);
         RequireInsideWindow(process.Id, x1, y1);
         RequireInsideWindow(process.Id, x2, y2);
-        SetCursorPos(x1, y1);
-        Send([MouseInput(MOUSEEVENTF_LEFTDOWN)]);
-        const int steps = 8;
-        for (var step = 1; step <= steps; step++)
-        {
-            var x = x1 + (x2 - x1) * step / steps;
-            var y = y1 + (y2 - y1) * step / steps;
-            SetCursorPos(x, y);
-            Thread.Sleep(20);
-        }
-        Send([MouseInput(MOUSEEVENTF_LEFTUP)]);
-        return new { dragged = true, from = fromId, to = toId };
+        HumanDrag(process.Id, x1, y1, x2, y2);
+        return new { dragged = true, how = "humanDrag", from = fromId, to = toId };
     }
 
     private static Bitmap AnnotateMarks(Bitmap source, Process process, RECT window)

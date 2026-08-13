@@ -10,7 +10,7 @@ Alfred is a local-first desktop workflow agent for repetitive work across applic
 - A polished GUI for setup, workflow creation, live execution, permissions, credentials, and schedules.
 - Visible execution with a current-action timeline, screenshots, pause, stop, takeover, and checkpoint recovery.
 - Pluggable planning through installed Codex, GitHub Copilot, Cursor, or Grok CLIs.
-- Semantic control of Windows applications through UI Automation, screen capture, and narrowly scoped keyboard/mouse input.
+- Semantic control of Windows applications through UI Automation, screen capture, and a mark-targeted virtual mouse and keyboard when the app only reacts to real input.
 - Control of the user's installed Chromium browser through an unpacked extension and Native Messaging bridge.
 - Local, portable workflow files that users can keep in Documents, OneDrive, Dropbox, Git, or any folder they choose.
 - A non-configurable hard block on deletion, trash, purge, destructive overwrite, password-field typing, and similar persistent-data-loss actions.
@@ -21,8 +21,8 @@ Alfred is a local-first desktop workflow agent for repetitive work across applic
 | --- | --- |
 | Tauri/React desktop GUI and first-run setup | Implemented; builds on Windows and macOS |
 | Rust policy engine, permissions, OS vault, events, and checkpoints | Implemented with policy tests |
-| Windows UI Automation, `PrintWindow` capture, and targeted `SendInput` host | Mark catalog + set-of-mark capture, pattern-first invoke/scroll, PerMonitorV2 mapping, and mark-targeted gestures; clean Windows 11 desktop validation is pending |
-| Chromium extension and Native Messaging bridge | Implemented as an unpacked extension with per-run tab pinning; packaged install validation is pending |
+| Windows UI Automation, `PrintWindow` capture, and targeted `SendInput` host | Mark catalog + set-of-mark capture, pattern-first invoke/scroll, PerMonitorV2 mapping, and a human-like mark-targeted mouse/keyboard (cursor path + cadenced keys) when patterns are missing; Start-menu unique-name launch; clean Windows 11 desktop validation is pending |
+| Chromium extension and Native Messaging bridge | Implemented as an unpacked extension with per-run tab pinning and trusted OS click/type fallback when a page ignores synthetic DOM events; packaged install validation is pending |
 | Codex, Copilot, Cursor, and Grok CLI adapters | Beta; requires the selected CLI to be installed and authenticated |
 | Goal runs (live planner loop with policy gate, approvals, and guardrails) | Implemented; provider answer parsing is best-effort per CLI and needs the Windows validation pass |
 | Planner vision (per-turn screenshots to the CLI) | Implemented for Codex (`--image`), Copilot (`--attachment`), Grok and Cursor (prompt-listed file paths); opt-in setting, off by default |

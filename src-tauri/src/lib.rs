@@ -2058,6 +2058,157 @@ fn browser_bridge_status(app: AppHandle) -> Result<bool, String> {
     Ok(browser_token_path(&app)?.exists() && connect_browser_bridge().is_ok())
 }
 
+fn browser_envelope_result(value: &Value) -> &Value {
+    value.get("result").unwrap_or(value)
+}
+
+fn browser_result_needs_trusted_input(method: &str, value: &Value) -> bool {
+    if !matches!(method, "click" | "type" | "hover" | "dblclick") {
+        return false;
+    }
+    let result = browser_envelope_result(value);
+    result.get("needsTrustedInput").and_then(Value::as_bool) == Some(true)
+        || (method == "type" && result.get("verified").and_then(Value::as_bool) == Some(false))
+}
+
+fn browser_trusted_point(value: &Value) -> Option<(f64, f64)> {
+    let result = browser_envelope_result(value);
+    Some((
+        json_finite_unit_interval(result, "nx")?,
+        json_finite_unit_interval(result, "ny")?,
+    ))
+}
+
+fn trusted_browser_native_method(method: &str) -> Option<&'static str> {
+    match method {
+        "click" => Some("click"),
+        "type" => Some("typeText"),
+        "hover" => Some("hover"),
+        "dblclick" => Some("doubleClick"),
+        _ => None,
+    }
+}
+
+fn merge_trusted_browser_result(mut value: Value, native: Value) -> Value {
+    let how = native
+        .get("how")
+        .and_then(Value::as_str)
+        .unwrap_or("humanClick")
+        .to_string();
+    let target_name = native
+        .get("targetName")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if let Value::Object(map) = &mut value {
+        let result = map
+            .entry("result")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Value::Object(result_map) = result {
+            result_map.insert("trustedInput".into(), Value::Bool(true));
+            result_map.insert("how".into(), Value::String(how.clone()));
+            if !target_name.is_empty() {
+                result_map.insert("targetName".into(), Value::String(target_name));
+            }
+            if native.get("typed").and_then(Value::as_bool) == Some(true) {
+                result_map.insert("typed".into(), Value::Bool(true));
+            }
+            if native.get("verified").and_then(Value::as_bool) == Some(true) {
+                result_map.insert("verified".into(), Value::Bool(true));
+            }
+            if native.get("clicked").and_then(Value::as_bool) == Some(true) || how.contains("Click") {
+                result_map.insert("clicked".into(), Value::Bool(true));
+            }
+            result_map.insert("needsTrustedInput".into(), Value::Bool(false));
+        }
+    }
+    value
+}
+
+fn apply_trusted_browser_input(
+    app: &AppHandle,
+    method: &str,
+    command: &BrowserCommand,
+    value: Value,
+) -> Result<Value, String> {
+    if !browser_result_needs_trusted_input(method, &value) {
+        return Ok(value);
+    }
+    let Some(native_method) = trusted_browser_native_method(method) else {
+        return Ok(value);
+    };
+    let Some((nx, ny)) = browser_trusted_point(&value) else {
+        return Err(
+            "The page asked for trusted input but did not expose a viewport point.".into(),
+        );
+    };
+    if !cfg!(windows) {
+        return Ok(value);
+    }
+    let runtime = app.state::<RuntimeState>();
+    let mut last_error = "No allow-listed browser window is available for trusted input.".to_string();
+    for application in ["Microsoft Edge", "Google Chrome", "Brave"] {
+        let pid = match resolve_application_process_id(app, &runtime, application) {
+            Ok(pid) => pid,
+            Err(error) => {
+                last_error = error;
+                continue;
+            }
+        };
+        let mut payload = serde_json::json!({
+            "processId": pid,
+            "nx": nx,
+            "ny": ny,
+            "space": "page"
+        });
+        if native_method == "typeText" {
+            let text = command
+                .params
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if text.is_empty() {
+                return Err("Trusted browser typing requires non-empty text.".into());
+            }
+            payload["text"] = Value::String(text.to_string());
+            payload["input"] = Value::String("human".into());
+        }
+        let request = ActionRequest {
+            protocol_version: protocol_version(),
+            run_id: command.run_id.clone().unwrap_or_else(|| "browser-live".into()),
+            workflow_step: command.id.clone(),
+            application: application.into(),
+            intent: format!("trusted OS {method} after the DOM path was ignored"),
+            effect: command.effect.clone(),
+            target_label: command.target_label.clone(),
+            payload: Some(payload),
+        };
+        match execute_native_action_inner(
+            app,
+            &runtime,
+            request,
+            native_method.into(),
+            Duration::from_secs(30),
+            false,
+        ) {
+            Ok(native) => return Ok(merge_trusted_browser_result(value, native)),
+            Err(error) => last_error = error,
+        }
+    }
+    let result = browser_envelope_result(&value);
+    let dom_claimed_success = result.get("clicked").and_then(Value::as_bool) == Some(true)
+        || result.get("typed").and_then(Value::as_bool) == Some(true)
+        || result.get("hovered").and_then(Value::as_bool) == Some(true)
+        || result.get("dblclicked").and_then(Value::as_bool) == Some(true);
+    if dom_claimed_success {
+        Ok(value)
+    } else {
+        Err(format!(
+            "Trusted OS input was required and failed: {last_error}"
+        ))
+    }
+}
+
 fn send_browser_command_inner(
     app: AppHandle,
     command: BrowserCommand,
@@ -2094,11 +2245,11 @@ fn send_browser_command_inner(
         .map_err(|_| "The browser bridge has not been paired yet.".to_string())?;
     let method_name = command.method.clone();
     let mut request = command.params.as_object().cloned().unwrap_or_default();
-    request.insert("id".into(), Value::String(command.id));
+    request.insert("id".into(), Value::String(command.id.clone()));
     request.insert("method".into(), Value::String(method_name.clone()));
-    request.insert("effect".into(), Value::String(command.effect));
-    request.insert("intent".into(), Value::String(command.intent));
-    if let Some(target) = command.target_label {
+    request.insert("effect".into(), Value::String(command.effect.clone()));
+    request.insert("intent".into(), Value::String(command.intent.clone()));
+    if let Some(target) = command.target_label.clone() {
         request.insert("targetLabel".into(), Value::String(target));
     }
     let envelope = serde_json::json!({ "capabilityToken": token.trim(), "request": request });
@@ -2133,6 +2284,7 @@ fn send_browser_command_inner(
         }
         return Err(error);
     }
+    let value = apply_trusted_browser_input(&app, &method_name, &command, value)?;
     if let Some(run_id) = command.run_id.as_deref() {
         append_run_log(
             &app,
@@ -3733,6 +3885,12 @@ fn planner_result_digest(value: &Value) -> String {
             if map.get("captcha").and_then(Value::as_bool) == Some(true) {
                 parts.push("[captcha]".into());
             }
+            if let Some(how) = map.get("how").and_then(Value::as_str) {
+                if how.starts_with("human") || map.get("trustedInput").and_then(Value::as_bool) == Some(true)
+                {
+                    parts.push(format!("[{how}]"));
+                }
+            }
             if let Some(matches) = map.get("matches").and_then(Value::as_array) {
                 let preview: Vec<String> = matches
                     .iter()
@@ -4342,7 +4500,8 @@ The optional extension is connected, so `browser.*` methods and application "Ins
 9. Analysis goals (Datadog RUM, logs, dashboards): navigate → wait → read → scroll/read more → summarize ONLY facts present in CURRENT DESKTOP STATE or ACTION HISTORY digests. If text is empty, say so; do not fabricate error rates or stack traces.
 10. One small action per reply. Prefer browser.find+click over any coordinate click. After navigate, wait for the destination path — same-origin is not success.
 11. browser.hover {"ref"} and browser.dblclick {"ref"} are available for menus and dense grids.
-12. Send/publish an already-written draft by clicking the live Send/Post control, then observe the destination (sent folder, profile, confirmation). Do not invent authored text that was already on the page."#
+12. Send/publish an already-written draft by clicking the live Send/Post control, then observe the destination (sent folder, profile, confirmation). Do not invent authored text that was already on the page.
+13. If a composer or SPA ignores the DOM click/type, Alfred retries with a trusted OS pointer/keyboard on that element's page box. Prefer refs; do not emit screen coordinates."#
 }
 
 fn goal_needs_browser_skill(goal: &str, applications: &[String]) -> bool {
@@ -4411,6 +4570,21 @@ fn infer_applications_from_goal(goal: &str) -> Vec<String> {
         (&["ms word", "word document", "word"], "Microsoft Word"),
         (&["powerpoint", "presentation"], "Microsoft PowerPoint"),
         (&["outlook", "email", "e-mail", "inbox"], "Microsoft Outlook"),
+        (
+            &[
+                "visual studio code",
+                "vs code",
+                "vscode",
+                "code.exe",
+            ],
+            "Visual Studio Code",
+        ),
+        (&["slack"], "Slack"),
+        (&["spotify"], "Spotify"),
+        (&["discord"], "Discord"),
+        (&["microsoft teams", "teams"], "Microsoft Teams"),
+        (&["notion"], "Notion"),
+        (&["photoshop", "adobe photoshop"], "Adobe Photoshop"),
     ];
     let normalized = goal.to_lowercase();
     let words: std::collections::HashSet<&str> = normalized
@@ -4503,13 +4677,13 @@ fn build_planner_prompt(
         "optional DOM browser accelerator: not connected; native application control only"
     };
     let mut prompt = format!(
-        "You are the planning brain of Alfred, a supervised desktop automation agent running on the user's machine. Propose the next single action toward the goal.\n\nGOAL: {goal}\n\nTARGET APPLICATIONS: {apps}\n\nAVAILABLE CAPABILITIES: {capability}\n\nCURRENT DESKTOP STATE:\n{observations}\n\nACTION HISTORY (oldest first):\n{history_text}{plan_text}{skill}\n\nReply with exactly one JSON object and nothing else (no markdown fences, no prose):\n{{\"done\": false, \"title\": \"short human label\", \"kind\": \"<method>\", \"application\": \"<exact app name>\", \"intent\": \"what and why\", \"effect\": \"observe|create|modify_reversible|external_write\", \"targetLabel\": \"<element label>\", \"payload\": {{...}}}}\nWhen the goal appears fully complete, reply: {{\"done\": true, \"summary\": \"what was accomplished\"}}. Alfred treats this as a completion claim and performs a fresh evidence-review turn before closing the run.\nIf the goal has multiple phases, you may instead reply {{\"plan\": [\"short phase\", ...]}} (no \"kind\") to outline or revise your approach; it is pinned below as CURRENT PLAN.\n\nMethods available on this turn: {methods}.\n\nRules:\n- One small action per reply; observe or find before click/type when unsure.\n- NEVER propose deletion, trash, purge, overwrite, password entry, shell commands, or credential handling. Alfred hard-blocks persistent data loss regardless of what you return.\n- Prefer marks (n12) or browser refs (e3). findElement {{\"text\"}} / browser.find before acting. Never emit screen x,y; use probe {{nx,ny}} only when a control has no mark.\n- Prefer setValue/invokeElement on a mark (semantic, focus-independent) over click/typeText.\n- Never include processId; Alfred injects the live one.\n- {app_rule}\n- If the last action failed or changed nothing, try a different approach instead of repeating it.\n- If a target application is not running, propose launchApplication. If the exact installed name is uncertain, call listInstalledApplications first.\n- Never claim to have read or analyzed content that does not appear in CURRENT DESKTOP STATE or ACTION HISTORY; if you cannot access the content the goal needs, reply done with a summary explaining the blocker instead of inventing results.",
+        "You are the planning brain of Alfred, a supervised desktop automation agent running on the user's machine. Propose the next single action toward the goal.\n\nGOAL: {goal}\n\nTARGET APPLICATIONS: {apps}\n\nAVAILABLE CAPABILITIES: {capability}\n\nCURRENT DESKTOP STATE:\n{observations}\n\nACTION HISTORY (oldest first):\n{history_text}{plan_text}{skill}\n\nReply with exactly one JSON object and nothing else (no markdown fences, no prose):\n{{\"done\": false, \"title\": \"short human label\", \"kind\": \"<method>\", \"application\": \"<exact app name>\", \"intent\": \"what and why\", \"effect\": \"observe|create|modify_reversible|external_write\", \"targetLabel\": \"<element label>\", \"payload\": {{...}}}}\nWhen the goal appears fully complete, reply: {{\"done\": true, \"summary\": \"what was accomplished\"}}. Alfred treats this as a completion claim and performs a fresh evidence-review turn before closing the run.\nIf the goal has multiple phases, you may instead reply {{\"plan\": [\"short phase\", ...]}} (no \"kind\") to outline or revise your approach; it is pinned below as CURRENT PLAN.\n\nMethods available on this turn: {methods}.\n\nRules:\n- One small action per reply; observe or find before click/type when unsure.\n- NEVER propose deletion, trash, purge, overwrite, password entry, shell commands, or credential handling. Alfred hard-blocks persistent data loss regardless of what you return.\n- Prefer marks (n12) or browser refs (e3). findElement {{\"text\"}} / browser.find before acting. Never emit screen x,y; use probe {{nx,ny}} only when a control has no mark.\n- Prefer setValue/invokeElement on a mark (semantic, focus-independent) over click/typeText.\n- Never include processId; Alfred injects the live one.\n- {app_rule}\n- If the last action failed or changed nothing, try a different approach instead of repeating it.\n- If a target application is not running, propose launchApplication. If the exact installed name is uncertain, call listInstalledApplications first and pick one exact name from the returned candidates.\n- Never claim to have read or analyzed content that does not appear in CURRENT DESKTOP STATE or ACTION HISTORY; if you cannot access the content the goal needs, reply done with a summary explaining the blocker instead of inventing results.",
         apps = planner_app_list(applications),
         methods = planner_methods(bridge_connected),
         app_rule = planner_app_rule_for_capabilities(applications, bridge_connected),
     );
     prompt.push_str(
-        "\n- For typeText, name the intended editable control in targetLabel and pass its mark. Alfred rejects the action unless it can focus that target and read the entered text back from it.\n- Never treat a successful input or click call as proof of the final outcome. Re-observe the destination and verify the requested result itself is visible.",
+        "\n- For typeText, name the intended editable control in targetLabel and pass its mark. Alfred rejects the action unless it can focus that target and read the entered text back from it.\n- Clicks, typing, hover, drag, and keys move the real Windows cursor and keyboard on the resolved mark or probe point. Never emit screen x,y. If a control has no mark, probe then act.\n- Never treat a successful input or click call as proof of the final outcome. Re-observe the destination and verify the requested result itself is visible.",
     );
     prompt.push_str(
         "\n- `shortcut` is available for two allow-listed combinations only: {\"keys\":\"CTRL+L\"} focuses a browser/Explorer address bar; {\"keys\":\"CTRL+S\"} opens Save/Save As.",
@@ -5852,6 +6026,23 @@ async fn drive_goal_run(
                 let next_progress = goal_run_progress(step_index.saturating_add(1));
                 memory.next_step_index = step_index.saturating_add(1);
                 let _ = save_goal_run_memory(&app, &mut memory);
+                let how = value
+                    .get("result")
+                    .and_then(|result| result.get("how"))
+                    .or_else(|| value.get("how"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let detail = if how.starts_with("human")
+                    || value
+                        .get("result")
+                        .and_then(|result| result.get("trustedInput"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                {
+                    "Action completed with the system cursor and keyboard.".to_string()
+                } else {
+                    "Action completed.".into()
+                };
                 let _ = app.emit(
                     "alfred://run-event",
                     RunEvent {
@@ -5859,7 +6050,7 @@ async fn drive_goal_run(
                         sequence: step_index as usize,
                         step_id: step.id.clone(),
                         title: title.clone(),
-                        detail: "Action completed.".into(),
+                        detail,
                         application: application.clone(),
                         status: "completed".into(),
                         progress: next_progress,
@@ -7784,6 +7975,37 @@ mod tests {
             vec!["Microsoft Edge".to_string()]
         );
         assert!(infer_applications_from_goal("organize my thoughts").is_empty());
+        assert_eq!(
+            infer_applications_from_goal("Open VS Code and the Slack thread"),
+            vec!["Visual Studio Code".to_string(), "Slack".to_string()]
+        );
+    }
+
+    #[test]
+    fn trusted_browser_input_routes_only_unverified_dom_actions() {
+        let click = serde_json::json!({
+            "ok": true,
+            "result": { "clicked": false, "needsTrustedInput": true, "nx": 0.42, "ny": 0.61, "space": "page" }
+        });
+        assert!(browser_result_needs_trusted_input("click", &click));
+        assert_eq!(browser_trusted_point(&click), Some((0.42, 0.61)));
+        assert_eq!(trusted_browser_native_method("click"), Some("click"));
+        assert_eq!(trusted_browser_native_method("type"), Some("typeText"));
+        assert_eq!(trusted_browser_native_method("dblclick"), Some("doubleClick"));
+        let ordinary = serde_json::json!({ "ok": true, "result": { "clicked": true, "nx": 0.2, "ny": 0.3 } });
+        assert!(!browser_result_needs_trusted_input("click", &ordinary));
+        let typed = serde_json::json!({ "ok": true, "result": { "typed": false, "verified": false, "nx": 0.5, "ny": 0.5 } });
+        assert!(browser_result_needs_trusted_input("type", &typed));
+        let merged = merge_trusted_browser_result(
+            click,
+            serde_json::json!({ "how": "humanClick", "targetName": "Post", "clicked": true }),
+        );
+        let result = merged.get("result").unwrap();
+        assert_eq!(result.get("trustedInput"), Some(&Value::Bool(true)));
+        assert_eq!(result.get("how").and_then(Value::as_str), Some("humanClick"));
+        assert_eq!(result.get("needsTrustedInput"), Some(&Value::Bool(false)));
+        let digest = planner_result_digest(&merged);
+        assert!(digest.contains("[humanClick]"));
     }
     #[test]
     fn planner_prompt_guides_app_choice_when_none_listed() {
@@ -7797,6 +8019,8 @@ mod tests {
         );
         assert!(prompt.contains("infer them from the goal"));
         assert!(prompt.contains("listApplications"));
+        assert!(prompt.contains("real Windows cursor and keyboard"));
+        assert!(prompt.contains("pick one exact name"));
     }
     #[test]
     fn accepts_planner_plan_outline_replies() {

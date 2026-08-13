@@ -468,6 +468,35 @@
     throw new Error("Element reference expired; observe or find the page again.");
   };
 
+  const viewportBox = (element) => {
+    const view = ownerView(element);
+    const rect = element.getBoundingClientRect();
+    const width = Math.max(1, view?.innerWidth || 0);
+    const height = Math.max(1, view?.innerHeight || 0);
+    const nx = (rect.x + rect.width / 2) / width;
+    const ny = (rect.y + rect.height / 2) / height;
+    if (!Number.isFinite(nx) || !Number.isFinite(ny) || nx < 0 || nx > 1 || ny < 0 || ny > 1) {
+      return null;
+    }
+    return { nx: Number(nx.toFixed(4)), ny: Number(ny.toFixed(4)), space: "page" };
+  };
+
+  const isContentEditable = (element) => {
+    const value = element.getAttribute?.("contenteditable");
+    return element.isContentEditable || value === "true" || value === "";
+  };
+
+  const prefersTrustedInput = (element) => {
+    const role = (element.getAttribute("role") || "").toLowerCase();
+    const tag = (element.tagName || "").toLowerCase();
+    return isContentEditable(element) || role === "textbox" || tag === "canvas";
+  };
+
+  const withBox = (result, element) => {
+    const box = viewportBox(element);
+    return box ? { ...result, ...box } : result;
+  };
+
   const pointerOpts = (element, extra = {}) => {
     const rect = element.getBoundingClientRect();
     return {
@@ -500,15 +529,21 @@
   const clickElement = (element) => {
     element.scrollIntoView({ block: "center", inline: "nearest" });
     requireEnabled(element);
+    if (prefersTrustedInput(element)) {
+      return withBox({ clicked: false, needsTrustedInput: true, reason: "contenteditable" }, element);
+    }
     dispatchPointer(element, "mousedown", { detail: 1 });
     dispatchPointer(element, "mouseup", { detail: 1 });
     element.click();
-    return { clicked: true };
+    return withBox({ clicked: true, untrusted: true }, element);
   };
 
   const doubleClickElement = (element) => {
     element.scrollIntoView({ block: "center", inline: "nearest" });
     requireEnabled(element);
+    if (prefersTrustedInput(element)) {
+      return withBox({ dblclicked: false, needsTrustedInput: true, reason: "contenteditable" }, element);
+    }
     dispatchPointer(element, "mousedown", { detail: 1 });
     dispatchPointer(element, "mouseup", { detail: 1 });
     dispatchPointer(element, "click", { detail: 1 });
@@ -516,7 +551,7 @@
     dispatchPointer(element, "mouseup", { detail: 2 });
     dispatchPointer(element, "click", { detail: 2 });
     dispatchPointer(element, "dblclick", { detail: 2 });
-    return { dblclicked: true };
+    return withBox({ dblclicked: true, untrusted: true }, element);
   };
 
   const setNativeValue = (element, text) => {
@@ -541,6 +576,12 @@
     }
     element.scrollIntoView({ block: "center", inline: "nearest" });
     element.focus();
+    if (prefersTrustedInput(element)) {
+      return withBox(
+        { typed: false, verified: false, needsTrustedInput: true, reason: "contenteditable", characters: text.length },
+        element
+      );
+    }
     setNativeValue(element, text);
     const view = ownerView(element);
     const Input = view.InputEvent || InputEvent;
@@ -548,9 +589,12 @@
     element.dispatchEvent(new view.Event("change", { bubbles: true }));
     const observed = "value" in element ? String(element.value || "") : element.innerText || "";
     if (text && !observed.includes(text) && observed !== text) {
-      throw new Error("The field did not accept the typed text.");
+      return withBox(
+        { typed: false, verified: false, needsTrustedInput: true, reason: "unverified", characters: text.length },
+        element
+      );
     }
-    return { typed: true, verified: true, characters: text.length };
+    return withBox({ typed: true, verified: true, characters: text.length }, element);
   };
 
   chrome.runtime.onMessage.addListener((message, _sender, respond) => {
@@ -589,7 +633,7 @@
           element.dispatchEvent(new Pointer("pointerenter", { bubbles: true, view }));
           element.dispatchEvent(new Mouse("mouseenter", { bubbles: true, view }));
           dispatchPointer(element, "mousemove");
-          return { hovered: true };
+          return withBox({ hovered: true, untrusted: true }, element);
         }
         if (message.method === "type") return typeElement(element, String(message.text ?? ""));
         if (message.method === "getText") {

@@ -152,7 +152,7 @@ internal static partial class Program
 
     private static object Dispatch(HostRequest request) => request.Method switch
     {
-        "health" => new { host = "windows", version = "0.2.0", processId = Environment.ProcessId },
+        "health" => new { host = "windows", version = "0.3.0", processId = Environment.ProcessId },
         "listApplications" => ListApplications(),
         "listInstalledApplications" => ListInstalledApplications(),
         "resolveApplication" => ResolveApplication(GetString(request.Params, "name")),
@@ -236,9 +236,54 @@ internal static partial class Program
         .Select(name => new { name })
         .ToArray();
 
-    private static string? FindStartMenuShortcut(string application) => StartMenuApplications()
-        .FirstOrDefault(item => item.Name.Equals(application, StringComparison.OrdinalIgnoreCase))
-        .Path;
+    internal static int ScoreInstalledName(string requested, string candidate)
+    {
+        var wanted = (requested ?? "").Trim();
+        var name = (candidate ?? "").Trim();
+        if (wanted.Length == 0 || name.Length == 0) return 0;
+        if (wanted.Equals(name, StringComparison.OrdinalIgnoreCase)) return 1000;
+        var wantedNorm = NormalizeText(wanted);
+        var nameNorm = NormalizeText(name);
+        if (wantedNorm.Length == 0 || nameNorm.Length == 0) return 0;
+        if (wantedNorm == nameNorm) return 900;
+        if (nameNorm.StartsWith(wantedNorm, StringComparison.Ordinal) || wantedNorm.StartsWith(nameNorm, StringComparison.Ordinal))
+            return 700 + Math.Min(wantedNorm.Length, nameNorm.Length);
+        if (nameNorm.Contains(wantedNorm, StringComparison.Ordinal)) return 500 + wantedNorm.Length;
+        if (wantedNorm.Contains(nameNorm, StringComparison.Ordinal) && nameNorm.Length >= 4) return 400 + nameNorm.Length;
+        var tokens = wantedNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries).Where(token => token.Length >= 3).ToArray();
+        if (tokens.Length == 0) return 0;
+        var hit = tokens.Count(token => nameNorm.Contains(token, StringComparison.Ordinal));
+        if (hit == 0) return 0;
+        var score = hit * 80;
+        if (hit == tokens.Length) score += 200;
+        return score;
+    }
+
+    private static (string Name, string Path)? ResolveInstalledLaunch(string application, out string[] candidates)
+    {
+        candidates = [];
+        if (LaunchTargets.ContainsKey(application))
+            return (application, LaunchTargets[application]);
+
+        var installed = StartMenuApplications();
+        var exact = installed.FirstOrDefault(item => item.Name.Equals(application, StringComparison.OrdinalIgnoreCase));
+        if (!string.IsNullOrWhiteSpace(exact.Path))
+            return (exact.Name, exact.Path);
+
+        var scored = installed
+            .Select(item => (item.Name, item.Path, Score: ScoreInstalledName(application, item.Name)))
+            .Where(item => item.Score >= 200)
+            .OrderByDescending(item => item.Score)
+            .ThenBy(item => item.Name.Length)
+            .Take(5)
+            .ToArray();
+        candidates = scored.Select(item => item.Name).ToArray();
+        if (scored.Length == 0) return null;
+        var best = scored[0];
+        var unique = scored.Length == 1
+            || (best.Score >= 500 && (scored.Length < 2 || best.Score >= scored[1].Score + 150));
+        return unique ? (best.Name, best.Path) : null;
+    }
 
     // Token-scored name-to-window resolution used by Alfred Core for preflight and
     // state conditions. LaunchTargets names resolve through their executable name.
@@ -279,19 +324,23 @@ internal static partial class Program
 
     private static object LaunchApplication(HostRequest request)
     {
-        var application = GetApplication(request);
-        var target = LaunchTargets.TryGetValue(application, out var executable)
-            ? executable
-            : FindStartMenuShortcut(application);
-        if (string.IsNullOrWhiteSpace(target))
-            throw new UnauthorizedAccessException($"{application} is not an exact installed Start-menu application.");
+        var requested = GetApplication(request);
+        var resolved = ResolveInstalledLaunch(requested, out var candidates);
+        if (resolved is null)
+        {
+            throw new UnauthorizedAccessException(candidates.Length > 0
+                ? $"{requested} is ambiguous. Choose one exact installed name: {string.Join(", ", candidates)}."
+                : $"{requested} is not an exact installed Start-menu application.");
+        }
+        var application = resolved.Value.Name;
+        var target = resolved.Value.Path;
         var existing = FindApplicationProcess(application);
         if (existing is not null)
         {
             try
             {
                 FocusProcess(existing);
-                return new { launched = false, alreadyRunning = true, application, processId = existing.Id, title = existing.MainWindowTitle };
+                return new { launched = false, alreadyRunning = true, application, requested, processId = existing.Id, title = existing.MainWindowTitle };
             }
             finally { existing.Dispose(); }
         }
@@ -312,7 +361,7 @@ internal static partial class Program
                     ?? throw new InvalidOperationException($"{application} launched without an accessible window.");
             }
             FocusProcess(process);
-            return new { launched = true, application, processId = process.Id, title = process.MainWindowTitle };
+            return new { launched = true, application, requested, processId = process.Id, title = process.MainWindowTitle };
         }
         finally { process.Dispose(); }
     }
@@ -361,8 +410,7 @@ internal static partial class Program
                 VirtualKeyInput(letterA, true),
                 VirtualKeyInput(control, true)
             ]);
-            foreach (var character in url)
-                Send([KeyboardInput(character, false), KeyboardInput(character, true)]);
+            HumanTypeCharacters(url);
         }
         Thread.Sleep(100);
         var enteredUrl = ReadElementText(addressBar);
@@ -675,19 +723,46 @@ internal static partial class Program
         var process = ResolveProcess(request);
         FocusProcess(process);
         var element = ResolveTargetElement(request, requireMark: false);
-        if (!element.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern))
-            throw new InvalidOperationException("The UI element does not accept direct values; use activate plus typeText.");
-        ((ValuePattern)pattern).SetValue(value);
-        Thread.Sleep(100);
-        var observed = ReadElementText(element);
-        if (!TextAppearsExactlyOnce(observed, value))
+        if (element.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern)
+            && !((ValuePattern)pattern).Current.IsReadOnly)
+        {
+            ((ValuePattern)pattern).SetValue(value);
+            Thread.Sleep(100);
+            var observed = ReadElementText(element);
+            if (TextAppearsExactlyOnce(observed, value))
+            {
+                return new
+                {
+                    set = true,
+                    verified = true,
+                    how = "setValue",
+                    characters = value.Length,
+                    observedText = Truncate(observed, 500),
+                    targetName = element.Current.Name,
+                    controlType = element.Current.ControlType?.ProgrammaticName,
+                    mark = GetOptionalString(request.Params, "mark")
+                };
+            }
+        }
+        try { element.SetFocus(); } catch { }
+        var bounds = element.Current.BoundingRectangle;
+        if (bounds.Width > 2 && bounds.Height > 2)
+            HumanLeftClick(process.Id, (int)Math.Round(bounds.Left + bounds.Width / 2), (int)Math.Round(bounds.Top + bounds.Height / 2));
+        Thread.Sleep(80);
+        SelectAllInFocusedControl();
+        Thread.Sleep(50);
+        HumanTypeCharacters(value);
+        Thread.Sleep(150);
+        var typed = ReadTargetSubtreeText(element);
+        if (!TextAppearsExactlyOnce(typed, value))
             throw new InvalidOperationException("The value action returned, but the requested text was not present in the target control.");
         return new
         {
             set = true,
             verified = true,
+            how = "humanType",
             characters = value.Length,
-            observedText = Truncate(observed, 500),
+            observedText = Truncate(typed, 500),
             targetName = element.Current.Name,
             controlType = element.Current.ControlType?.ProgrammaticName,
             mark = GetOptionalString(request.Params, "mark")
@@ -1004,7 +1079,7 @@ internal static partial class Program
         {
             (x, y) = CenterOf(markElement);
         }
-        else if (TryNormalizedPoint(request, process, out x, out y))
+        else if (TryPageOrWindowPoint(request, process, out x, out y))
         {
             // Window-relative 0–1 point from a screenshot / probe. Still retarget
             // onto a matching UIA control when one sits under the pixel.
@@ -1050,11 +1125,11 @@ internal static partial class Program
             catch { /* The hit-test node can vanish before the click. */ }
         }
         RequireInsideWindow(process.Id, x, y);
-        SetCursorPos(x, y);
-        Send([MouseInput(MOUSEEVENTF_LEFTDOWN), MouseInput(MOUSEEVENTF_LEFTUP)]);
+        HumanLeftClick(process.Id, x, y);
         return new
         {
             clicked = true,
+            how = "humanClick",
             x,
             y,
             mark = GetOptionalString(request.Params, "mark"),
@@ -1072,22 +1147,32 @@ internal static partial class Program
             throw new InvalidOperationException("The requested text contains likely UTF-8 mojibake. Alfred will not submit corrupted content; the planner must regenerate the original Unicode or plain-ASCII text.");
         var process = ResolveProcess(request);
         FocusProcess(process);
-        var target = TryResolveMark(request) ?? FindTypingTarget(process, request);
+        var target = TryResolveMark(request);
+        var usedPagePoint = false;
+        if (target is null && TryPageOrWindowPoint(request, process, out var pageX, out var pageY))
+        {
+            usedPagePoint = true;
+            HumanLeftClick(process.Id, pageX, pageY);
+            Thread.Sleep(80);
+            target = AutomationElement.FocusedElement;
+            if (target is null || target.Current.ProcessId != process.Id)
+                target = HitTest(pageX, pageY);
+        }
+        target ??= FindTypingTarget(process, request);
         var type = target.Current.ControlType;
         var writable = type == ControlType.Edit
             || type == ControlType.Document
+            || type == ControlType.Custom
             || (target.TryGetCurrentPattern(ValuePattern.Pattern, out var editable)
                 && editable is ValuePattern value
                 && !value.Current.IsReadOnly);
-        if (!writable)
+        if (!writable && !usedPagePoint)
             throw new InvalidOperationException("typeText requires an editable control; the supplied mark is not writable.");
-        target.SetFocus();
+        try { target.SetFocus(); } catch { /* Canvas / custom editors may reject SetFocus. */ }
         var bounds = target.Current.BoundingRectangle;
-        SetCursorPos(
-            (int)Math.Round(bounds.Left + bounds.Width / 2),
-            (int)Math.Round(bounds.Top + bounds.Height / 2));
-        Send([MouseInput(MOUSEEVENTF_LEFTDOWN), MouseInput(MOUSEEVENTF_LEFTUP)]);
-        Thread.Sleep(100);
+        if (bounds.Width > 2 && bounds.Height > 2)
+            HumanLeftClick(process.Id, (int)Math.Round(bounds.Left + bounds.Width / 2), (int)Math.Round(bounds.Top + bounds.Height / 2));
+        Thread.Sleep(80);
         var focused = AutomationElement.FocusedElement;
         if (focused is null || focused.Current.ProcessId != process.Id)
             throw new InvalidOperationException("The intended text target did not receive keyboard focus.");
@@ -1104,6 +1189,7 @@ internal static partial class Program
                 typed = false,
                 alreadyPresent = true,
                 verified = true,
+                how = "alreadyPresent",
                 characters = text.Length,
                 observedText = Truncate(before, 500),
                 targetName = target.Current.Name,
@@ -1113,31 +1199,43 @@ internal static partial class Program
         }
 
         var usedDirectValue = false;
-        if (target.TryGetCurrentPattern(ValuePattern.Pattern, out var valuePattern)
+        var preferKeyboard = usedPagePoint
+            || type == ControlType.Document
+            || type == ControlType.Custom
+            || GetOptionalString(request.Params, "input") is "human";
+        if (!preferKeyboard
+            && target.TryGetCurrentPattern(ValuePattern.Pattern, out var valuePattern)
             && !((ValuePattern)valuePattern).Current.IsReadOnly)
         {
             ((ValuePattern)valuePattern).SetValue(text);
             usedDirectValue = true;
+            Thread.Sleep(150);
+            if (!TextAppearsExactlyOnce(ReadTargetSubtreeText(target), text))
+            {
+                usedDirectValue = false;
+                preferKeyboard = true;
+            }
         }
-        else
+        if (!usedDirectValue)
         {
             // Replacement semantics make retries safe. A previous attempt may
             // have changed the control even if readback timed out; selecting the
             // focused editor prevents appending a second/interleaved version.
             SelectAllInFocusedControl();
             Thread.Sleep(50);
-            foreach (var character in text)
-                Send([KeyboardInput(character, false), KeyboardInput(character, true)]);
+            HumanTypeCharacters(text);
         }
         Thread.Sleep(150);
         var observed = ReadTargetSubtreeText(target);
-        if (!TextAppearsExactlyOnce(observed, text))
+        var verified = TextAppearsExactlyOnce(observed, text);
+        if (!verified && !usedPagePoint)
             throw new InvalidOperationException("The target was updated, but it does not contain exactly one verified copy of the requested text. Alfred will not append or submit it.");
         return new
         {
             typed = true,
-            verified = true,
+            verified,
             usedDirectValue,
+            how = usedDirectValue ? "setValue" : "humanType",
             characters = text.Length,
             observedText = Truncate(observed, 500),
             targetName = target.Current.Name,
@@ -1153,8 +1251,8 @@ internal static partial class Program
         if (!AllowedVirtualKeys.Contains(virtualKey))
             throw new InvalidOperationException($"Virtual key 0x{virtualKey:X2} is not in Alfred's allowed key set.");
         FocusProcess(ResolveProcess(request));
-        Send([VirtualKeyInput((ushort)virtualKey, false), VirtualKeyInput((ushort)virtualKey, true)]);
-        return new { pressed = true, virtualKey };
+        HumanPressVirtualKey((ushort)virtualKey);
+        return new { pressed = true, how = "humanKey", virtualKey };
     }
 
     private static object PressShortcut(HostRequest request, string keys)
@@ -1162,14 +1260,8 @@ internal static partial class Program
         if (!AllowedShortcuts.TryGetValue(keys.Trim(), out var virtualKey))
             throw new InvalidOperationException($"Shortcut {keys} is not in Alfred's allowed shortcut set.");
         FocusProcess(ResolveProcess(request));
-        const ushort control = 0x11;
-        Send([
-            VirtualKeyInput(control, false),
-            VirtualKeyInput(virtualKey, false),
-            VirtualKeyInput(virtualKey, true),
-            VirtualKeyInput(control, true)
-        ]);
-        return new { pressed = true, keys = keys.ToUpperInvariant() };
+        HumanPressShortcut(virtualKey);
+        return new { pressed = true, how = "humanShortcut", keys = keys.ToUpperInvariant() };
     }
 
     private static int GetInt(JsonElement? value, string property) =>
