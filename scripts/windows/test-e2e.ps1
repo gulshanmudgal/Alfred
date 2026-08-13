@@ -11,8 +11,7 @@ if (-not $HostPath) {
   # was built or launched from the share.
   $HostSource = Join-Path $env:LOCALAPPDATA "Alfred\test-host"
   New-Item -ItemType Directory -Force -Path $HostSource | Out-Null
-  Copy-Item (Join-Path $root "native\windows-host\Program.cs") $HostSource -Force
-  Copy-Item (Join-Path $root "native\windows-host\Marks.cs") $HostSource -Force
+  Copy-Item (Join-Path $root "native\windows-host\*.cs") $HostSource -Force
   Copy-Item (Join-Path $root "native\windows-host\Alfred.WindowsHost.csproj") $HostSource -Force
   $HostProject = Join-Path $HostSource "Alfred.WindowsHost.csproj"
   dotnet build $HostProject -c Debug
@@ -56,11 +55,17 @@ try {
 
   # The planner may name installed apps, but never an executable path or command.
   $blockedLaunch = Invoke-AlfredHost "launchApplication" @{} "launch application" "Executable path" "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
-  if ($blockedLaunch.ok -or $blockedLaunch.error -notmatch "not an exact installed Start-menu application") { throw "Executable-path launch was not rejected." }
+  if ($blockedLaunch.ok -or $blockedLaunch.error -notmatch "not an installed application") { throw "Executable-path launch was not rejected." }
   Write-Host "PASS exact Start-menu application boundary"
 
   $installed = Invoke-AlfredHost "listInstalledApplications"
   if (-not $installed.ok -or -not ($installed.result | Where-Object { $_.name -eq "Notepad" })) { throw "Installed application discovery did not include Notepad." }
+  $notepadQuery = Invoke-AlfredHost "listInstalledApplications" @{ query = "note" }
+  if (-not $notepadQuery.ok -or -not ($notepadQuery.result | Where-Object { $_.name -eq "Notepad" })) {
+    throw "Installed application query did not return Notepad."
+  }
+  $storeQuery = Invoke-AlfredHost "listInstalledApplications" @{ query = "microsoft store" }
+  if (-not $storeQuery.ok) { throw "Installed application query for Microsoft Store failed." }
   Write-Host "PASS installed application discovery"
 
   $blockedDeleteKey = Invoke-AlfredHost "key" @{ virtualKey = 46 } "press key" "Keyboard input" "Notepad"
@@ -124,6 +129,9 @@ try {
     if (-not $replaced.ok -or -not $replaced.result.verified -or $replaced.result.observedText -ne $unicodeText) {
       throw "Unicode text was corrupted, duplicated, or not verified in the intended control: $($replaced.error)"
     }
+    $waited = Invoke-AlfredHost "wait" @{ text = "Alfred Windows UTF-8"; timeoutMs = 4000; processId = $notepadId } "wait for typed Notepad text" "Editor" "Notepad"
+    if (-not $waited.ok -or -not $waited.result.found) { throw "wait did not find the typed Notepad text: $($waited.error)" }
+    Write-Host "PASS native wait"
     if (-not (Invoke-AlfredHost "key" @{ virtualKey = 13; processId = $notepadId } "press enter" "Editor" "Notepad").ok) { throw "Allowed key (Enter) was rejected." }
     $outside = Invoke-AlfredHost "click" @{ x = -32000; y = -32000; processId = $notepadId } "click target" "Editor" "Notepad"
     if ($outside.ok) { throw "A click outside the target window bounds was not refused." }
@@ -149,6 +157,41 @@ try {
       throw "Live destructive name Empty Recycle Bin was not refused: $($emptyBin.error)"
     }
     Write-Host "PASS targeted input postcondition, bounds validation, key allow-list, and per-process marks"
+    $uwpNames = @("Settings", "Microsoft Store") | ForEach-Object {
+      $wanted = $_
+      @($installed.result) | Where-Object { $_.name -eq $wanted } | Select-Object -First 1
+    }
+    if ($uwpNames.Count -eq 0) {
+      Write-Host "SKIP UWP launch; Settings/Microsoft Store were not in the installed catalog"
+    }
+    foreach ($settingsName in $uwpNames) {
+      $uwp = Invoke-AlfredHost "launchApplication" @{} "launch UWP inbox app" $settingsName.name $settingsName.name
+      if (-not $uwp.ok -or -not $uwp.result.processId) { throw "Could not launch $($settingsName.name): $($uwp.error)" }
+      $uwpWait = Invoke-AlfredHost "wait" @{ text = $settingsName.name; timeoutMs = 12000 } "wait for UWP window" $settingsName.name $settingsName.name
+      if (-not $uwpWait.ok) { throw "wait after $($settingsName.name) launch failed: $($uwpWait.error)" }
+      $uwpObserve = Invoke-AlfredHost "observeWindow" @{ processId = [int]$uwp.result.processId } "observe UWP inbox app" $settingsName.name $settingsName.name
+      if (-not $uwpObserve.ok) { throw "$($settingsName.name) observe failed: $($uwpObserve.error)" }
+      if (-not $uwpObserve.result.marks) { throw "$($settingsName.name) observe returned no marks." }
+      Write-Host "PASS UWP launch and observe: $($settingsName.name)"
+      $searchMark = @($uwpObserve.result.marks) | Where-Object { $_.name -match 'Search' } | Select-Object -First 1
+      if (-not $searchMark) {
+        Write-Host "SKIP UWP search type for $($settingsName.name); no Search mark"
+      }
+      else {
+        $query = if ($settingsName.name -eq "Microsoft Store") { "Calculator" } else { "Display" }
+        $uwpPid = [int]$uwp.result.processId
+        $typedSearch = Invoke-AlfredHost "typeText" @{ text = $query; mark = $searchMark.id; processId = $uwpPid } "type into UWP search" "Search" $settingsName.name
+        if (-not $typedSearch.ok -or -not $typedSearch.result.verified) {
+          throw "$($settingsName.name) search type failed: $($typedSearch.error)"
+        }
+        $null = Invoke-AlfredHost "key" @{ virtualKey = 13; processId = $uwpPid } "submit UWP search" "Search" $settingsName.name
+        $searchWait = Invoke-AlfredHost "wait" @{ text = $query; timeoutMs = 10000; processId = $uwpPid } "wait for UWP search results" $query $settingsName.name
+        if (-not $searchWait.ok -or -not $searchWait.result.found) {
+          throw "$($settingsName.name) search did not show ${query}: $($searchWait.error)"
+        }
+        Write-Host "PASS UWP search type: $($settingsName.name)"
+      }
+    }
     $badNavigation = Invoke-AlfredHost "navigateApplication" @{ url = "file:///C:/Windows/System32/cmd.exe"; processId = $notepadId } "navigate outside HTTP" "Address bar" "Notepad"
     if ($badNavigation.ok) { throw "Native navigation accepted a non-browser application and non-HTTP URL." }
     $badCredentialUrl = Invoke-AlfredHost "navigateApplication" @{ url = "https://user:secret@example.com"; processId = $notepadId } "navigate credential URL" "Address bar" "Microsoft Edge"

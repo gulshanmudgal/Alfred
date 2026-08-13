@@ -24,8 +24,8 @@ internal static partial class Program
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     private static readonly string ExpectedToken = Environment.GetEnvironmentVariable("ALFRED_CAPABILITY_TOKEN") ?? "";
     // Stable Windows inbox/browser aliases. Other applications are launchable
-    // only when an exact Start-menu shortcut is installed; the planner can never
-    // supply an executable path or arbitrary command line.
+    // only when an exact Start-menu or AppsFolder name is installed; the planner
+    // can never supply an executable path or arbitrary command line.
     private static readonly IReadOnlyDictionary<string, string> LaunchTargets = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
     {
         ["Notepad"] = "notepad.exe",
@@ -34,7 +34,10 @@ internal static partial class Program
         ["File Explorer"] = "explorer.exe",
         ["Microsoft Edge"] = "msedge.exe",
         ["Google Chrome"] = "chrome.exe",
-        ["Brave"] = "brave.exe"
+        ["Brave"] = "brave.exe",
+        ["Windows Terminal"] = "wt.exe",
+        ["Microsoft Store"] = "ms-windows-store:",
+        ["Settings"] = "ms-settings:"
     };
     private static readonly HashSet<string> BrowserApplications = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -59,7 +62,13 @@ internal static partial class Program
             ["CTRL+S"] = 0x53  // Save / Save As
         };
 
+    private const int SW_SHOW = 5;
     private const int SW_RESTORE = 9;
+    private static readonly IntPtr HWND_TOPMOST = new(-1);
+    private static readonly IntPtr HWND_NOTOPMOST = new(-2);
+    private const uint SWP_NOSIZE = 0x0001;
+    private const uint SWP_NOMOVE = 0x0002;
+    private const uint SWP_SHOWWINDOW = 0x0040;
     private const uint PW_RENDERFULLCONTENT = 0x00000002;
     // The Rust planner keeps at most 40 interesting controls from an observation.
     // Bound the raw UIA snapshot as well: modern Windows apps can expose thousands
@@ -152,9 +161,9 @@ internal static partial class Program
 
     private static object Dispatch(HostRequest request) => request.Method switch
     {
-        "health" => new { host = "windows", version = "0.3.0", processId = Environment.ProcessId },
+        "health" => new { host = "windows", version = "0.4.0", processId = Environment.ProcessId },
         "listApplications" => ListApplications(),
-        "listInstalledApplications" => ListInstalledApplications(),
+        "listInstalledApplications" => ListInstalledApplications(request),
         "resolveApplication" => ResolveApplication(GetString(request.Params, "name")),
         "launchApplication" => LaunchApplication(request),
         "focusApplication" => FocusApplication(request),
@@ -176,21 +185,25 @@ internal static partial class Program
         "doubleClick" => PointerGesture(request, "doubleClick"),
         "hover" => PointerGesture(request, "hover"),
         "drag" => Drag(request),
+        "wait" => WaitFor(request),
         _ => throw new InvalidOperationException($"Unsupported host method: {request.Method}")
     };
 
     private static object ListApplications()
     {
         var items = new List<(int id, string name, string title)>();
-        foreach (var process in Process.GetProcesses())
+        var seen = new HashSet<int>();
+        foreach (var window in EnumerateTopWindows())
         {
             try
             {
-                if (process.MainWindowHandle == IntPtr.Zero) continue;
-                items.Add((process.Id, process.ProcessName ?? "", process.MainWindowTitle ?? ""));
+                using var process = Process.GetProcessById(window.ProcessId);
+                var processName = process.ProcessName ?? "";
+                if (processName.StartsWith("alfred", StringComparison.OrdinalIgnoreCase)) continue;
+                if (!seen.Add(window.ProcessId)) continue;
+                items.Add((window.ProcessId, processName, window.Title));
             }
             catch { /* The process exited or denies access; skip it. */ }
-            finally { process.Dispose(); }
         }
         PruneDeadMarks();
         return items.OrderBy(item => item.name)
@@ -199,178 +212,18 @@ internal static partial class Program
             .ToArray();
     }
 
-    private static IEnumerable<string> StartMenuRoots()
-    {
-        var common = Environment.GetFolderPath(Environment.SpecialFolder.CommonStartMenu);
-        var user = Environment.GetFolderPath(Environment.SpecialFolder.StartMenu);
-        if (!string.IsNullOrWhiteSpace(common)) yield return Path.Combine(common, "Programs");
-        if (!string.IsNullOrWhiteSpace(user)) yield return Path.Combine(user, "Programs");
-    }
-
-    private static IReadOnlyList<(string Name, string Path)> StartMenuApplications()
-    {
-        var applications = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var root in StartMenuRoots())
-        {
-            if (!Directory.Exists(root)) continue;
-            try
-            {
-                foreach (var path in Directory.EnumerateFiles(root, "*.lnk", SearchOption.AllDirectories))
-                {
-                    var name = Path.GetFileNameWithoutExtension(path).Trim();
-                    if (!string.IsNullOrWhiteSpace(name)) applications.TryAdd(name, path);
-                }
-            }
-            catch { /* A vendor-owned Start-menu folder may deny traversal. */ }
-        }
-        return applications.OrderBy(item => item.Key)
-            .Select(item => (item.Key, item.Value)).ToArray();
-    }
-
-    private static object ListInstalledApplications() => StartMenuApplications()
-        .Select(item => item.Name)
-        .Concat(LaunchTargets.Keys)
-        .Distinct(StringComparer.OrdinalIgnoreCase)
-        .OrderBy(name => name)
-        .Take(300)
-        .Select(name => new { name })
-        .ToArray();
-
-    internal static int ScoreInstalledName(string requested, string candidate)
-    {
-        var wanted = (requested ?? "").Trim();
-        var name = (candidate ?? "").Trim();
-        if (wanted.Length == 0 || name.Length == 0) return 0;
-        if (wanted.Equals(name, StringComparison.OrdinalIgnoreCase)) return 1000;
-        var wantedNorm = NormalizeText(wanted);
-        var nameNorm = NormalizeText(name);
-        if (wantedNorm.Length == 0 || nameNorm.Length == 0) return 0;
-        if (wantedNorm == nameNorm) return 900;
-        if (nameNorm.StartsWith(wantedNorm, StringComparison.Ordinal) || wantedNorm.StartsWith(nameNorm, StringComparison.Ordinal))
-            return 700 + Math.Min(wantedNorm.Length, nameNorm.Length);
-        if (nameNorm.Contains(wantedNorm, StringComparison.Ordinal)) return 500 + wantedNorm.Length;
-        if (wantedNorm.Contains(nameNorm, StringComparison.Ordinal) && nameNorm.Length >= 4) return 400 + nameNorm.Length;
-        var tokens = wantedNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries).Where(token => token.Length >= 3).ToArray();
-        if (tokens.Length == 0) return 0;
-        var hit = tokens.Count(token => nameNorm.Contains(token, StringComparison.Ordinal));
-        if (hit == 0) return 0;
-        var score = hit * 80;
-        if (hit == tokens.Length) score += 200;
-        return score;
-    }
-
-    private static (string Name, string Path)? ResolveInstalledLaunch(string application, out string[] candidates)
-    {
-        candidates = [];
-        if (LaunchTargets.ContainsKey(application))
-            return (application, LaunchTargets[application]);
-
-        var installed = StartMenuApplications();
-        var exact = installed.FirstOrDefault(item => item.Name.Equals(application, StringComparison.OrdinalIgnoreCase));
-        if (!string.IsNullOrWhiteSpace(exact.Path))
-            return (exact.Name, exact.Path);
-
-        var scored = installed
-            .Select(item => (item.Name, item.Path, Score: ScoreInstalledName(application, item.Name)))
-            .Where(item => item.Score >= 200)
-            .OrderByDescending(item => item.Score)
-            .ThenBy(item => item.Name.Length)
-            .Take(5)
-            .ToArray();
-        candidates = scored.Select(item => item.Name).ToArray();
-        if (scored.Length == 0) return null;
-        var best = scored[0];
-        var unique = scored.Length == 1
-            || (best.Score >= 500 && (scored.Length < 2 || best.Score >= scored[1].Score + 150));
-        return unique ? (best.Name, best.Path) : null;
-    }
-
-    // Token-scored name-to-window resolution used by Alfred Core for preflight and
-    // state conditions. LaunchTargets names resolve through their executable name.
-    private static object ResolveApplication(string name)
-    {
-        var tokens = name.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Where(token => token.Length >= 3)
-            .Select(token => token.ToLowerInvariant())
-            .ToArray();
-        if (tokens.Length == 0)
-            throw new InvalidOperationException("An application name is required to resolve a window.");
-        var lowered = name.ToLowerInvariant();
-        (int id, string name, string title, int score)? best = null;
-        foreach (var process in Process.GetProcesses())
-        {
-            try
-            {
-                if (process.MainWindowHandle == IntPtr.Zero) continue;
-                var processName = (process.ProcessName ?? "").ToLowerInvariant();
-                var title = (process.MainWindowTitle ?? "").ToLowerInvariant();
-                var score = processName == lowered ? 100 : 0;
-                foreach (var token in tokens)
-                {
-                    if (processName.Contains(token)) score += 10;
-                    if (title.Contains(token)) score += 5;
-                }
-                if (score == 0) continue;
-                if (best is null || score > best.Value.score)
-                    best = (process.Id, process.ProcessName ?? "", process.MainWindowTitle ?? "", score);
-            }
-            catch { /* The process exited or denies access; skip it. */ }
-            finally { process.Dispose(); }
-        }
-        if (best is null)
-            throw new InvalidOperationException($"No running application window matches \"{name}\".");
-        return new { processId = best.Value.id, name = best.Value.name, title = best.Value.title, matched = name };
-    }
-
-    private static object LaunchApplication(HostRequest request)
-    {
-        var requested = GetApplication(request);
-        var resolved = ResolveInstalledLaunch(requested, out var candidates);
-        if (resolved is null)
-        {
-            throw new UnauthorizedAccessException(candidates.Length > 0
-                ? $"{requested} is ambiguous. Choose one exact installed name: {string.Join(", ", candidates)}."
-                : $"{requested} is not an exact installed Start-menu application.");
-        }
-        var application = resolved.Value.Name;
-        var target = resolved.Value.Path;
-        var existing = FindApplicationProcess(application);
-        if (existing is not null)
-        {
-            try
-            {
-                FocusProcess(existing);
-                return new { launched = false, alreadyRunning = true, application, requested, processId = existing.Id, title = existing.MainWindowTitle };
-            }
-            finally { existing.Dispose(); }
-        }
-        var process = Process.Start(new ProcessStartInfo(target) { UseShellExecute = true })
-            ?? throw new InvalidOperationException($"Windows could not launch {application}.");
-        try
-        {
-            try { process.WaitForInputIdle(5000); } catch { }
-            for (var attempt = 0; attempt < 40 && process.MainWindowHandle == IntPtr.Zero; attempt++)
-            {
-                Thread.Sleep(100);
-                process.Refresh();
-            }
-            if (process.MainWindowHandle == IntPtr.Zero)
-            {
-                process.Dispose();
-                process = FindApplicationProcess(application)
-                    ?? throw new InvalidOperationException($"{application} launched without an accessible window.");
-            }
-            FocusProcess(process);
-            return new { launched = true, application, requested, processId = process.Id, title = process.MainWindowTitle };
-        }
-        finally { process.Dispose(); }
-    }
-
     private static object FocusApplication(HostRequest request)
     {
         var process = ResolveProcess(request);
-        FocusProcess(process);
-        return new { focused = true, application = GetApplication(request), processId = process.Id, title = process.MainWindowTitle };
+        var application = GetApplication(request);
+        FocusProcess(process, application);
+        return new
+        {
+            focused = true,
+            application,
+            processId = process.Id,
+            title = Truncate(WindowTitle(FindBestWindowHandle(process, application)), 160)
+        };
     }
 
     private static object NavigateApplication(HostRequest request)
@@ -386,12 +239,12 @@ internal static partial class Program
             || !string.IsNullOrEmpty(parsed.UserInfo))
             throw new UnauthorizedAccessException("Native browser navigation accepts only an absolute HTTP(S) URL up to 2048 characters.");
         var process = ResolveProcess(request);
-        FocusProcess(process);
+        FocusProcess(process, application);
         var addressBar = FindBrowserAddressBar(process);
         addressBar.SetFocus();
         Thread.Sleep(100);
         var focused = AutomationElement.FocusedElement;
-        if (focused is null || focused.Current.ProcessId != process.Id || !IsBrowserChromeEditor(focused, process))
+        if (focused is null || !ElementBelongsToProcess(focused, process, application) || !IsBrowserChromeEditor(focused, process))
             throw new InvalidOperationException("The browser address bar did not receive focus; navigation was not sent.");
         var usedDirectValue = false;
         if (addressBar.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern)
@@ -410,7 +263,7 @@ internal static partial class Program
                 VirtualKeyInput(letterA, true),
                 VirtualKeyInput(control, true)
             ]);
-            HumanTypeCharacters(url);
+            HumanTypeCharacters(url, process.Id);
         }
         Thread.Sleep(100);
         var enteredUrl = ReadElementText(addressBar);
@@ -431,18 +284,17 @@ internal static partial class Program
     {
         var process = Process.GetProcessById(processId);
         FocusProcess(process);
-        return new { activated = true, processId, title = process.MainWindowTitle };
+        return new { activated = true, processId, title = Truncate(WindowTitle(FindBestWindowHandle(process, null)), 160) };
     }
 
     // Brings the target window to the foreground and proves it stayed there before
     // any input is sent. UIA SetFocus is attempted first; SetForegroundWindow is
     // retried while Windows settles.
-    private static void FocusProcess(Process process)
+    private static void FocusProcess(Process process, string? application = null)
     {
         process.Refresh();
-        var handle = process.MainWindowHandle;
-        if (handle == IntPtr.Zero)
-            throw new InvalidOperationException("The application does not have an accessible window.");
+        RememberApplication(process.Id, application);
+        var handle = RequireWindowHandle(process, application);
         if (IsIconic(handle)) ShowWindow(handle, SW_RESTORE);
         var deadline = DateTime.UtcNow.AddSeconds(5);
         var lastAttempt = DateTime.MinValue;
@@ -450,7 +302,9 @@ internal static partial class Program
         {
             var foreground = GetForegroundWindow();
             GetWindowThreadProcessId(foreground, out var foregroundPid);
-            if (foreground == handle || foregroundPid == (uint)process.Id)
+            GetWindowThreadProcessId(handle, out var handlePid);
+            var foregroundTitle = WindowTitle(foreground);
+            if (ForegroundIsTarget(handle, process.Id, application, foreground, foregroundPid, handlePid, foregroundTitle))
             {
                 Thread.Sleep(150);
                 return;
@@ -462,7 +316,44 @@ internal static partial class Program
             }
             Thread.Sleep(100);
         }
-        throw new InvalidOperationException("Could not bring the target window to the foreground.");
+        var leftover = GetForegroundWindow();
+        GetWindowThreadProcessId(leftover, out var leftoverPid);
+        throw new InvalidOperationException(
+            $"Could not bring the target window to the foreground (wanted '{Truncate(WindowTitle(handle), 120)}' pid {process.Id}; foreground '{Truncate(WindowTitle(leftover), 120)}' pid {leftoverPid}).");
+    }
+
+    private static bool ForegroundIsTarget(
+        IntPtr handle,
+        int processId,
+        string? application,
+        IntPtr foreground,
+        uint foregroundPid,
+        uint handlePid,
+        string foregroundTitle)
+    {
+        if (foreground == IntPtr.Zero) return false;
+        if (foreground == handle) return true;
+        if (handle != IntPtr.Zero && GetAncestor(foreground, GA_ROOT) == handle) return true;
+        // ApplicationFrameHost hosts many UWP frames under one PID. PID match
+        // alone would treat Settings as Store. Require the exact frame or title.
+        var sharedFrame = IsApplicationFrameHost(processId)
+            || (handlePid != 0 && IsApplicationFrameHost((int)handlePid));
+        if (!sharedFrame)
+        {
+            if (foregroundPid == (uint)processId) return true;
+            if (handlePid != 0 && foregroundPid == handlePid) return true;
+        }
+        return ForegroundLooksLikeApplication(application, foregroundTitle);
+    }
+
+    private static bool ForegroundLooksLikeApplication(string? application, string title)
+    {
+        if (string.IsNullOrWhiteSpace(application) || string.IsNullOrWhiteSpace(title))
+            return false;
+        if (TitleMatchesApplication(title, application)) return true;
+        var titleNorm = NormalizeText(title);
+        var appNorm = NormalizeText(application);
+        return appNorm.Length > 0 && titleNorm.Contains(appNorm, StringComparison.Ordinal);
     }
 
     // Windows normally prevents a background process from stealing focus. The
@@ -485,6 +376,14 @@ internal static partial class Program
             BringWindowToTop(handle);
             SetForegroundWindow(handle);
             try { AutomationElement.FromHandle(handle)?.SetFocus(); } catch { }
+            if (GetForegroundWindow() == handle) return;
+            ShowWindow(handle, SW_SHOW);
+            SetWindowPos(handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            SetWindowPos(handle, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            // Any synthetic input from this process resets the foreground lock.
+            Send([MouseInput(MOUSEEVENTF_MOVE)]);
+            SetForegroundWindow(handle);
+            try { AutomationElement.FromHandle(handle)?.SetFocus(); } catch { }
         }
         finally
         {
@@ -495,37 +394,24 @@ internal static partial class Program
 
     private static Process ResolveProcess(HostRequest request)
     {
+        var application = GetApplication(request);
         var processId = GetOptionalInt(request.Params, "processId");
         if (processId.HasValue)
-            return Process.GetProcessById(processId.Value);
-        return FindApplicationProcess(GetApplication(request))
-            ?? throw new InvalidOperationException($"{GetApplication(request)} is not open.");
-    }
-
-    private static Process? FindApplicationProcess(string application)
-    {
-        LaunchTargets.TryGetValue(application, out var executable);
-        var expectedName = Path.GetFileNameWithoutExtension(executable ?? application);
-        Process? match = null;
-        foreach (var process in Process.GetProcesses())
         {
-            var keep = false;
             try
             {
-                if (process.MainWindowHandle != IntPtr.Zero
-                    && (process.ProcessName.Equals(expectedName, StringComparison.OrdinalIgnoreCase)
-                        || (process.MainWindowTitle ?? "").Contains(application, StringComparison.OrdinalIgnoreCase))
-                    && (match is null || process.Id > match.Id))
-                {
-                    match?.Dispose();
-                    match = process;
-                    keep = true;
-                }
+                var process = Process.GetProcessById(processId.Value);
+                RememberApplication(process.Id, application);
+                if (FindBestWindowHandle(process, application) != IntPtr.Zero)
+                    return process;
+                process.Dispose();
             }
-            catch { keep = false; }
-            finally { if (!keep) process.Dispose(); }
+            catch { /* UWP stubs exit or hand off; fall back to the application name. */ }
         }
-        return match;
+        var resolved = FindApplicationProcess(application)
+            ?? throw new InvalidOperationException($"{application} is not open.");
+        RememberApplication(resolved.Id, application);
+        return resolved;
     }
 
     private static string GetApplication(HostRequest request) =>
@@ -585,9 +471,7 @@ internal static partial class Program
     private static object CaptureWindow(HostRequest request)
     {
         var process = ResolveProcess(request);
-        var handle = process.MainWindowHandle;
-        if (handle == IntPtr.Zero)
-            throw new InvalidOperationException("The application window is unavailable.");
+        var handle = RequireWindowHandle(process, GetApplication(request));
         if (IsIconic(handle))
             throw new InvalidOperationException("The target window is minimized; run an activate step first.");
         if (!GetWindowRect(handle, out var rect))
@@ -624,8 +508,7 @@ internal static partial class Program
 
     private static AutomationElement FindElement(Process process, string? automationId, string? name, string? controlType)
     {
-        var root = AutomationElement.FromHandle(process.MainWindowHandle)
-            ?? throw new InvalidOperationException("The application window is unavailable.");
+        var root = RequireAutomationRoot(process, null);
         if (!string.IsNullOrEmpty(automationId))
         {
             var byId = root.FindFirst(TreeScope.Descendants,
@@ -702,6 +585,8 @@ internal static partial class Program
     private static object GetElementValue(HostRequest request)
     {
         var element = ResolveTargetElement(request, requireMark: false);
+        if (IsPasswordElement(element))
+            throw new UnauthorizedAccessException("Alfred will not read a password field.");
         if (element.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern))
             return new { value = ((ValuePattern)pattern).Current.Value, mark = GetOptionalString(request.Params, "mark") };
         var name = element.Current.Name;
@@ -712,7 +597,7 @@ internal static partial class Program
     private static object InvokeElement(HostRequest request)
     {
         var process = ResolveProcess(request);
-        FocusProcess(process);
+        FocusProcess(process, GetApplication(request));
         var element = ResolveTargetElement(request, requireMark: false);
         return InvokeViaPatterns(process, element, request.Target);
     }
@@ -721,8 +606,9 @@ internal static partial class Program
     {
         var value = GetString(request.Params, "value");
         var process = ResolveProcess(request);
-        FocusProcess(process);
+        FocusProcess(process, GetApplication(request));
         var element = ResolveTargetElement(request, requireMark: false);
+        RefusePasswordElement(element);
         if (element.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern)
             && !((ValuePattern)pattern).Current.IsReadOnly)
         {
@@ -751,7 +637,7 @@ internal static partial class Program
         Thread.Sleep(80);
         SelectAllInFocusedControl();
         Thread.Sleep(50);
-        HumanTypeCharacters(value);
+        HumanTypeCharacters(value, process.Id);
         Thread.Sleep(150);
         var typed = ReadTargetSubtreeText(element);
         if (!TextAppearsExactlyOnce(typed, value))
@@ -867,7 +753,19 @@ internal static partial class Program
             }
         }
         catch { /* Dynamic web controls may replace their accessibility node. */ }
-        return string.Join(" ", values);
+        var unique = values
+            .Select(value => value.Trim())
+            .Where(value => value.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (unique.Count == 0) return "";
+        // WinUI editors often echo the same document on the parent and a child.
+        // Joining those copies made a single verified type look like a duplicate.
+        var longest = unique.OrderByDescending(value => value.Length).First();
+        var longestNorm = NormalizeText(longest);
+        if (unique.All(value => longestNorm.Contains(NormalizeText(value))))
+            return longest;
+        return string.Join(" ", unique);
     }
 
     private static bool IsUsableElement(AutomationElement element)
@@ -885,7 +783,7 @@ internal static partial class Program
     {
         try
         {
-            if (!GetWindowRect(process.MainWindowHandle, out var window)) return false;
+            if (!GetWindowRect(FindBestWindowHandle(process, null), out var window)) return false;
             var current = element.Current;
             var name = (current.Name ?? "").ToLowerInvariant();
             var bounds = current.BoundingRectangle;
@@ -899,7 +797,7 @@ internal static partial class Program
     {
         try
         {
-            if (!GetWindowRect(process.MainWindowHandle, out var window)) return false;
+            if (!GetWindowRect(FindBestWindowHandle(process, null), out var window)) return false;
             var bounds = element.Current.BoundingRectangle;
             // Edge's tab strip/address toolbar lives above the web content. Do not
             // let a vision coordinate intended for the page resolve to Favorites,
@@ -911,8 +809,7 @@ internal static partial class Program
 
     private static AutomationElement FindBrowserAddressBar(Process process)
     {
-        var root = AutomationElement.FromHandle(process.MainWindowHandle)
-            ?? throw new InvalidOperationException("The browser window is unavailable.");
+        var root = RequireAutomationRoot(process, null);
         AutomationElement? best = null;
         var bestScore = int.MinValue;
         var descendants = root.FindAll(TreeScope.Descendants,
@@ -968,9 +865,8 @@ internal static partial class Program
             return selected;
         }
 
-        var root = AutomationElement.FromHandle(process.MainWindowHandle)
-            ?? throw new InvalidOperationException("The application window is unavailable.");
         var application = GetApplication(request);
+        var root = RequireAutomationRoot(process, application);
         var isBrowser = BrowserApplications.Contains(application);
         var target = request.Target ?? "";
         var targetWantsSearch = target.Contains("search", StringComparison.OrdinalIgnoreCase)
@@ -1011,7 +907,7 @@ internal static partial class Program
     private static AutomationElement? FindClickTarget(Process process, HostRequest request, int requestedX, int requestedY)
     {
         if (string.IsNullOrWhiteSpace(request.Target)) return null;
-        var root = AutomationElement.FromHandle(process.MainWindowHandle);
+        var root = TryAutomationRoot(process, GetApplication(request));
         if (root is null) return null;
         var isBrowser = BrowserApplications.Contains(GetApplication(request));
         var target = request.Target ?? "";
@@ -1061,7 +957,8 @@ internal static partial class Program
     private static void RequireInsideWindow(int processId, int x, int y)
     {
         var process = Process.GetProcessById(processId);
-        if (!GetWindowRect(process.MainWindowHandle, out var rect))
+        var handle = FindBestWindowHandle(process, null);
+        if (!GetWindowRect(handle, out var rect))
             throw new InvalidOperationException("Could not read the target window bounds.");
         if (x < rect.Left || x >= rect.Right || y < rect.Top || y >= rect.Bottom)
             throw new InvalidOperationException("The recorded point is outside the target window; re-record this step.");
@@ -1070,7 +967,7 @@ internal static partial class Program
     private static object Click(HostRequest request)
     {
         var process = ResolveProcess(request);
-        FocusProcess(process);
+        FocusProcess(process, GetApplication(request));
         var markElement = TryResolveMark(request);
         int x;
         int y;
@@ -1146,7 +1043,7 @@ internal static partial class Program
             || text.Contains("â€", StringComparison.Ordinal))
             throw new InvalidOperationException("The requested text contains likely UTF-8 mojibake. Alfred will not submit corrupted content; the planner must regenerate the original Unicode or plain-ASCII text.");
         var process = ResolveProcess(request);
-        FocusProcess(process);
+        FocusProcess(process, GetApplication(request));
         var target = TryResolveMark(request);
         var usedPagePoint = false;
         if (target is null && TryPageOrWindowPoint(request, process, out var pageX, out var pageY))
@@ -1155,28 +1052,42 @@ internal static partial class Program
             HumanLeftClick(process.Id, pageX, pageY);
             Thread.Sleep(80);
             target = AutomationElement.FocusedElement;
-            if (target is null || target.Current.ProcessId != process.Id)
+            if (target is null || !ElementBelongsToProcess(target, process, GetApplication(request)))
                 target = HitTest(pageX, pageY);
         }
         target ??= FindTypingTarget(process, request);
+        var application = GetApplication(request);
+        if (!IsWritableElement(target) && !usedPagePoint)
+        {
+            try { target.SetFocus(); } catch { /* Search buttons often ignore SetFocus. */ }
+            var hint = target.Current.BoundingRectangle;
+            if (hint.Width > 2 && hint.Height > 2)
+                HumanLeftClick(process.Id, (int)Math.Round(hint.Left + hint.Width / 2), (int)Math.Round(hint.Top + hint.Height / 2));
+            Thread.Sleep(180);
+            target = FindWritableSuccessor(process, application, target)
+                ?? throw new InvalidOperationException("typeText requires an editable control; the supplied mark is not writable.");
+        }
+        RefusePasswordElement(target);
         var type = target.Current.ControlType;
-        var writable = type == ControlType.Edit
-            || type == ControlType.Document
-            || type == ControlType.Custom
-            || (target.TryGetCurrentPattern(ValuePattern.Pattern, out var editable)
-                && editable is ValuePattern value
-                && !value.Current.IsReadOnly);
-        if (!writable && !usedPagePoint)
-            throw new InvalidOperationException("typeText requires an editable control; the supplied mark is not writable.");
         try { target.SetFocus(); } catch { /* Canvas / custom editors may reject SetFocus. */ }
         var bounds = target.Current.BoundingRectangle;
         if (bounds.Width > 2 && bounds.Height > 2)
             HumanLeftClick(process.Id, (int)Math.Round(bounds.Left + bounds.Width / 2), (int)Math.Round(bounds.Top + bounds.Height / 2));
-        Thread.Sleep(80);
+        Thread.Sleep(150);
         var focused = AutomationElement.FocusedElement;
-        if (focused is null || focused.Current.ProcessId != process.Id)
-            throw new InvalidOperationException("The intended text target did not receive keyboard focus.");
-        if (BrowserApplications.Contains(GetApplication(request))
+        // Store/WinUI search often hands focus to a child edit or helper process.
+        if (focused is not null
+            && IsWritableElement(focused)
+            && KeyboardFocusAccepted(target, focused, process, application)
+            && !SameVisualControl(target, focused))
+        {
+            target = focused;
+            RefusePasswordElement(target);
+            type = target.Current.ControlType;
+            bounds = target.Current.BoundingRectangle;
+        }
+        if (BrowserApplications.Contains(application)
+            && focused is not null
             && IsBrowserChromeEditor(focused, process)
             && !(request.Target ?? "").Contains("address", StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("Refusing to type page content into the browser address bar.");
@@ -1201,7 +1112,6 @@ internal static partial class Program
         var usedDirectValue = false;
         var preferKeyboard = usedPagePoint
             || type == ControlType.Document
-            || type == ControlType.Custom
             || GetOptionalString(request.Params, "input") is "human";
         if (!preferKeyboard
             && target.TryGetCurrentPattern(ValuePattern.Pattern, out var valuePattern)
@@ -1218,12 +1128,21 @@ internal static partial class Program
         }
         if (!usedDirectValue)
         {
+            if (!KeyboardFocusAccepted(target, AutomationElement.FocusedElement, process, application))
+            {
+                try { target.SetFocus(); } catch { /* Retry once after the click settles. */ }
+                Thread.Sleep(120);
+            }
+            focused = AutomationElement.FocusedElement;
+            if (!KeyboardFocusAccepted(target, focused, process, application))
+                throw new InvalidOperationException(
+                    $"The intended text target did not receive keyboard focus (focused={DescribeFocus(focused)}).");
             // Replacement semantics make retries safe. A previous attempt may
             // have changed the control even if readback timed out; selecting the
             // focused editor prevents appending a second/interleaved version.
             SelectAllInFocusedControl();
             Thread.Sleep(50);
-            HumanTypeCharacters(text);
+            HumanTypeCharacters(text, process.Id);
         }
         Thread.Sleep(150);
         var observed = ReadTargetSubtreeText(target);
@@ -1250,7 +1169,7 @@ internal static partial class Program
             throw new UnauthorizedAccessException("The Delete key is blocked by Alfred's deletion policy.");
         if (!AllowedVirtualKeys.Contains(virtualKey))
             throw new InvalidOperationException($"Virtual key 0x{virtualKey:X2} is not in Alfred's allowed key set.");
-        FocusProcess(ResolveProcess(request));
+        FocusProcess(ResolveProcess(request), GetApplication(request));
         HumanPressVirtualKey((ushort)virtualKey);
         return new { pressed = true, how = "humanKey", virtualKey };
     }
@@ -1259,7 +1178,7 @@ internal static partial class Program
     {
         if (!AllowedShortcuts.TryGetValue(keys.Trim(), out var virtualKey))
             throw new InvalidOperationException($"Shortcut {keys} is not in Alfred's allowed shortcut set.");
-        FocusProcess(ResolveProcess(request));
+        FocusProcess(ResolveProcess(request), GetApplication(request));
         HumanPressShortcut(virtualKey);
         return new { pressed = true, how = "humanShortcut", keys = keys.ToUpperInvariant() };
     }
@@ -1282,6 +1201,162 @@ internal static partial class Program
         value?.GetProperty(property).GetString() ?? throw new InvalidOperationException($"Missing {property}.");
     private static string? GetOptionalString(JsonElement? value, string property) =>
         value.HasValue && value.Value.TryGetProperty(property, out var item) ? item.GetString() : null;
+    private static bool IsPasswordElement(AutomationElement element)
+    {
+        try { return element.Current.IsPassword; }
+        catch { return false; }
+    }
+
+    private static void RefusePasswordElement(AutomationElement element)
+    {
+        if (IsPasswordElement(element))
+            throw new UnauthorizedAccessException("Alfred will not type into a password field.");
+    }
+
+    private static bool IsWritableElement(AutomationElement element)
+    {
+        try
+        {
+            if (IsPasswordElement(element)) return false;
+            var type = element.Current.ControlType;
+            var hasWritableValue = element.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern)
+                && pattern is ValuePattern value
+                && !value.Current.IsReadOnly;
+            if (type == ControlType.Custom) return hasWritableValue;
+            if (type == ControlType.Edit || type == ControlType.Document)
+            {
+                if (pattern is ValuePattern readOnly && readOnly.Current.IsReadOnly) return false;
+                return true;
+            }
+            return hasWritableValue;
+        }
+        catch { return false; }
+    }
+
+    private static bool SameVisualControl(AutomationElement left, AutomationElement right)
+    {
+        try
+        {
+            var a = left.Current;
+            var b = right.Current;
+            if ((a.ControlType?.ProgrammaticName ?? "") != (b.ControlType?.ProgrammaticName ?? ""))
+                return false;
+            if ((a.Name ?? "") != (b.Name ?? "")) return false;
+            if (!string.IsNullOrWhiteSpace(a.AutomationId)
+                && !a.AutomationId.Equals(b.AutomationId ?? "", StringComparison.Ordinal))
+                return false;
+            var ab = a.BoundingRectangle;
+            var bb = b.BoundingRectangle;
+            return Math.Abs(ab.X - bb.X) < 12
+                && Math.Abs(ab.Y - bb.Y) < 12
+                && Math.Abs(ab.Width - bb.Width) < 24
+                && Math.Abs(ab.Height - bb.Height) < 24;
+        }
+        catch { return false; }
+    }
+
+    private static bool KeyboardFocusAccepted(
+        AutomationElement target,
+        AutomationElement? focused,
+        Process process,
+        string? application)
+    {
+        if (focused is null) return false;
+        if (SameVisualControl(target, focused)) return true;
+        try
+        {
+            var box = target.Current.BoundingRectangle;
+            var focusBox = focused.Current.BoundingRectangle;
+            if (box.Width <= 0 || box.Height <= 0) return false;
+            var centerX = focusBox.X + focusBox.Width / 2;
+            var centerY = focusBox.Y + focusBox.Height / 2;
+            if (centerX >= box.X && centerX <= box.X + box.Width
+                && centerY >= box.Y && centerY <= box.Y + box.Height)
+                return true;
+            var distance = Math.Sqrt(
+                Math.Pow(centerX - (box.X + box.Width / 2), 2)
+                + Math.Pow(centerY - (box.Y + box.Height / 2), 2));
+            return distance <= 120 && ElementBelongsToProcess(focused, process, application);
+        }
+        catch { return false; }
+    }
+
+    private static AutomationElement? FindWritableSuccessor(
+        Process process,
+        string application,
+        AutomationElement origin)
+    {
+        try
+        {
+            var focused = AutomationElement.FocusedElement;
+            if (focused is not null
+                && IsWritableElement(focused)
+                && KeyboardFocusAccepted(origin, focused, process, application))
+                return focused;
+        }
+        catch { /* WinUI may replace the Search button before focus settles. */ }
+
+        var root = TryAutomationRoot(process, application);
+        if (root is null) return null;
+        string originName;
+        System.Windows.Rect originBox;
+        try
+        {
+            originName = origin.Current.Name ?? "";
+            originBox = origin.Current.BoundingRectangle;
+        }
+        catch { return null; }
+
+        AutomationElement? best = null;
+        var bestScore = double.MinValue;
+        foreach (AutomationElement candidate in root.FindAll(TreeScope.Descendants, Condition.TrueCondition).Cast<AutomationElement>())
+        {
+            try
+            {
+                if (!IsUsableElement(candidate) || !IsWritableElement(candidate)) continue;
+                var current = candidate.Current;
+                if (current.IsOffscreen) continue;
+                var box = current.BoundingRectangle;
+                if (box.Width <= 2 || box.Height <= 2) continue;
+                var score = 0.0;
+                if (!string.IsNullOrWhiteSpace(originName)
+                    && (current.Name ?? "").Equals(originName, StringComparison.OrdinalIgnoreCase))
+                    score += 500;
+                var distance = Math.Sqrt(
+                    Math.Pow((box.X + box.Width / 2) - (originBox.X + originBox.Width / 2), 2)
+                    + Math.Pow((box.Y + box.Height / 2) - (originBox.Y + originBox.Height / 2), 2));
+                if (distance > 400) continue;
+                if (distance > 240 && score < 500) continue;
+                score -= distance / 4;
+                if (score > bestScore)
+                {
+                    best = candidate;
+                    bestScore = score;
+                }
+            }
+            catch { /* Skip stale nodes while Store redraws search. */ }
+        }
+        return bestScore >= -60 ? best : null;
+    }
+
+    private static string DescribeFocus(AutomationElement? focused)
+    {
+        if (focused is null) return "none";
+        try
+        {
+            var current = focused.Current;
+            var processName = "";
+            try
+            {
+                using var owner = Process.GetProcessById(current.ProcessId);
+                processName = owner.ProcessName ?? "";
+            }
+            catch { /* Access-denied helper processes still report a pid. */ }
+            return $"{processName}#{current.ProcessId} {current.ControlType?.ProgrammaticName} '{Truncate(current.Name ?? "", 80)}'";
+        }
+        catch { return "unavailable"; }
+    }
+
     private static string Truncate(string value, int max) => value.Length <= max ? value : value[..max];
     private static void Reply(object value) { Console.Out.WriteLine(JsonSerializer.Serialize(value, Json)); Console.Out.Flush(); }
 
@@ -1295,6 +1370,7 @@ internal static partial class Program
     }
 
     private const uint INPUT_MOUSE = 0, INPUT_KEYBOARD = 1;
+    private const uint MOUSEEVENTF_MOVE = 0x0001;
     private const uint MOUSEEVENTF_LEFTDOWN = 0x0002, MOUSEEVENTF_LEFTUP = 0x0004;
     private const uint MOUSEEVENTF_RIGHTDOWN = 0x0008, MOUSEEVENTF_RIGHTUP = 0x0010;
     private const uint MOUSEEVENTF_WHEEL = 0x0800;
@@ -1310,10 +1386,13 @@ internal static partial class Program
     [DllImport("user32.dll", SetLastError = true)] private static extern uint SendInput(uint count, INPUT[] inputs, int size);
     [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
+    private const uint GA_ROOT = 2;
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
     [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")] private static extern bool BringWindowToTop(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool SetWindowPos(IntPtr hWnd, IntPtr insertAfter, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
     [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] private static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);

@@ -21,7 +21,7 @@ Alfred is a local-first desktop workflow agent for repetitive work across applic
 | --- | --- |
 | Tauri/React desktop GUI and first-run setup | Implemented; builds on Windows and macOS |
 | Rust policy engine, permissions, OS vault, events, and checkpoints | Implemented with policy tests |
-| Windows UI Automation, `PrintWindow` capture, and targeted `SendInput` host | Mark catalog + set-of-mark capture, pattern-first invoke/scroll, PerMonitorV2 mapping, and a human-like mark-targeted mouse/keyboard (cursor path + cadenced keys) when patterns are missing; Start-menu unique-name launch; clean Windows 11 desktop validation is pending |
+| Windows UI Automation, `PrintWindow` capture, and targeted `SendInput` host | Mark catalog + set-of-mark capture, pattern-first invoke/scroll, PerMonitorV2 mapping, and a human-like mark-targeted mouse/keyboard (cursor path + cadenced keys) when patterns are missing; Start-menu + AppsFolder unique-name launch including Store/Settings; native `wait`; clean Windows 11 desktop validation is pending |
 | Chromium extension and Native Messaging bridge | Implemented as an unpacked extension with per-run tab pinning and trusted OS click/type fallback when a page ignores synthetic DOM events; packaged install validation is pending |
 | Codex, Copilot, Cursor, and Grok CLI adapters | Beta; requires the selected CLI to be installed and authenticated |
 | Goal runs (live planner loop with policy gate, approvals, and guardrails) | Implemented; provider answer parsing is best-effort per CLI and needs the Windows validation pass |

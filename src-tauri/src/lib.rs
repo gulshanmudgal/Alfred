@@ -1168,6 +1168,7 @@ const ALLOWED_PLAN_METHODS: &[&str] = &[
     "doubleClick",
     "hover",
     "drag",
+    "wait",
     "browser.observe",
     "browser.navigate",
     "browser.click",
@@ -1334,6 +1335,16 @@ fn validate_workflow_step(step: &WorkflowStep) -> Result<(), String> {
             .unwrap_or(true)
     {
         return Err("A typeText step must include non-empty text.".into());
+    }
+    if step.kind == "wait" {
+        let text = params
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let target = step.target_label.as_deref().unwrap_or("");
+        if text.trim().is_empty() && target.trim().is_empty() {
+            return Err("wait requires text to look for.".into());
+        }
     }
     if step.kind == "key" && params.get("virtualKey").and_then(Value::as_u64) == Some(0x2e) {
         return Err("The Delete key is blocked by Alfred's deletion policy.".into());
@@ -1936,6 +1947,7 @@ fn kind_is_observe(kind: &str) -> bool {
             | "listapplications"
             | "listinstalledapplications"
             | "resolveapplication"
+            | "wait"
             | "health"
     )
 }
@@ -2550,7 +2562,11 @@ fn execute_native_action_inner(
 fn needs_process_resolution(kind: &str, application: &str) -> bool {
     !matches!(
         kind,
-        "launchApplication" | "listApplications" | "listInstalledApplications" | "resolveApplication"
+        "launchApplication"
+            | "listApplications"
+            | "listInstalledApplications"
+            | "resolveApplication"
+            | "wait"
     ) && application != "Alfred"
 }
 
@@ -3856,6 +3872,26 @@ fn planner_result_digest(value: &Value) -> String {
             let snippet: String = collapsed.chars().take(500).collect();
             parts.push(snippet);
         }
+        Value::Array(items) => {
+            let names: Vec<String> = items
+                .iter()
+                .filter_map(|item| {
+                    item.get("name")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.as_str())
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                })
+                .take(12)
+                .collect();
+            if !names.is_empty() {
+                parts.push(format!("names: {}", names.join(", ")));
+                if items.len() > names.len() {
+                    parts.push(format!("[+{} more]", items.len() - names.len()));
+                }
+            }
+        }
         Value::Object(map) => {
             for key in ["text", "value", "observedText", "prose"] {
                 if let Some(text) = map
@@ -3869,6 +3905,34 @@ fn planner_result_digest(value: &Value) -> String {
                         parts.push(snippet);
                     }
                 }
+            }
+            if let Some(application) = map
+                .get("application")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                parts.push(format!("application={application}"));
+            }
+            if let Some(title) = map
+                .get("title")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                let short: String = title.chars().take(80).collect();
+                parts.push(format!("title=\"{short}\""));
+            }
+            if map.get("alreadyRunning").and_then(Value::as_bool) == Some(true) {
+                parts.push("[alreadyRunning]".into());
+            }
+            if let Some(found) = map.get("found").and_then(Value::as_bool) {
+                parts.push(format!("[found={found}]"));
+            }
+            if let Some(mark) = map
+                .get("mark")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                parts.push(format!("mark={mark}"));
             }
             if map.get("hasMore").and_then(Value::as_bool) == Some(true) {
                 let next = map.get("nextOffset").and_then(Value::as_u64).unwrap_or(0);
@@ -4504,6 +4568,51 @@ The optional extension is connected, so `browser.*` methods and application "Ins
 13. If a composer or SPA ignores the DOM click/type, Alfred retries with a trusted OS pointer/keyboard on that element's page box. Prefer refs; do not emit screen coordinates."#
 }
 
+fn windows_skill_block() -> &'static str {
+    r#"
+
+WINDOWS SKILL — INSTALLED APPS AND HUMAN INPUT:
+Alfred can operate any installed Start / AppsFolder application. The planner never receives raw mouse or keyboard APIs.
+1. If the exact name is uncertain, listInstalledApplications {"query":"store"} and pick one returned name. Never invent .exe paths or command lines.
+2. launchApplication that exact name. UWP apps (Microsoft Store, Settings, Calculator) use their Start name, never ApplicationFrameHost.
+3. wait {"text":"Search","timeoutMs":8000} until a label or window title appears, then observeWindow / findElement.
+4. Prefer invokeElement / setValue on a mark (n12). If the control ignores patterns, click / typeText / hover / drag move the real cursor and keyboard onto that mark.
+5. Screenshots are set-of-mark annotated. If a control has no badge, probe {"nx","ny"} then act on the returned mark. Never emit screen x,y.
+6. One small action per reply. After a failure, change approach instead of repeating."#
+}
+
+fn store_skill_block() -> &'static str {
+    r#"
+
+MICROSOFT STORE SKILL:
+1. listInstalledApplications {"query":"microsoft store"} if needed, then launchApplication "Microsoft Store".
+2. wait {"text":"Search","timeoutMs":12000} until the Store shell is up.
+3. findElement {"text":"Search"} then typeText the product into that mark — not the taskbar or a browser.
+4. findElement the matching tile or title, click / invokeElement, then re-observe.
+5. Get / Install / Open is a commit. After clicking, re-observe and report only the visible Store state (Get, Installing, Open, Owned). Never uninstall. Never claim an install finished unless the page shows Installed or Open.
+6. Store is WinUI: if Invoke/Value is ignored, use the virtual mouse and keyboard on the mark.
+7. If Store asks to sign in or pay, stop and ask the user."#
+}
+
+fn goal_needs_store_skill(goal: &str, applications: &[String]) -> bool {
+    if applications
+        .iter()
+        .any(|application| application.eq_ignore_ascii_case("Microsoft Store"))
+    {
+        return true;
+    }
+    let lower = goal.to_lowercase();
+    if lower.contains("microsoft store")
+        || lower.contains("windows store")
+        || lower.contains("ms store")
+    {
+        return true;
+    }
+    lower
+        .split(|character: char| !character.is_alphanumeric())
+        .any(|word| word == "store")
+}
+
 fn goal_needs_browser_skill(goal: &str, applications: &[String]) -> bool {
     if applications
         .iter()
@@ -4566,6 +4675,20 @@ fn infer_applications_from_goal(goal: &str) -> Vec<String> {
             ],
             "Microsoft Edge",
         ),
+        (
+            &[
+                "microsoft store",
+                "windows store",
+                "ms store",
+                "store",
+            ],
+            "Microsoft Store",
+        ),
+        (&["settings", "windows settings"], "Settings"),
+        (
+            &["windows terminal", "terminal", "wt"],
+            "Windows Terminal",
+        ),
         (&["excel", "spreadsheet", "workbook"], "Microsoft Excel"),
         (&["ms word", "word document", "word"], "Microsoft Word"),
         (&["powerpoint", "presentation"], "Microsoft PowerPoint"),
@@ -4611,7 +4734,7 @@ fn infer_applications_from_goal(goal: &str) -> Vec<String> {
 /// the user left the list empty — instructions to pick them from the goal.
 fn planner_app_list(applications: &[String]) -> String {
     if applications.is_empty() {
-        "(none chosen — infer them from the goal: use listApplications with application \"Alfred\" to see what is running, then launchApplication for allow-listed apps)".to_string()
+        "(none chosen — infer them from the goal: use listInstalledApplications {\"query\"} to search installed names, listApplications with application \"Alfred\" to see what is running, then launchApplication for an exact installed name)".to_string()
     } else {
         applications.join(", ")
     }
@@ -4636,9 +4759,9 @@ fn planner_app_rule_for_capabilities(
 
 fn planner_methods(bridge_connected: bool) -> &'static str {
     if bridge_connected {
-        "listApplications (application \"Alfred\") | listInstalledApplications (application \"Alfred\") | browser.observe | browser.navigate {\"url\"} | browser.find {\"text\"} | browser.click {\"ref\"} | browser.type {\"ref\",\"text\"} | browser.getText {\"ref\"} | browser.read {\"offset\":0} | browser.scroll {\"direction\":\"down\"} or {\"text\"} | browser.wait {\"text\",\"timeoutMs\"} | browser.hover {\"ref\"} | browser.dblclick {\"ref\"} | launchApplication | focusApplication | activate | observeWindow | findElement {\"text\"} | getValue {\"mark\"} | invokeElement {\"mark\"} | setValue {\"mark\",\"value\"} | typeText {\"mark\",\"text\"} | click {\"mark\"} | scroll {\"mark\"|\"direction\"|\"text\"} | probe {\"nx\",\"ny\"} | rightClick {\"mark\"} | doubleClick {\"mark\"} | hover {\"mark\"} | drag {\"from\",\"to\"} | key | shortcut"
+        "listApplications (application \"Alfred\") | listInstalledApplications {\"query\"} | wait {\"text\",\"timeoutMs\"} | browser.observe | browser.navigate {\"url\"} | browser.find {\"text\"} | browser.click {\"ref\"} | browser.type {\"ref\",\"text\"} | browser.getText {\"ref\"} | browser.read {\"offset\":0} | browser.scroll {\"direction\":\"down\"} or {\"text\"} | browser.wait {\"text\",\"timeoutMs\"} | browser.hover {\"ref\"} | browser.dblclick {\"ref\"} | launchApplication | focusApplication | activate | observeWindow | findElement {\"text\"} | getValue {\"mark\"} | invokeElement {\"mark\"} | setValue {\"mark\",\"value\"} | typeText {\"mark\",\"text\"} | click {\"mark\"} | scroll {\"mark\"|\"direction\"|\"text\"} | probe {\"nx\",\"ny\"} | rightClick {\"mark\"} | doubleClick {\"mark\"} | hover {\"mark\"} | drag {\"from\",\"to\"} | key | shortcut"
     } else {
-        "listApplications (application \"Alfred\") | listInstalledApplications (application \"Alfred\") | launchApplication (exact Start-menu name) | navigateApplication {\"url\":\"https://...\"} (Edge/Chrome/Brave + HTTP(S)) | focusApplication | activate | observeWindow | captureWindow | findElement {\"text\"} or {\"automationId\"|\"name\"|\"controlType\"} | getValue {\"mark\"} | invokeElement {\"mark\"} | setValue {\"mark\",\"value\"} | typeText {\"mark\",\"text\"} | click {\"mark\"} | probe {\"nx\",\"ny\"} | scroll {\"mark\"|\"direction\"|\"text\"} | rightClick {\"mark\"} | doubleClick {\"mark\"} | hover {\"mark\"} | drag {\"from\",\"to\"} | key {\"virtualKey\":13|9|27} | shortcut {\"keys\":\"CTRL+L\"|\"CTRL+S\"}"
+        "listApplications (application \"Alfred\") | listInstalledApplications {\"query\"} | wait {\"text\",\"timeoutMs\"} | launchApplication (exact installed name) | navigateApplication {\"url\":\"https://...\"} (Edge/Chrome/Brave + HTTP(S)) | focusApplication | activate | observeWindow | captureWindow | findElement {\"text\"} or {\"automationId\"|\"name\"|\"controlType\"} | getValue {\"mark\"} | invokeElement {\"mark\"} | setValue {\"mark\",\"value\"} | typeText {\"mark\",\"text\"} | click {\"mark\"} | probe {\"nx\",\"ny\"} | scroll {\"mark\"|\"direction\"|\"text\"} | rightClick {\"mark\"} | doubleClick {\"mark\"} | hover {\"mark\"} | drag {\"from\",\"to\"} | key {\"virtualKey\":13|9|27} | shortcut {\"keys\":\"CTRL+L\"|\"CTRL+S\"}"
     }
 }
 
@@ -4666,11 +4789,13 @@ fn build_planner_prompt(
             .join("\n");
         format!("\n\nCURRENT PLAN (your outline; follow it, or return an updated plan):\n{outline}")
     };
-    let skill = if goal_needs_browser_skill(goal, applications) {
-        browser_skill_block(bridge_connected)
-    } else {
-        ""
-    };
+    let mut skill = windows_skill_block().to_string();
+    if goal_needs_store_skill(goal, applications) {
+        skill.push_str(store_skill_block());
+    }
+    if goal_needs_browser_skill(goal, applications) {
+        skill.push_str(browser_skill_block(bridge_connected));
+    }
     let capability = if bridge_connected {
         "optional DOM browser accelerator: connected"
     } else {
@@ -7401,6 +7526,7 @@ mod tests {
         assert!(!needs_process_resolution("launchApplication", "Notepad"));
         assert!(!needs_process_resolution("listApplications", "Alfred"));
         assert!(!needs_process_resolution("listInstalledApplications", "Alfred"));
+        assert!(!needs_process_resolution("wait", "Microsoft Store"));
         assert!(needs_process_resolution("typeText", "Notepad"));
         assert!(needs_process_resolution("focusApplication", "Notepad"));
         assert!(!needs_process_resolution("typeText", "Alfred"));
@@ -7979,6 +8105,18 @@ mod tests {
             infer_applications_from_goal("Open VS Code and the Slack thread"),
             vec!["Visual Studio Code".to_string(), "Slack".to_string()]
         );
+        assert_eq!(
+            infer_applications_from_goal("Open Microsoft Store and search for Spotify"),
+            vec!["Microsoft Store".to_string(), "Spotify".to_string()]
+        );
+        assert_eq!(
+            infer_applications_from_goal("Open Settings"),
+            vec!["Settings".to_string()]
+        );
+        assert_eq!(
+            infer_applications_from_goal("Open Windows Terminal"),
+            vec!["Windows Terminal".to_string()]
+        );
     }
 
     #[test]
@@ -8021,6 +8159,10 @@ mod tests {
         assert!(prompt.contains("listApplications"));
         assert!(prompt.contains("real Windows cursor and keyboard"));
         assert!(prompt.contains("pick one exact name"));
+        assert!(prompt.contains("WINDOWS SKILL"));
+        assert!(prompt.contains("wait {\"text\",\"timeoutMs\"}"));
+        assert!(prompt.contains("listInstalledApplications {\"query\"}"));
+        assert!(!prompt.contains("MICROSOFT STORE SKILL"));
     }
     #[test]
     fn accepts_planner_plan_outline_replies() {
@@ -8041,6 +8183,32 @@ mod tests {
         );
         let click = serde_json::json!({"ok": true, "result": {"clicked": true}});
         assert_eq!(planner_result_digest(&click), "");
+        let installed = serde_json::json!({
+            "ok": true,
+            "result": [
+                {"name": "Microsoft Store"},
+                {"name": "Settings"},
+                {"name": "Notepad"}
+            ]
+        });
+        let installed_digest = planner_result_digest(&installed);
+        assert!(installed_digest.contains("Microsoft Store"));
+        assert!(installed_digest.contains("Settings"));
+        let waited = serde_json::json!({
+            "ok": true,
+            "result": { "found": true, "text": "Search", "mark": "n4", "title": "Microsoft Store" }
+        });
+        let waited_digest = planner_result_digest(&waited);
+        assert!(waited_digest.contains("[found=true]"));
+        assert!(waited_digest.contains("mark=n4"));
+        assert!(waited_digest.contains("Microsoft Store"));
+        let launched = serde_json::json!({
+            "ok": true,
+            "result": { "alreadyRunning": true, "application": "Settings", "title": "Settings" }
+        });
+        let launched_digest = planner_result_digest(&launched);
+        assert!(launched_digest.contains("[alreadyRunning]"));
+        assert!(launched_digest.contains("application=Settings"));
         assert!(payload_has_normalized_point(Some(&serde_json::json!({"nx": 0.4, "ny": 0.6}))));
         assert!(!payload_has_normalized_point(Some(&serde_json::json!({"nx": null, "ny": null, "x": 900, "y": 600}))));
         let prose_only = serde_json::json!({
@@ -8078,10 +8246,13 @@ mod tests {
         assert_eq!(effective_effect("browser.scroll", "observe"), "observe");
         assert_eq!(effective_effect("browser.find", "observe"), "observe");
         assert_eq!(effective_effect("browser.wait", "observe"), "observe");
+        assert_eq!(effective_effect("wait", "observe"), "observe");
+        assert_eq!(effective_effect("wait", "modify_reversible"), "observe");
         assert!(ALLOWED_PLAN_METHODS.contains(&"browser.read"));
         assert!(ALLOWED_PLAN_METHODS.contains(&"browser.scroll"));
         assert!(ALLOWED_PLAN_METHODS.contains(&"browser.find"));
         assert!(ALLOWED_PLAN_METHODS.contains(&"browser.wait"));
+        assert!(ALLOWED_PLAN_METHODS.contains(&"wait"));
     }
     #[test]
     fn browser_skill_attaches_for_portal_goals() {
@@ -8109,6 +8280,57 @@ mod tests {
         assert!(prompt.contains("browser.find"));
         assert!(prompt.contains("browser.wait"));
         assert!(prompt.contains("Never invent portal data"));
+        assert!(prompt.contains("WINDOWS SKILL"));
+    }
+
+    #[test]
+    fn store_skill_attaches_for_store_goals() {
+        assert!(goal_needs_store_skill(
+            "Open Microsoft Store and search for Spotify",
+            &[]
+        ));
+        assert!(goal_needs_store_skill(
+            "anything",
+            &["Microsoft Store".to_string()]
+        ));
+        assert!(!goal_needs_store_skill(
+            "Open Notepad and type hello",
+            &[]
+        ));
+        assert!(!goal_needs_store_skill("restore the last draft", &[]));
+        let prompt = build_planner_prompt(
+            "Open the Microsoft Store and find Calculator",
+            &["Microsoft Store".to_string()],
+            "Microsoft Store: unavailable (not open)",
+            &[],
+            &[],
+            false,
+        );
+        assert!(prompt.contains("MICROSOFT STORE SKILL"));
+        assert!(prompt.contains("WINDOWS SKILL"));
+        assert!(prompt.contains("wait {\"text\",\"timeoutMs\"}"));
+        let wait_step = WorkflowStep {
+            id: "wait".into(),
+            title: "Wait for Search".into(),
+            kind: "wait".into(),
+            effect: "observe".into(),
+            application: Some("Microsoft Store".into()),
+            intent: Some("wait for the Store shell".into()),
+            target_label: Some("Search".into()),
+            payload: Some(serde_json::json!({ "text": "Search", "timeoutMs": 12000 })),
+            timeout_ms: default_timeout(),
+            retries: default_retries(),
+            wait_for: None,
+            expect: None,
+            save_as: None,
+        };
+        assert!(validate_workflow_step(&wait_step).is_ok());
+        let missing = WorkflowStep {
+            payload: Some(serde_json::json!({})),
+            target_label: None,
+            ..wait_step.clone()
+        };
+        assert!(validate_workflow_step(&missing).is_err());
     }
     #[test]
     fn planner_digest_keeps_read_paging_metadata() {

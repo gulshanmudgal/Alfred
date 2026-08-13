@@ -28,7 +28,8 @@ internal static partial class Program
         try
         {
             using var process = Process.GetProcessById(processId);
-            if (!GetWindowRect(process.MainWindowHandle, out var rect)) return false;
+            var handle = FindBestWindowHandle(process, null);
+            if (handle == IntPtr.Zero || !GetWindowRect(handle, out var rect)) return false;
             return x >= rect.Left && x < rect.Right && y >= rect.Top && y < rect.Bottom;
         }
         catch
@@ -41,8 +42,18 @@ internal static partial class Program
     {
         var foreground = GetForegroundWindow();
         GetWindowThreadProcessId(foreground, out var foregroundPid);
-        if (foregroundPid != (uint)processId)
-            throw new InvalidOperationException("The target window lost foreground focus; input was not sent.");
+        if (foregroundPid == (uint)processId) return;
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            var application = RememberedApplication(processId);
+            var handle = FindBestWindowHandle(process, application);
+            GetWindowThreadProcessId(handle, out var handlePid);
+            if (ForegroundIsTarget(handle, processId, application, foreground, foregroundPid, handlePid, WindowTitle(foreground)))
+                return;
+        }
+        catch { /* Fall through to the hard failure below. */ }
+        throw new InvalidOperationException("The target window lost foreground focus; input was not sent.");
     }
 
     private static void MoveCursorHuman(int processId, int toX, int toY)
@@ -151,13 +162,17 @@ internal static partial class Program
         Send([WheelInput(delta, horizontal)]);
     }
 
-    private static void HumanTypeCharacters(string text)
+    private static void HumanTypeCharacters(string text, int? processId = null)
     {
+        var index = 0;
         foreach (var character in text)
         {
+            if (processId is int id && (index == 0 || index % 8 == 0))
+                RequireForeground(id);
             Send([KeyboardInput(character, false), KeyboardInput(character, true)]);
             // Deterministic cadence (15–40 ms) so retries stay reproducible.
             Thread.Sleep(18 + (character % 15));
+            index++;
         }
     }
 

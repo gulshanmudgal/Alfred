@@ -486,10 +486,45 @@
     return element.isContentEditable || value === "true" || value === "";
   };
 
-  const prefersTrustedInput = (element) => {
+  const prefersTrustedType = (element) => {
     const role = (element.getAttribute("role") || "").toLowerCase();
     const tag = (element.tagName || "").toLowerCase();
     return isContentEditable(element) || role === "textbox" || tag === "canvas";
+  };
+
+  const isNativeActivator = (element) => {
+    const tag = (element.tagName || "").toLowerCase();
+    return (
+      tag === "button" ||
+      tag === "a" ||
+      tag === "input" ||
+      tag === "summary" ||
+      tag === "label" ||
+      tag === "select" ||
+      tag === "option"
+    );
+  };
+
+  // Custom SPA controls (div[role=button], tabindex cards) ignore untrusted
+  // DOM clicks. Native <button>/<a>/<input> still take the faster DOM path.
+  const prefersTrustedClick = (element) => {
+    if (prefersTrustedType(element)) return true;
+    if (isNativeActivator(element)) return false;
+    const role = (element.getAttribute("role") || "").toLowerCase();
+    return (
+      role === "button" ||
+      role === "tab" ||
+      role === "menuitem" ||
+      role === "menuitemcheckbox" ||
+      role === "menuitemradio" ||
+      role === "switch" ||
+      role === "option" ||
+      role === "link" ||
+      role === "checkbox" ||
+      role === "radio" ||
+      role === "treeitem" ||
+      element.getAttribute("tabindex") === "0"
+    );
   };
 
   const withBox = (result, element) => {
@@ -529,8 +564,8 @@
   const clickElement = (element) => {
     element.scrollIntoView({ block: "center", inline: "nearest" });
     requireEnabled(element);
-    if (prefersTrustedInput(element)) {
-      return withBox({ clicked: false, needsTrustedInput: true, reason: "contenteditable" }, element);
+    if (prefersTrustedClick(element)) {
+      return withBox({ clicked: false, needsTrustedInput: true, reason: "custom-control" }, element);
     }
     dispatchPointer(element, "mousedown", { detail: 1 });
     dispatchPointer(element, "mouseup", { detail: 1 });
@@ -541,8 +576,8 @@
   const doubleClickElement = (element) => {
     element.scrollIntoView({ block: "center", inline: "nearest" });
     requireEnabled(element);
-    if (prefersTrustedInput(element)) {
-      return withBox({ dblclicked: false, needsTrustedInput: true, reason: "contenteditable" }, element);
+    if (prefersTrustedClick(element)) {
+      return withBox({ dblclicked: false, needsTrustedInput: true, reason: "custom-control" }, element);
     }
     dispatchPointer(element, "mousedown", { detail: 1 });
     dispatchPointer(element, "mouseup", { detail: 1 });
@@ -576,7 +611,7 @@
     }
     element.scrollIntoView({ block: "center", inline: "nearest" });
     element.focus();
-    if (prefersTrustedInput(element)) {
+    if (prefersTrustedType(element)) {
       return withBox(
         { typed: false, verified: false, needsTrustedInput: true, reason: "contenteditable", characters: text.length },
         element
@@ -626,6 +661,9 @@
         }
         if (message.method === "hover") {
           element.scrollIntoView({ block: "center" });
+          if (prefersTrustedClick(element)) {
+            return withBox({ hovered: false, needsTrustedInput: true, reason: "custom-control" }, element);
+          }
           const view = ownerView(element);
           const Pointer = view.PointerEvent || PointerEvent;
           const Mouse = view.MouseEvent || MouseEvent;

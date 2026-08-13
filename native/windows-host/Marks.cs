@@ -250,9 +250,7 @@ internal static partial class Program
 
     private static object BuildObservation(Process process, string application)
     {
-        var handle = process.MainWindowHandle;
-        if (handle == IntPtr.Zero)
-            throw new InvalidOperationException("The application window is unavailable.");
+        var handle = RequireWindowHandle(process, application);
         var root = AutomationElement.FromHandle(handle)
             ?? throw new InvalidOperationException("The application window is unavailable.");
         var catalog = CollectMarks(process, application, root);
@@ -267,9 +265,20 @@ internal static partial class Program
             generation = GenerationFor(process.Id) + 1;
             GenerationByProcess[process.Id] = generation;
             Marks.RemoveAll(mark => mark.ProcessId == process.Id);
+            var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var nextIndex = 1;
+            string NextCatalogId()
+            {
+                string id;
+                do { id = $"n{nextIndex++}"; } while (!used.Add(id));
+                return id;
+            }
             foreach (var mark in catalog)
-                Marks.Add(mark with { ProcessId = process.Id, Generation = generation, Source = "catalog" });
-            var used = new HashSet<string>(catalog.Select(mark => mark.Id), StringComparer.OrdinalIgnoreCase);
+            {
+                var prior = previousQuery.FirstOrDefault(old => SameFingerprint(old, mark));
+                var id = prior is not null && used.Add(prior.Id) ? prior.Id : NextCatalogId();
+                Marks.Add(mark with { Id = id, ProcessId = process.Id, Generation = generation, Source = "catalog" });
+            }
             var retained = 0;
             foreach (var old in previousQuery)
             {
@@ -277,8 +286,7 @@ internal static partial class Program
                 if (Marks.Any(mark => mark.ProcessId == process.Id && SameFingerprint(mark, old)))
                     continue;
                 if (!QueryMarkStillLive(process, old)) continue;
-                var id = used.Add(old.Id) ? old.Id : NextMarkId(process.Id);
-                used.Add(id);
+                var id = used.Add(old.Id) ? old.Id : NextCatalogId();
                 Marks.Add(old with { Id = id, Generation = generation, Source = "query" });
                 retained++;
             }
@@ -288,7 +296,7 @@ internal static partial class Program
         try
         {
             var focus = AutomationElement.FocusedElement;
-            if (focus is not null && focus.Current.ProcessId == process.Id)
+            if (focus is not null && ElementBelongsToProcess(focus, process, application))
                 focused = published.FirstOrDefault(mark => SameControl(mark, focus))?.Id;
         }
         catch { /* Focus can race while the target redraws. */ }
@@ -299,7 +307,7 @@ internal static partial class Program
             generation,
             application,
             processId = process.Id,
-            title = Truncate(process.MainWindowTitle ?? "", 160),
+            title = Truncate(WindowTitle(handle), 160),
             dpi,
             focused,
             markCount = published.Count,
@@ -316,7 +324,7 @@ internal static partial class Program
         try
         {
             var focus = AutomationElement.FocusedElement;
-            if (focus is not null && focus.Current.ProcessId == process.Id
+            if (focus is not null && ElementBelongsToProcess(focus, process, application)
                 && !candidates.Any(item => SameControl(item.Mark, focus)))
             {
                 var mark = DescribeMark("n0", process, application, focus);
@@ -449,7 +457,15 @@ internal static partial class Program
         try
         {
             var current = element.Current;
-            if (current.ProcessId != mark.ProcessId) return false;
+            if (current.ProcessId != mark.ProcessId)
+            {
+                try
+                {
+                    using var owner = Process.GetProcessById(mark.ProcessId);
+                    if (!ElementBelongsToProcess(element, owner)) return false;
+                }
+                catch { return false; }
+            }
             var type = current.ControlType?.ProgrammaticName ?? "";
             if (type != mark.ControlType) return false;
             var name = current.Name ?? "";
@@ -649,7 +665,7 @@ internal static partial class Program
                     || mark.AutomationId.Contains(needle, StringComparison.OrdinalIgnoreCase))));
         }
         if (matches.Count >= QuerySearchLimit) return matches.Take(QuerySearchLimit).ToList();
-        foreach (var element in SearchTreeByText(process, needle, QuerySearchLimit, QueryBudget))
+        foreach (var element in SearchTreeByText(process, application, needle, QuerySearchLimit, QueryBudget))
         {
             matches.Add(MintMark(process, application, element));
             if (matches.Count >= QuerySearchLimit) break;
@@ -662,10 +678,9 @@ internal static partial class Program
     }
 
     private static List<AutomationElement> SearchTreeByText(
-        Process process, string needle, int limit, TimeSpan budget)
+        Process process, string application, string needle, int limit, TimeSpan budget)
     {
-        var root = AutomationElement.FromHandle(process.MainWindowHandle)
-            ?? throw new InvalidOperationException("The application window is unavailable.");
+        var root = RequireAutomationRoot(process, application);
         var found = new List<AutomationElement>();
         var deadline = DateTime.UtcNow + budget;
         try
@@ -690,8 +705,17 @@ internal static partial class Program
                 var current = element.Current;
                 var name = current.Name ?? "";
                 var automationId = current.AutomationId ?? "";
+                var value = "";
+                try
+                {
+                    if (element.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern)
+                        && pattern is ValuePattern typed)
+                        value = typed.Current.Value ?? "";
+                }
+                catch { /* ValuePattern is optional. */ }
                 if ((name.Contains(needle, StringComparison.OrdinalIgnoreCase)
-                    || automationId.Contains(needle, StringComparison.OrdinalIgnoreCase))
+                    || automationId.Contains(needle, StringComparison.OrdinalIgnoreCase)
+                    || value.Contains(needle, StringComparison.OrdinalIgnoreCase))
                     && !found.Contains(element))
                     found.Add(element);
                 var child = TreeWalker.ControlViewWalker.GetFirstChild(element);
@@ -783,7 +807,7 @@ internal static partial class Program
         if (nx is null || ny is null) return false;
         if (nx < 0 || nx > 1 || ny < 0 || ny > 1)
             throw new InvalidOperationException("Normalized click points must be between 0 and 1 (window bitmap space).");
-        if (!GetWindowRect(process.MainWindowHandle, out var rect))
+        if (!GetWindowRect(FindBestWindowHandle(process, GetApplication(request)), out var rect))
             throw new InvalidOperationException("Could not read the target window bounds.");
         var width = Math.Max(1, rect.Right - rect.Left);
         var height = Math.Max(1, rect.Bottom - rect.Top);
@@ -796,7 +820,7 @@ internal static partial class Program
     private static bool TryPageDocumentBounds(Process process, out RECT page)
     {
         page = default;
-        var root = AutomationElement.FromHandle(process.MainWindowHandle);
+        var root = TryAutomationRoot(process, null);
         if (root is null) return false;
         AutomationElement? best = null;
         var bestArea = 0.0;
@@ -849,7 +873,7 @@ internal static partial class Program
             if (!TryPageDocumentBounds(process, out rect))
                 return TryNormalizedPoint(request, process, out x, out y);
         }
-        else if (!GetWindowRect(process.MainWindowHandle, out rect))
+        else if (!GetWindowRect(FindBestWindowHandle(process, GetApplication(request)), out rect))
         {
             throw new InvalidOperationException("Could not read the target window bounds.");
         }
@@ -915,7 +939,7 @@ internal static partial class Program
         if (!TryPageOrWindowPoint(request, process, out var x, out var y))
             throw new InvalidOperationException("probe requires nx and ny in window bitmap space (0–1).");
         var hit = HitTest(x, y);
-        if (hit is null || hit.Current.ProcessId != process.Id)
+        if (hit is null || !ElementBelongsToProcess(hit, process, GetApplication(request)))
             return new { kind = "visualOnly", x, y, reason = "No UI Automation control is under that point." };
         if (!IsUsableElement(hit)
             || hit.Current.ControlType == ControlType.Window
@@ -952,7 +976,7 @@ internal static partial class Program
     private static object Scroll(HostRequest request)
     {
         var process = ResolveProcess(request);
-        FocusProcess(process);
+        FocusProcess(process, GetApplication(request));
         var direction = (GetOptionalString(request.Params, "direction") ?? "down").ToLowerInvariant();
         var text = GetOptionalString(request.Params, "text");
         var target = TryResolveMark(request);
@@ -967,7 +991,7 @@ internal static partial class Program
             ((ScrollItemPattern)scrollItem).ScrollIntoView();
             return new { scrolled = true, how = "ScrollItemPattern" };
         }
-        var pane = target ?? AutomationElement.FromHandle(process.MainWindowHandle);
+        var pane = target ?? TryAutomationRoot(process, null);
         while (pane is not null)
         {
             if (pane.TryGetCurrentPattern(ScrollPattern.Pattern, out var scrollPattern))
@@ -1007,7 +1031,8 @@ internal static partial class Program
 
     private static bool TryWheelSafePoint(Process process, AutomationElement? preferred, out int x, out int y)
     {
-        if (!GetWindowRect(process.MainWindowHandle, out var rect))
+        var handle = FindBestWindowHandle(process, null);
+        if (handle == IntPtr.Zero || !GetWindowRect(handle, out var rect))
         {
             x = 0;
             y = 0;
@@ -1027,7 +1052,7 @@ internal static partial class Program
         {
             if (cx < rect.Left || cx >= rect.Right || cy < rect.Top || cy >= rect.Bottom) continue;
             var hit = HitTest(cx, cy);
-            if (hit is null || hit.Current.ProcessId != process.Id || !IsWheelSensitive(hit))
+            if (hit is null || !ElementBelongsToProcess(hit, process) || !IsWheelSensitive(hit))
             {
                 x = cx;
                 y = cy;
@@ -1042,7 +1067,7 @@ internal static partial class Program
     private static object PointerGesture(HostRequest request, string kind)
     {
         var process = ResolveProcess(request);
-        FocusProcess(process);
+        FocusProcess(process, GetApplication(request));
         var element = TryResolveMark(request);
         int x, y;
         if (element is not null) (x, y) = CenterOf(element);
@@ -1082,7 +1107,7 @@ internal static partial class Program
     private static object Drag(HostRequest request)
     {
         var process = ResolveProcess(request);
-        FocusProcess(process);
+        FocusProcess(process, GetApplication(request));
         var fromId = GetOptionalString(request.Params, "from") ?? GetOptionalString(request.Params, "mark");
         var toId = GetOptionalString(request.Params, "to");
         if (string.IsNullOrWhiteSpace(fromId) || string.IsNullOrWhiteSpace(toId))
