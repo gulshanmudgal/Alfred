@@ -7,6 +7,7 @@ export interface AppSettings {
   screenshotRetention: "all" | "failures" | "none";
   theme: "system" | "light" | "dark";
   shareScreenshotsWithPlanner: boolean;
+  diagnosticLogging: boolean;
 }
 
 export interface SystemInfo {

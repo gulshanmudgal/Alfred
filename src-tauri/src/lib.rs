@@ -18,6 +18,16 @@ use uuid::Uuid;
 
 const PROTOCOL_VERSION: &str = "1.0";
 const VAULT_SERVICE: &str = "com.alfred.desktop";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+fn hide_windows_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let _ = command;
+}
 
 #[derive(Default)]
 struct RuntimeState {
@@ -41,15 +51,18 @@ struct NativeHostProcess {
     to_host: mpsc::Sender<String>,
     from_host: mpsc::Receiver<Result<String, String>>,
     capability_token: String,
+    last_stderr: Arc<Mutex<String>>,
 }
 
 fn spawn_native_host(app: &AppHandle) -> Result<NativeHostProcess, String> {
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-    let mut child = Command::new(native_host_executable(app)?)
+    let mut host_command = Command::new(native_host_executable(app)?);
+    hide_windows_console(&mut host_command);
+    let mut child = host_command
         .env("ALFRED_CAPABILITY_TOKEN", &token)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| error.to_string())?;
     let mut stdin = child
@@ -62,6 +75,18 @@ fn spawn_native_host(app: &AppHandle) -> Result<NativeHostProcess, String> {
             .take()
             .ok_or_else(|| "Could not open native-host output.".to_string())?,
     );
+    let last_stderr = Arc::new(Mutex::new(String::new()));
+    if let Some(stderr) = child.stderr.take() {
+        let sink = last_stderr.clone();
+        std::thread::spawn(move || {
+            let reader = StdBufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                if let Ok(mut held) = sink.lock() {
+                    *held = line.chars().take(400).collect();
+                }
+            }
+        });
+    }
     let (to_host, worker_inbox) = mpsc::channel::<String>();
     let (worker_outbox, from_host) = mpsc::channel::<Result<String, String>>();
     std::thread::spawn(move || {
@@ -78,7 +103,7 @@ fn spawn_native_host(app: &AppHandle) -> Result<NativeHostProcess, String> {
                     format!("Could not read the Windows automation host response: {error}")
                 })?;
                 if response.is_empty() {
-                    return Err("The native host closed the connection.".to_string());
+                    return Err("The native host closed the connection.".into());
                 }
                 Ok(response)
             })();
@@ -93,6 +118,7 @@ fn spawn_native_host(app: &AppHandle) -> Result<NativeHostProcess, String> {
         to_host,
         from_host,
         capability_token: token,
+        last_stderr,
     })
 }
 
@@ -117,6 +143,10 @@ pub struct AppSettings {
     /// it is the fallback for canvas-based and accessibility-poor applications.
     #[serde(default)]
     share_screenshots_with_planner: bool,
+    /// Local JSONL of planner turns and tool calls. Off by default; never sent
+    /// to a provider. Useful when diagnosing a failed run.
+    #[serde(default)]
+    diagnostic_logging: bool,
 }
 
 impl Default for AppSettings {
@@ -128,6 +158,7 @@ impl Default for AppSettings {
             screenshot_retention: "failures".into(),
             theme: "system".into(),
             share_screenshots_with_planner: true,
+            diagnostic_logging: false,
         }
     }
 }
@@ -163,6 +194,8 @@ pub struct BrowserCommand {
     target_label: Option<String>,
     #[serde(default)]
     params: Value,
+    #[serde(default)]
+    run_id: Option<String>,
 }
 
 /// A state check evaluated against the target application (UIA element lookup for
@@ -507,6 +540,133 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     atomic_write(path, &contents)
 }
 
+fn diagnostic_logging_enabled(app: &AppHandle) -> bool {
+    get_settings(app.clone())
+        .map(|settings| settings.diagnostic_logging)
+        .unwrap_or(false)
+}
+
+fn run_logs_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let path = app_data_dir(app)?.join("run-logs");
+    fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+fn run_log_path(app: &AppHandle, run_id: &str) -> Result<PathBuf, String> {
+    Ok(run_logs_dir(app)?.join(format!("{run_id}.jsonl")))
+}
+
+fn compact_log_value(value: &Value) -> Value {
+    match value {
+        Value::String(text) if text.len() > 400 => {
+            Value::String(format!("{}…(+{} chars)", text.chars().take(200).collect::<String>(), text.len() - 200))
+        }
+        Value::Object(map) => {
+            let mut compact = serde_json::Map::new();
+            for (key, item) in map {
+                if matches!(key.as_str(), "base64" | "dataUrl" | "capabilityToken") {
+                    compact.insert(key.clone(), Value::String("[omitted]".into()));
+                } else {
+                    compact.insert(key.clone(), compact_log_value(item));
+                }
+            }
+            Value::Object(compact)
+        }
+        Value::Array(items) => Value::Array(items.iter().take(24).map(compact_log_value).collect()),
+        other => other.clone(),
+    }
+}
+
+fn append_run_log(app: &AppHandle, run_id: &str, event: Value) {
+    if run_id.is_empty() || run_id == "resolve" || run_id == "browser-live" || run_id == "planning"
+    {
+        return;
+    }
+    if !diagnostic_logging_enabled(app) {
+        return;
+    }
+    let Ok(path) = run_log_path(app, run_id) else {
+        return;
+    };
+    let mut record = match event {
+        Value::Object(map) => map,
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("event".into(), other);
+            map
+        }
+    };
+    record
+        .entry("at".to_string())
+        .or_insert_with(|| Value::String(Utc::now().to_rfc3339()));
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{}", Value::Object(record));
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunLogSummary {
+    run_id: String,
+    path: String,
+    updated_at: String,
+    bytes: u64,
+}
+
+#[tauri::command]
+fn list_run_logs(app: AppHandle) -> Result<Vec<RunLogSummary>, String> {
+    let directory = run_logs_dir(&app)?;
+    let mut logs = Vec::new();
+    let entries = fs::read_dir(&directory).map_err(|error| error.to_string())?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let metadata = entry.metadata().ok();
+        logs.push(RunLogSummary {
+            run_id: path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .into(),
+            path: path.display().to_string(),
+            updated_at: metadata
+                .as_ref()
+                .and_then(|info| info.modified().ok())
+                .map(DateTime::<Utc>::from)
+                .map(|time| time.to_rfc3339())
+                .unwrap_or_default(),
+            bytes: metadata.map(|info| info.len()).unwrap_or(0),
+        });
+    }
+    logs.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    logs.truncate(40);
+    Ok(logs)
+}
+
+#[tauri::command]
+fn read_run_log(app: AppHandle, run_id: String) -> Result<String, String> {
+    let path = run_log_path(&app, &run_id)?;
+    let contents = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let line_count = contents.lines().count();
+    if line_count <= 200 {
+        return Ok(contents);
+    }
+    let skipped = line_count - 200;
+    let tail = contents
+        .lines()
+        .skip(skipped)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(format!("… {skipped} earlier events omitted …\n{tail}"))
+}
+
+#[tauri::command]
+fn run_logs_folder(app: AppHandle) -> Result<String, String> {
+    Ok(run_logs_dir(&app)?.display().to_string())
+}
+
 fn default_library(app: &AppHandle) -> String {
     app.path()
         .document_dir()
@@ -618,7 +778,9 @@ fn resolve_provider_command(command: &str) -> Option<PathBuf> {
     } else {
         "which"
     };
-    let output = Command::new(finder).arg(command).output().ok()?;
+    let mut finder_command = Command::new(finder);
+    hide_windows_console(&mut finder_command);
+    let output = finder_command.arg(command).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -696,6 +858,7 @@ fn provider_version(path: &Path) -> Option<String> {
     let args = vec!["--version".to_string()];
     let resolved = resolved_process(path, &args, true).ok()?;
     let mut process = Command::new(resolved.program);
+    hide_windows_console(&mut process);
     process.args(resolved.args);
     #[cfg(target_os = "windows")]
     if let Some(raw_argument) = resolved.windows_raw_argument {
@@ -924,6 +1087,10 @@ fn provider_command(
     let planner_workspace = app_data_dir(app)?.join("planner-workspace");
     fs::create_dir_all(&planner_workspace).map_err(|error| error.to_string())?;
     let mut process = tokio::process::Command::new(&resolved.program);
+    #[cfg(windows)]
+    {
+        process.creation_flags(CREATE_NO_WINDOW);
+    }
     process
         .args(resolved.args)
         .current_dir(planner_workspace)
@@ -980,7 +1147,9 @@ fn preflight_provider(provider: &str) -> Result<(), String> {
 
 const ALLOWED_PLAN_METHODS: &[&str] = &[
     "launchApplication",
+    "listApplications",
     "listInstalledApplications",
+    "activate",
     "focusApplication",
     "navigateApplication",
     "observeWindow",
@@ -1149,10 +1318,8 @@ fn validate_workflow_step(step: &WorkflowStep) -> Result<(), String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "Every workflow step must name an application.".to_string())?;
-    let params = step
-        .payload
-        .as_ref()
-        .ok_or_else(|| format!("Parameters for {} must be a JSON object.", step.kind))?;
+    let empty_params = serde_json::json!({});
+    let params = step.payload.as_ref().unwrap_or(&empty_params);
     if !params.is_object() {
         return Err(format!(
             "Parameters for {} must be a JSON object.",
@@ -1925,9 +2092,10 @@ fn send_browser_command_inner(
     }
     let token = fs::read_to_string(browser_token_path(&app)?)
         .map_err(|_| "The browser bridge has not been paired yet.".to_string())?;
+    let method_name = command.method.clone();
     let mut request = command.params.as_object().cloned().unwrap_or_default();
     request.insert("id".into(), Value::String(command.id));
-    request.insert("method".into(), Value::String(command.method));
+    request.insert("method".into(), Value::String(method_name.clone()));
     request.insert("effect".into(), Value::String(command.effect));
     request.insert("intent".into(), Value::String(command.intent));
     if let Some(target) = command.target_label {
@@ -1944,11 +2112,39 @@ fn send_browser_command_inner(
     // The bridge reports failures inside the envelope; surface them so runs fail
     // (and retry) honestly instead of treating a rejected command as success.
     if value.get("ok").and_then(Value::as_bool) == Some(false) {
-        return Err(value
+        let error = value
             .get("error")
             .and_then(Value::as_str)
             .unwrap_or("Browser action failed.")
-            .to_string());
+            .to_string();
+        if let Some(run_id) = command.run_id.as_deref() {
+            append_run_log(
+                &app,
+                run_id,
+                serde_json::json!({
+                    "kind": "tool",
+                    "channel": "browser",
+                    "method": method_name,
+                    "ok": false,
+                    "error": error,
+                    "payload": compact_log_value(&command.params)
+                }),
+            );
+        }
+        return Err(error);
+    }
+    if let Some(run_id) = command.run_id.as_deref() {
+        append_run_log(
+            &app,
+            run_id,
+            serde_json::json!({
+                "kind": "tool",
+                "channel": "browser",
+                "method": method_name,
+                "ok": true,
+                "result": compact_log_value(&value)
+            }),
+        );
     }
     Ok(value)
 }
@@ -2087,6 +2283,7 @@ fn execute_native_action_inner(
     timeout: Duration,
     approval_override: bool,
 ) -> Result<Value, String> {
+    let method_name = method.clone();
     let decision = evaluate_action(app.clone(), request.clone())?;
     // hard_deny is absolute; only request_user can be overridden by the explicit
     // one-step approval the user grants at the mid-run waiting prompt.
@@ -2128,9 +2325,16 @@ fn execute_native_action_inner(
     let response = match host.from_host.recv_timeout(timeout) {
         Ok(Ok(line)) => line,
         Ok(Err(error)) => {
+            let detail = host
+                .last_stderr
+                .lock()
+                .ok()
+                .filter(|line| !line.is_empty())
+                .map(|line| format!("{error} Host: {line}"))
+                .unwrap_or(error);
             let _ = host.child.kill();
             *guard = None;
-            return Err(error);
+            return Err(detail);
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
             // A hung target application must fail this one step, never freeze
@@ -2149,13 +2353,40 @@ fn execute_native_action_inner(
     };
     let value: Value = serde_json::from_str(&response).map_err(|error| error.to_string())?;
     if value.get("ok").and_then(Value::as_bool) == Some(false) {
-        return Err(value
+        let error = value
             .get("error")
             .and_then(Value::as_str)
             .unwrap_or("Native action failed.")
-            .to_string());
+            .to_string();
+        append_run_log(
+            app,
+            &request.run_id,
+            serde_json::json!({
+                "kind": "tool",
+                "channel": "native",
+                "method": method_name,
+                "application": request.application,
+                "ok": false,
+                "error": error,
+                "payload": compact_log_value(request.payload.as_ref().unwrap_or(&Value::Null))
+            }),
+        );
+        return Err(error);
     }
-    Ok(value.get("result").cloned().unwrap_or(Value::Null))
+    let result = value.get("result").cloned().unwrap_or(Value::Null);
+    append_run_log(
+        app,
+        &request.run_id,
+        serde_json::json!({
+            "kind": "tool",
+            "channel": "native",
+            "method": method_name,
+            "application": request.application,
+            "ok": true,
+            "result": compact_log_value(&result)
+        }),
+    );
+    Ok(result)
 }
 
 /// Re-resolve a recorded application name to the process that owns its window
@@ -2165,7 +2396,10 @@ fn execute_native_action_inner(
 /// point of launchApplication is that the application is not running yet, so
 /// pre-resolving it would always fail and the launch would never happen.
 fn needs_process_resolution(kind: &str, application: &str) -> bool {
-    kind != "launchApplication" && application != "Alfred"
+    !matches!(
+        kind,
+        "launchApplication" | "listApplications" | "listInstalledApplications" | "resolveApplication"
+    ) && application != "Alfred"
 }
 
 fn resolve_application_process_id(
@@ -2269,6 +2503,7 @@ fn evaluate_step_condition(
                 intent: "check page state before continuing".into(),
                 target_label: None,
                 params,
+                run_id: None,
             },
             false,
         )?;
@@ -3014,6 +3249,7 @@ async fn drive_workflow_run(
                         intent: step.intent.clone().unwrap_or_else(|| step.title.clone()),
                         target_label: step.target_label.clone(),
                         params: payload,
+                        run_id: Some(run_id.clone()),
                     },
                     approved,
                 )
@@ -3648,7 +3884,9 @@ fn kill_planner_process(pid: Option<u32>) {
     };
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
+        let mut kill = Command::new("taskkill");
+        hide_windows_console(&mut kill);
+        let _ = kill
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -3771,23 +4009,74 @@ async fn run_planner_turn(
                 let combined = format!("{stdout}\n{stderr}");
                 if !output.status.success() {
                     let detail: String = combined.trim().chars().take(600).collect();
-                    return Err(format!(
-                        "{provider} exited with {}: {detail}",
-                        output.status
-                    ));
+                    let error = format!("{provider} exited with {}: {detail}", output.status);
+                    append_run_log(
+                        app,
+                        run_id,
+                        serde_json::json!({
+                            "kind": "planner",
+                            "provider": provider,
+                            "ok": false,
+                            "error": error
+                        }),
+                    );
+                    return Err(error);
                 }
                 if let Some(error) = provider_output_error(provider, &combined) {
+                    append_run_log(
+                        app,
+                        run_id,
+                        serde_json::json!({
+                            "kind": "planner",
+                            "provider": provider,
+                            "ok": false,
+                            "error": error
+                        }),
+                    );
                     return Err(error);
                 }
                 let session = provider_session_id_from_output(provider, &combined);
+                append_run_log(
+                    app,
+                    run_id,
+                    serde_json::json!({
+                        "kind": "planner",
+                        "provider": provider,
+                        "ok": true,
+                        "elapsedMs": started.elapsed().as_millis() as u64,
+                        "output": compact_log_value(&Value::String(combined.chars().take(1200).collect()))
+                    }),
+                );
                 return Ok((combined, session));
             }
-            Ok(Err(error)) => return Err(format!("The planner process failed: {error}")),
+            Ok(Err(error)) => {
+                append_run_log(
+                    app,
+                    run_id,
+                    serde_json::json!({
+                        "kind": "planner",
+                        "provider": provider,
+                        "ok": false,
+                        "error": error.to_string()
+                    }),
+                );
+                return Err(format!("The planner process failed: {error}"));
+            }
             Err(_) => {
                 let now = std::time::Instant::now();
                 if now >= deadline {
                     kill_planner_process(planner_pid);
                     let _ = wait.await;
+                    append_run_log(
+                        app,
+                        run_id,
+                        serde_json::json!({
+                            "kind": "planner",
+                            "provider": provider,
+                            "ok": false,
+                            "error": "The planner did not answer within 180 seconds."
+                        }),
+                    );
                     return Err("The planner did not answer within 180 seconds.".into());
                 }
                 // A CLI turn can legitimately take minutes; keep the cockpit
@@ -4280,6 +4569,7 @@ fn gather_observations(
                     intent: "observe the page before planning".into(),
                     target_label: None,
                     params: params.clone(),
+                    run_id: Some(run_id.to_string()),
                 },
                 false,
             ) {
@@ -4309,6 +4599,7 @@ fn gather_observations(
                             intent: "read page content before planning".into(),
                             target_label: None,
                             params: read_params,
+                            run_id: Some(run_id.to_string()),
                         },
                         false,
                     ) {
@@ -5459,6 +5750,7 @@ async fn drive_goal_run(
                         intent: step.intent.clone().unwrap_or_else(|| title.clone()),
                         target_label: step.target_label.clone(),
                         params: payload.clone(),
+                        run_id: Some(run_id.clone()),
                     },
                     approved,
                 )
@@ -5900,6 +6192,7 @@ fn capture_run_screenshots(
                     intent: "capture the page for planner vision".into(),
                     target_label: None,
                     params,
+                    run_id: Some(run_id.to_string()),
                 },
                 false,
             )
@@ -6057,7 +6350,9 @@ fn register_windows_schedule(schedule: &WorkflowSchedule) -> Result<(), String> 
         schedule.workflow_id
     );
     let start = format!("{:02}:{:02}", schedule.hour, schedule.minute);
-    let status = Command::new("schtasks")
+    let mut task = Command::new("schtasks");
+    hide_windows_console(&mut task);
+    let status = task
         .args([
             "/Create", "/SC", "WEEKLY", "/D", &days, "/TN", &task_name, "/TR", &task_run, "/ST",
             &start, "/F",
@@ -6365,6 +6660,9 @@ pub fn run() {
             send_browser_command,
             execute_native_action,
             start_demo_run,
+            list_run_logs,
+            read_run_log,
+            run_logs_folder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Alfred");
@@ -6910,9 +7208,34 @@ mod tests {
     fn launches_skip_process_resolution() {
         // The app is intentionally not running when a launch step executes.
         assert!(!needs_process_resolution("launchApplication", "Notepad"));
+        assert!(!needs_process_resolution("listApplications", "Alfred"));
+        assert!(!needs_process_resolution("listInstalledApplications", "Alfred"));
         assert!(needs_process_resolution("typeText", "Notepad"));
         assert!(needs_process_resolution("focusApplication", "Notepad"));
         assert!(!needs_process_resolution("typeText", "Alfred"));
+    }
+    #[test]
+    fn inventory_methods_are_allowed_observe_actions() {
+        let list_apps = WorkflowStep {
+            id: "list".into(),
+            title: "See running apps".into(),
+            kind: "listApplications".into(),
+            effect: "observe".into(),
+            application: Some("Alfred".into()),
+            intent: Some("list running windows".into()),
+            target_label: None,
+            payload: None,
+            timeout_ms: default_timeout(),
+            retries: default_retries(),
+            wait_for: None,
+            expect: None,
+            save_as: None,
+        };
+        assert!(validate_workflow_step(&list_apps).is_ok());
+        assert_eq!(method_effect("listApplications"), "observe");
+        assert_eq!(method_effect("activate"), "modify_reversible");
+        assert!(ALLOWED_PLAN_METHODS.contains(&"listApplications"));
+        assert!(ALLOWED_PLAN_METHODS.contains(&"activate"));
     }
     #[test]
     fn mutating_methods_cannot_masquerade_as_observe() {
