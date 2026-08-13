@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -63,6 +63,49 @@ function plannerSummary(settings: AppSettings, provider: string) {
   return [plannerChoice(settings, provider, "model"), plannerChoice(settings, provider, "effort")]
     .filter(Boolean)
     .join(" · ");
+}
+
+function isArchivedWorkflow(workflow: Workflow) {
+  return workflow.status.toLowerCase() === "archived";
+}
+
+function OverflowMenu({ label, children }: { label: string; children: ReactNode }) {
+  const [open, setOpen] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onPointer = (event: PointerEvent) => {
+      if (!root.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointer);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("pointerdown", onPointer);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+  return (
+    <div className="overflow-menu" ref={root}>
+      <button
+        type="button"
+        className="overflow-trigger"
+        aria-label={label}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <Icon name="more" size={16} />
+      </button>
+      {open && (
+        <div className="overflow-panel" role="menu" onClick={() => setOpen(false)}>
+          {children}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function App() {
@@ -141,8 +184,10 @@ function App() {
             {view === "library" && (
               <Library
                 workflows={workflows}
+                libraryPath={settings.libraryPath}
                 onStartGoal={() => setView("home")}
                 onRun={setActiveWorkflow}
+                onChanged={() => refreshWorkflows(settings.libraryPath)}
               />
             )}
             {view === "settings" && (
@@ -226,7 +271,7 @@ function Home({
   onRun: (workflow: Workflow) => void;
   onOpenSettings: () => void;
 }) {
-  const visible = workflows.slice(0, 4);
+  const visible = workflows.filter((workflow) => !isArchivedWorkflow(workflow)).slice(0, 4);
   return (
     <div className="page home-page">
       <section className="hero">
@@ -311,12 +356,30 @@ function GoalLauncher({
   );
 }
 
-function WorkflowCard({ workflow, onRun }: { workflow: Workflow; onRun: () => void }) {
+function WorkflowCard({
+  workflow,
+  onRun,
+  onArchive,
+  onRestore,
+}: {
+  workflow: Workflow;
+  onRun?: () => void;
+  onArchive?: () => void;
+  onRestore?: () => void;
+}) {
+  const archived = isArchivedWorkflow(workflow);
   return (
-    <article className="workflow-card">
+    <article className={`workflow-card${archived ? " archived" : ""}`}>
       <div className="workflow-title-row">
         <h3>{workflow.name}</h3>
         <span className={`status-badge ${workflow.status}`}>{workflow.status}</span>
+        {onArchive && !archived && (
+          <OverflowMenu label={`More actions for ${workflow.name}`}>
+            <button type="button" role="menuitem" onClick={onArchive}>
+              <Icon name="archive" size={14} /> Archive
+            </button>
+          </OverflowMenu>
+        )}
       </div>
       <p>{workflow.goal}</p>
       <div className="app-chips">
@@ -324,13 +387,51 @@ function WorkflowCard({ workflow, onRun }: { workflow: Workflow; onRun: () => vo
       </div>
       <div className="workflow-card-footer">
         <span>{workflow.status === "example" ? "Safe simulation" : `Updated ${relativeDate(workflow.updatedAt)}`}</span>
-        <button onClick={onRun}><Icon name="runs" size={14} /> Run</button>
+        <div className="workflow-card-actions">
+          {archived
+            ? onRestore && <button type="button" className="ghost-button" onClick={onRestore}><Icon name="archive" size={14} /> Restore</button>
+            : onRun && <button type="button" onClick={onRun}><Icon name="runs" size={14} /> Run</button>}
+        </div>
       </div>
     </article>
   );
 }
 
-function Library({ workflows, onStartGoal, onRun }: { workflows: Workflow[]; onStartGoal: () => void; onRun: (workflow: Workflow) => void }) {
+function Library({
+  workflows,
+  libraryPath,
+  onStartGoal,
+  onRun,
+  onChanged,
+}: {
+  workflows: Workflow[];
+  libraryPath: string;
+  onStartGoal: () => void;
+  onRun: (workflow: Workflow) => void;
+  onChanged: () => Promise<void>;
+}) {
+  const [showArchived, setShowArchived] = useState(false);
+  const [busyId, setBusyId] = useState("");
+  const [error, setError] = useState("");
+  const [scheduleRevision, setScheduleRevision] = useState(0);
+  const active = workflows.filter((workflow) => !isArchivedWorkflow(workflow));
+  const archived = workflows.filter(isArchivedWorkflow);
+  const shown = showArchived ? archived : active;
+  const setArchived = async (workflow: Workflow, next: boolean) => {
+    if (busyId) return;
+    setBusyId(workflow.id);
+    setError("");
+    try {
+      await invoke("set_workflow_archived", { libraryPath, workflowId: workflow.id, archived: next });
+      await onChanged();
+      setScheduleRevision((value) => value + 1);
+      if (!next && archived.length <= 1) setShowArchived(false);
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setBusyId("");
+    }
+  };
   return (
     <div className="page library-page">
       <section className="page-title">
@@ -338,35 +439,60 @@ function Library({ workflows, onStartGoal, onRun }: { workflows: Workflow[]; onS
           <h1>Library</h1>
           <p>Reusable workflows and the weekday schedules that run them.</p>
         </div>
-        <button className="primary-button" onClick={onStartGoal}><Icon name="plus" size={16} /> New goal</button>
+        <div className="page-title-actions library-title-actions">
+          {(archived.length > 0 || showArchived) && (
+            <OverflowMenu label="Library options">
+              <button type="button" role="menuitem" onClick={() => setShowArchived((value) => !value)}>
+                <Icon name="archive" size={14} />
+                {showArchived ? "Show library" : `Show archived (${archived.length})`}
+              </button>
+            </OverflowMenu>
+          )}
+          <button className="primary-button" onClick={onStartGoal}><Icon name="plus" size={16} /> New goal</button>
+        </div>
       </section>
-      {workflows.length === 0 ? (
+      {error && <div className="error-message">{error}</div>}
+      {shown.length === 0 ? (
         <EmptyState
-          icon="folder"
-          title="Nothing saved yet"
-          description="Run a goal all the way through, then save it here."
-          action="Write a goal"
-          onAction={onStartGoal}
+          icon={showArchived ? "archive" : "folder"}
+          title={showArchived ? "No archived workflows" : workflows.length ? "Nothing in the library" : "Nothing saved yet"}
+          description={showArchived
+            ? "Restored workflows come back here as ready."
+            : workflows.length
+              ? "Archived workflows stay on disk. Open the archive to restore one."
+              : "Run a goal all the way through, then save it here."}
+          action={showArchived || !archived.length ? "Write a goal" : "Show archived"}
+          onAction={showArchived || !archived.length ? onStartGoal : () => setShowArchived(true)}
         />
       ) : (
         <div className="workflow-list">
-          {workflows.map((workflow) => <WorkflowCard key={workflow.id} workflow={workflow} onRun={() => onRun(workflow)} />)}
+          {shown.map((workflow) => (
+            <WorkflowCard
+              key={workflow.id}
+              workflow={workflow}
+              onRun={isArchivedWorkflow(workflow) || busyId === workflow.id ? undefined : () => onRun(workflow)}
+              onArchive={busyId === workflow.id ? undefined : () => setArchived(workflow, true)}
+              onRestore={busyId === workflow.id ? undefined : () => setArchived(workflow, false)}
+            />
+          ))}
         </div>
       )}
-      <ScheduleSection workflows={workflows} onStartGoal={onStartGoal} />
+      <ScheduleSection workflows={active} revision={scheduleRevision} onStartGoal={onStartGoal} />
     </div>
   );
 }
 
-function ScheduleSection({ workflows, onStartGoal }: { workflows: Workflow[]; onStartGoal: () => void }) {
+function ScheduleSection({ workflows, revision = 0, onStartGoal }: { workflows: Workflow[]; revision?: number; onStartGoal: () => void }) {
   const [schedules, setSchedules] = useState<WorkflowSchedule[]>([]);
   const [workflowId, setWorkflowId] = useState(workflows[0]?.id ?? "");
   const [time, setTime] = useState("09:00");
   const [error, setError] = useState("");
   const refresh = useCallback(() => invoke<WorkflowSchedule[]>("list_schedules").then(setSchedules), []);
-  useEffect(() => { refresh(); }, [refresh]);
+  useEffect(() => { refresh(); }, [refresh, revision]);
   useEffect(() => {
-    if (!workflowId && workflows[0]) setWorkflowId(workflows[0].id);
+    if (!workflows.some((item) => item.id === workflowId)) {
+      setWorkflowId(workflows[0]?.id ?? "");
+    }
   }, [workflows, workflowId]);
   const add = async () => {
     const workflow = workflows.find((item) => item.id === workflowId);
@@ -394,23 +520,35 @@ function ScheduleSection({ workflows, onStartGoal }: { workflows: Workflow[]; on
       )}
       {error && <div className="error-message">{error}</div>}
       <div className="schedule-list">
-        {schedules.map((schedule) => (
-          <article className="settings-section schedule-row" key={schedule.id}>
-            <div>
-              <strong>{schedule.workflowName}</strong>
-              <span>Weekdays at {String(schedule.hour).padStart(2, "0")}:{String(schedule.minute).padStart(2, "0")}</span>
-            </div>
-            <button
-              className={schedule.enabled ? "status-badge ready" : "status-badge"}
-              onClick={async () => {
-                const next = await invoke<WorkflowSchedule[]>("set_schedule_enabled", { scheduleId: schedule.id, enabled: !schedule.enabled });
-                setSchedules(next);
-              }}
-            >
-              {schedule.enabled ? "On" : "Off"}
-            </button>
-          </article>
-        ))}
+        {schedules.map((schedule) => {
+          const archivedSchedule = !workflows.some((item) => item.id === schedule.workflowId);
+          return (
+            <article className="settings-section schedule-row" key={schedule.id}>
+              <div>
+                <strong>{schedule.workflowName}</strong>
+                <span>Weekdays at {String(schedule.hour).padStart(2, "0")}:{String(schedule.minute).padStart(2, "0")}</span>
+              </div>
+              <button
+                type="button"
+                className={schedule.enabled && !archivedSchedule ? "status-badge ready" : "status-badge"}
+                disabled={archivedSchedule}
+                title={archivedSchedule ? "Restore this workflow before turning its schedule back on." : undefined}
+                onClick={async () => {
+                  if (archivedSchedule) return;
+                  try {
+                    const next = await invoke<WorkflowSchedule[]>("set_schedule_enabled", { scheduleId: schedule.id, enabled: !schedule.enabled });
+                    setSchedules(next);
+                    setError("");
+                  } catch (caught) {
+                    setError(String(caught));
+                  }
+                }}
+              >
+                {archivedSchedule || !schedule.enabled ? "Off" : "On"}
+              </button>
+            </article>
+          );
+        })}
       </div>
       {!schedules.length && workflows.length === 0 && (
         <EmptyState icon="calendar" title="No schedules yet" description="Save a workflow first, then choose a weekday time." action="Write a goal" onAction={onStartGoal} />

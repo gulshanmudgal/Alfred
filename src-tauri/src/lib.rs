@@ -2560,6 +2560,141 @@ fn list_workflows(library_path: String) -> Result<Vec<Workflow>, String> {
     Ok(workflows)
 }
 
+fn is_archived_status(status: &str) -> bool {
+    status.eq_ignore_ascii_case("archived")
+}
+
+fn ensure_workflow_runnable(workflow: &Workflow) -> Result<(), String> {
+    if is_archived_status(&workflow.status) {
+        Err("This workflow is archived. Restore it before running or scheduling it.".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn apply_workflow_archive(workflow: &mut Workflow, archived: bool) -> Result<bool, String> {
+    if workflow.status.eq_ignore_ascii_case("recording") {
+        return Err("A recording cannot be archived.".into());
+    }
+    if archived == is_archived_status(&workflow.status) {
+        return Ok(false);
+    }
+    workflow.status = if archived {
+        "archived".into()
+    } else {
+        "ready".into()
+    };
+    workflow.updated_at = Utc::now();
+    Ok(true)
+}
+
+fn persist_workflow_archive(
+    library_path: &str,
+    workflow_id: &str,
+    archived: bool,
+) -> Result<(PathBuf, Workflow, bool), String> {
+    let (path, mut workflow) = load_workflow(library_path, workflow_id)?;
+    let changed = apply_workflow_archive(&mut workflow, archived)?;
+    if changed {
+        save_workflow(&path, &workflow)?;
+    }
+    Ok((path, workflow, changed))
+}
+
+/// Turns off every stored schedule for `workflow_id` and returns their ids so the
+/// OS task can be disabled even when the JSON row is already `enabled: false`.
+fn reconcile_schedule_records(
+    schedules: &mut [WorkflowSchedule],
+    workflow_id: &str,
+) -> Vec<String> {
+    let ids = schedules
+        .iter()
+        .filter(|schedule| schedule.workflow_id == workflow_id)
+        .map(|schedule| schedule.id.clone())
+        .collect::<Vec<_>>();
+    for schedule in schedules.iter_mut() {
+        if schedule.workflow_id == workflow_id {
+            schedule.enabled = false;
+        }
+    }
+    ids
+}
+
+fn windows_task_is_missing(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("cannot find") || detail.contains("does not exist")
+}
+
+fn disable_windows_schedule_task(schedule_id: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let task_name = format!("Alfred-{schedule_id}");
+        let mut task = Command::new("schtasks");
+        hide_windows_console(&mut task);
+        let output = task
+            .args(["/Change", "/TN", &task_name, "/DISABLE"])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let detail = String::from_utf8_lossy(&output.stderr);
+        if windows_task_is_missing(&detail) {
+            return Ok(());
+        }
+        Err("Windows Task Scheduler could not turn off a schedule for this workflow.".into())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = schedule_id;
+        Ok(())
+    }
+}
+
+fn disable_schedules_for_workflow(app: &AppHandle, workflow_id: &str) -> Result<(), String> {
+    let path = schedules_path(app)?;
+    let mut schedules: Vec<WorkflowSchedule> = read_json_or_default(&path)?;
+    let needs_write = schedules
+        .iter()
+        .any(|schedule| schedule.workflow_id == workflow_id && schedule.enabled);
+    let ids = reconcile_schedule_records(&mut schedules, workflow_id);
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let mut task_error = None;
+    for id in &ids {
+        if let Err(error) = disable_windows_schedule_task(id) {
+            task_error = Some(error);
+        }
+    }
+    if needs_write {
+        write_json(&path, &schedules)?;
+    }
+    match task_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Archive is a reversible status flag. The YAML file stays in the library;
+/// Alfred never deletes workflow files. Matching schedules are forced off
+/// before the status is written, including on restore.
+#[tauri::command]
+fn set_workflow_archived(
+    app: AppHandle,
+    library_path: String,
+    workflow_id: String,
+    archived: bool,
+) -> Result<Workflow, String> {
+    let (path, mut workflow) = load_workflow(&library_path, &workflow_id)?;
+    let changed = apply_workflow_archive(&mut workflow, archived)?;
+    disable_schedules_for_workflow(&app, &workflow.id)?;
+    if changed {
+        save_workflow(&path, &workflow)?;
+    }
+    Ok(workflow)
+}
+
 fn is_persistent_data_loss_phrase(value: &str) -> bool {
     const PHRASES: &[&str] = &[
         "empty recycle",
@@ -7557,6 +7692,9 @@ fn save_schedule(
     if hour > 23 || minute > 59 || days.iter().any(|day| *day > 6) {
         return Err("The schedule contains an invalid time or day.".into());
     }
+    let settings = get_settings(app.clone())?;
+    let (_, workflow) = load_workflow(&settings.library_path, &workflow_id)?;
+    ensure_workflow_runnable(&workflow)?;
     let mut schedules: Vec<WorkflowSchedule> = read_json_or_default(&schedules_path(&app)?)?;
     let schedule = WorkflowSchedule {
         id: Uuid::new_v4().to_string(),
@@ -7586,6 +7724,11 @@ fn set_schedule_enabled(
         .iter_mut()
         .find(|item| item.id == schedule_id)
         .ok_or_else(|| "Schedule not found.".to_string())?;
+    if enabled {
+        let settings = get_settings(app.clone())?;
+        let (_, workflow) = load_workflow(&settings.library_path, &schedule.workflow_id)?;
+        ensure_workflow_runnable(&workflow)?;
+    }
     schedule.enabled = enabled;
     #[cfg(windows)]
     {
@@ -7646,14 +7789,16 @@ fn start_scheduler(app: AppHandle) {
                     if let Ok((_, workflow)) =
                         load_workflow(&settings.library_path, &schedule.workflow_id)
                     {
-                        let _ = start_goal_run(
-                            app.clone(),
-                            workflow.goal,
-                            workflow.required_apps,
-                            workflow.planner_provider,
-                            Some(0),
-                        )
-                        .await;
+                        if ensure_workflow_runnable(&workflow).is_ok() {
+                            let _ = start_goal_run(
+                                app.clone(),
+                                workflow.goal,
+                                workflow.required_apps,
+                                workflow.planner_provider,
+                                Some(0),
+                            )
+                            .await;
+                        }
                     }
                 }
             }
@@ -7765,8 +7910,8 @@ pub fn run() {
                         // state is re-observed and stale refs/coordinates are
                         // never replayed blindly.
                         let scheduled = load_workflow(&settings.library_path, workflow_id)
-                            .map(|(_, workflow)| workflow)
-                            .and_then(|workflow| {
+                            .and_then(|(_, workflow)| {
+                                ensure_workflow_runnable(&workflow)?;
                                 tauri::async_runtime::block_on(start_goal_run(
                                     app.handle().clone(),
                                     workflow.goal,
@@ -7816,6 +7961,7 @@ pub fn run() {
             store_provider_secret,
             has_provider_secret,
             list_workflows,
+            set_workflow_archived,
             list_permissions,
             grant_permission,
             set_permission_enabled,
@@ -8681,6 +8827,124 @@ mod tests {
             .collect();
         let _ = fs::remove_dir_all(&directory);
         assert!(leftovers.is_empty(), "atomic_write left temp files: {leftovers:?}");
+    }
+
+    fn sample_library_workflow(status: &str) -> Workflow {
+        Workflow {
+            id: Uuid::new_v4().to_string(),
+            name: "Invoice copy".into(),
+            goal: "Copy the invoice total into Notepad".into(),
+            version: "1.0.0".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            status: status.into(),
+            planner_provider: Some("codex".into()),
+            required_apps: vec!["Notepad".into()],
+            steps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn archive_and_restore_keep_the_yaml_file() {
+        let library = std::env::temp_dir().join(format!("alfred-archive-{}", Uuid::new_v4()));
+        fs::create_dir_all(&library).unwrap();
+        let library_path = library.to_string_lossy().to_string();
+        let workflow = sample_library_workflow("ready");
+        let path = workflow_path(&library_path, &workflow);
+        save_workflow(&path, &workflow).unwrap();
+
+        let (_, archived, changed) =
+            persist_workflow_archive(&library_path, &workflow.id, true).unwrap();
+        assert!(changed);
+        assert_eq!(archived.status, "archived");
+        assert!(path.exists(), "archive must not delete the workflow file");
+        let listed = list_workflows(library_path.clone()).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, "archived");
+        assert!(ensure_workflow_runnable(&listed[0]).is_err());
+
+        let (_, restored, restored_changed) =
+            persist_workflow_archive(&library_path, &workflow.id, false).unwrap();
+        assert!(restored_changed);
+        assert_eq!(restored.status, "ready");
+        assert!(path.exists());
+        assert!(ensure_workflow_runnable(&restored).is_ok());
+        let _ = fs::remove_dir_all(&library);
+    }
+
+    #[test]
+    fn recording_workflows_cannot_be_archived() {
+        let library = std::env::temp_dir().join(format!("alfred-recording-{}", Uuid::new_v4()));
+        fs::create_dir_all(&library).unwrap();
+        let library_path = library.to_string_lossy().to_string();
+        let workflow = sample_library_workflow("recording");
+        let path = workflow_path(&library_path, &workflow);
+        save_workflow(&path, &workflow).unwrap();
+        assert!(persist_workflow_archive(&library_path, &workflow.id, true).is_err());
+        let (_, loaded) = load_workflow(&library_path, &workflow.id).unwrap();
+        assert_eq!(loaded.status, "recording");
+        assert!(path.exists());
+        let _ = fs::remove_dir_all(&library);
+    }
+
+    #[test]
+    fn reconcile_schedule_records_turns_off_all_matches() {
+        let mut schedules = vec![
+            WorkflowSchedule {
+                id: "sched-a-on".into(),
+                workflow_id: "wf-a".into(),
+                workflow_name: "A".into(),
+                hour: 9,
+                minute: 0,
+                days: vec![0, 1, 2, 3, 4],
+                enabled: true,
+                last_triggered_key: None,
+                created_at: Utc::now(),
+            },
+            WorkflowSchedule {
+                id: "sched-a-off".into(),
+                workflow_id: "wf-a".into(),
+                workflow_name: "A".into(),
+                hour: 10,
+                minute: 0,
+                days: vec![0],
+                enabled: false,
+                last_triggered_key: None,
+                created_at: Utc::now(),
+            },
+            WorkflowSchedule {
+                id: "sched-b".into(),
+                workflow_id: "wf-b".into(),
+                workflow_name: "B".into(),
+                hour: 11,
+                minute: 0,
+                days: vec![0],
+                enabled: true,
+                last_triggered_key: None,
+                created_at: Utc::now(),
+            },
+        ];
+        let ids = reconcile_schedule_records(&mut schedules, "wf-a");
+        assert_eq!(
+            ids,
+            vec!["sched-a-on".to_string(), "sched-a-off".to_string()]
+        );
+        assert!(!schedules[0].enabled);
+        assert!(!schedules[1].enabled);
+        assert!(schedules[2].enabled);
+        // Restore must re-disable OS tasks even when JSON is already off.
+        assert_eq!(reconcile_schedule_records(&mut schedules, "wf-a"), ids);
+        assert!(!schedules[0].enabled);
+    }
+
+    #[test]
+    fn missing_windows_task_is_already_off() {
+        assert!(windows_task_is_missing(
+            "ERROR: The system cannot find the file specified."
+        ));
+        assert!(!windows_task_is_missing(
+            "ERROR: Access is denied."
+        ));
     }
     #[test]
     fn blocks_delete_virtual_key_payload() {
