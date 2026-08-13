@@ -180,12 +180,14 @@ No safety layer is perfect. Keep backups, use test accounts and disposable files
 
 ## Roadmap
 
-- Complete the clean Windows 11 VM test matrix and retain screenshot evidence.
-- Validate Edge/Chrome/Brave Native Messaging end to end.
-- Validate provider authentication and cancellation for every supported CLI.
-- Exercise Task Scheduler recovery and unattended runs.
-- Sign and verify MSI/NSIS install, upgrade, repair, and uninstall flows.
-- Implement the Swift AXUIElement/ScreenCaptureKit host for macOS parity.
+The living product board is the public [Alfred roadmap](https://github.com/users/gulshanmudgal/projects/2) project (group the board by **Horizon**).
+
+- **Now** — trust the Windows prototype: clean-VM matrix, browser Native Messaging, planner CLI validation, Task Scheduler, GUI polish, native Arm64.
+- **Next** — signed Windows preview: MSI/NSIS signatures, packaged extension, independent safety review, harder goal-run reliability.
+- **Later** — macOS host and notarization, broader Windows app coverage.
+- **Shipped** — GUI, policy core, Windows marks + virtual input, planner adapters, live goal loop, local YAML library, in-app schedules.
+
+Safety invariants do not move: planners only propose, Core authorizes, and deletion stays hard-blocked. There is no workflow marketplace.
 
 ## Contributing
 
