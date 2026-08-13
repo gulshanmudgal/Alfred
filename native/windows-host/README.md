@@ -2,7 +2,9 @@
 
 This is a self-contained C#/.NET executable using Windows UI Automation, GDI screen capture, and `SendInput`. It accepts newline-delimited JSON only when `capabilityToken` matches the per-launch `ALFRED_CAPABILITY_TOKEN`. Destructive language is rejected again in this process as defense in depth. It never exposes PowerShell, a shell, or arbitrary process launch.
 
-Methods: `health`, `listApplications`, `listInstalledApplications`, `resolveApplication`, `launchApplication`, `focusApplication`, `navigateApplication`, `activate`, `observeWindow`, `captureWindow`, `findElement`, `getValue`, `invokeElement`, `setValue`, `click`, `typeText`, `key`, and `shortcut`.
+Methods: `health`, `listApplications`, `listInstalledApplications`, `resolveApplication`, `launchApplication`, `focusApplication`, `navigateApplication`, `activate`, `observeWindow`, `captureWindow`, `findElement`, `getValue`, `invokeElement`, `setValue`, `click`, `typeText`, `key`, `shortcut`, `probe`, `scroll`, `rightClick`, `doubleClick`, `hover`, and `drag`.
+
+`observeWindow` returns a per-process mark catalog (`n1`…`n24`) plus a generation, not a raw UIA dump. Query marks from `findElement`/`probe` survive the next observe of that window. `captureWindow` annotates the current catalog without reminting. Actions resolve `{"mark":"n12"}` as `(processId, id)`. After resolution the live UIA name is re-checked for persistent data loss. `probe` (`nx`,`ny` in window bitmap space 0–1) mints a mark from a visual hit or reports `visualOnly`. Pixel `x,y` remains only for recorded YAML. Live browser `click`/`rightClick`/`doubleClick`/`hover` with `nx`/`ny` still refuse when no matching page control sits under the point.
 
 Targeting rules (phase 1 hardening):
 

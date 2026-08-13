@@ -96,6 +96,14 @@ fn spawn_native_host(app: &AppHandle) -> Result<NativeHostProcess, String> {
     })
 }
 
+impl Drop for NativeHostProcess {
+    fn drop(&mut self) {
+        // kill() alone leaves a zombie until wait(). Always reap.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -346,6 +354,20 @@ pub struct GoalRunMemory {
     last_typed_text: Option<String>,
     #[serde(default)]
     last_typed_application: Option<String>,
+    /// Live control name returned by the host/extension after the last action.
+    #[serde(default)]
+    last_resolved_label: Option<String>,
+    /// Observation captured immediately before the last save-class action.
+    #[serde(default)]
+    save_baseline: Option<String>,
+    /// Application that received the save action; used to pick the right title
+    /// out of a multi-application observation.
+    #[serde(default)]
+    save_application: Option<String>,
+    #[serde(default)]
+    saw_publish_commit: bool,
+    #[serde(default)]
+    save_committed: bool,
     status: String,
     #[serde(default)]
     completion_summary: Option<String>,
@@ -452,9 +474,24 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, contents).map_err(|error| error.to_string())?;
-    fs::rename(&temporary, path).map_err(|error| error.to_string())
+    let stem = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("write");
+    let temporary = path.with_file_name(format!(
+        ".{stem}.{}.tmp",
+        Uuid::new_v4().simple()
+    ));
+    let written = fs::write(&temporary, contents);
+    if let Err(error) = written {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    Ok(())
 }
 
 fn read_json_or_default<T: DeserializeOwned + Default>(path: &Path) -> Result<T, String> {
@@ -956,6 +993,12 @@ const ALLOWED_PLAN_METHODS: &[&str] = &[
     "typeText",
     "key",
     "shortcut",
+    "probe",
+    "scroll",
+    "rightClick",
+    "doubleClick",
+    "hover",
+    "drag",
     "browser.observe",
     "browser.navigate",
     "browser.click",
@@ -965,12 +1008,76 @@ const ALLOWED_PLAN_METHODS: &[&str] = &[
     "browser.scroll",
     "browser.find",
     "browser.wait",
+    "browser.hover",
+    "browser.dblclick",
 ];
 
+const COMMIT_VERBS: &[&str] = &[
+    "post", "send", "publish", "share", "submit", "tweet", "save", "save as", "install",
+];
+
+fn kind_is_always_external_write(method: &str) -> bool {
+    matches!(
+        method,
+        "launchApplication" | "navigateApplication" | "browser.navigate"
+    )
+}
+
+fn is_commit_label(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    let tokens: Vec<&str> = normalized
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+    COMMIT_VERBS.iter().any(|verb| {
+        if *verb == "save as" {
+            normalized.contains("save as")
+        } else {
+            tokens.iter().any(|token| token == verb)
+        }
+    })
+}
+
+fn is_commit_action(kind: &str, target: Option<&str>, payload: Option<&Value>) -> bool {
+    if kind == "shortcut" {
+        return payload
+            .and_then(|value| value.get("keys"))
+            .and_then(Value::as_str)
+            .is_some_and(|keys| keys.eq_ignore_ascii_case("CTRL+S"));
+    }
+    if !matches!(
+        kind,
+        "invokeElement" | "click" | "doubleClick" | "browser.click" | "browser.dblclick"
+    ) {
+        return false;
+    }
+    if target.is_some_and(is_commit_label) {
+        return true;
+    }
+    payload.is_some_and(|value| {
+        ["name", "text", "mark"]
+            .into_iter()
+            .any(|key| value.get(key).and_then(Value::as_str).is_some_and(is_commit_label))
+    })
+}
+
 fn method_effect(method: &str) -> &'static str {
-    // Single source of truth: the same classification the policy floor uses.
+    // Default floor from the method alone. Commit verbs on invoke/click are
+    // applied in method_effect_for once the target/payload is known.
     if kind_is_observe(method) {
         "observe"
+    } else if kind_is_always_external_write(method) {
+        "external_write"
+    } else {
+        "modify_reversible"
+    }
+}
+
+fn method_effect_for(method: &str, target: Option<&str>, payload: Option<&Value>) -> &'static str {
+    if kind_is_observe(method) {
+        "observe"
+    } else if kind_is_always_external_write(method) || is_commit_action(method, target, payload) {
+        "external_write"
     } else {
         "modify_reversible"
     }
@@ -1001,6 +1108,27 @@ fn is_safe_http_url(url: &str) -> bool {
             && parsed.username().is_empty()
             && parsed.password().is_none()
     })
+}
+
+fn json_finite_unit_interval(value: &Value, key: &str) -> Option<f64> {
+    let number = value.get(key)?;
+    let parsed = number
+        .as_f64()
+        .or_else(|| number.as_i64().map(|value| value as f64))
+        .or_else(|| number.as_u64().map(|value| value as f64))
+        .or_else(|| number.as_str()?.parse().ok())?;
+    if parsed.is_finite() && (0.0..=1.0).contains(&parsed) {
+        Some(parsed)
+    } else {
+        None
+    }
+}
+
+fn payload_has_normalized_point(payload: Option<&Value>) -> bool {
+    let Some(value) = payload else {
+        return false;
+    };
+    json_finite_unit_interval(value, "nx").is_some() && json_finite_unit_interval(value, "ny").is_some()
 }
 
 fn native_browser_application(applications: &[String]) -> String {
@@ -1065,9 +1193,26 @@ fn validate_workflow_step(step: &WorkflowStep) -> Result<(), String> {
             );
         }
     }
+    if step.kind == "browser.navigate" {
+        let url = params
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !is_safe_http_url(url) {
+            return Err("browser.navigate requires an absolute HTTP(S) URL.".into());
+        }
+    }
     if matches!(
         step.kind.as_str(),
-        "invokeElement" | "click" | "browser.click" | "browser.type"
+        "invokeElement"
+            | "click"
+            | "rightClick"
+            | "doubleClick"
+            | "hover"
+            | "browser.click"
+            | "browser.type"
+            | "browser.hover"
+            | "browser.dblclick"
     ) && step
         .target_label
         .as_deref()
@@ -1077,7 +1222,43 @@ fn validate_workflow_step(step: &WorkflowStep) -> Result<(), String> {
     {
         return Err(format!("{} requires a visible target label.", step.kind));
     }
-    if step.effect != method_effect(&step.kind) {
+    if step.kind == "probe"
+        && (params.get("nx").and_then(Value::as_f64).is_none()
+            || params.get("ny").and_then(Value::as_f64).is_none())
+    {
+        return Err("probe requires nx and ny in window bitmap space (0–1).".into());
+    }
+    if step.kind == "drag"
+        && (params
+            .get("from")
+            .and_then(Value::as_str)
+            .map(str::is_empty)
+            .unwrap_or(true)
+            || params
+                .get("to")
+                .and_then(Value::as_str)
+                .map(str::is_empty)
+                .unwrap_or(true))
+    {
+        return Err("drag requires from and to marks.".into());
+    }
+    if step.kind == "click" {
+        let has_mark = params
+            .get("mark")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty());
+        let has_normalized = payload_has_normalized_point(Some(params));
+        let has_pixels = params.get("x").is_some() && params.get("y").is_some();
+        if !has_mark && !has_normalized && !has_pixels {
+            return Err("click requires a mark, nx/ny, or recorded x/y.".into());
+        }
+    }
+    let expected = method_effect_for(
+        &step.kind,
+        step.target_label.as_deref(),
+        step.payload.as_ref(),
+    );
+    if step.effect != expected {
         return Err(format!(
             "The effect for {} does not match its method.",
             step.kind
@@ -1209,7 +1390,8 @@ fn validate_provider_plan(plan: ProviderPlan) -> Result<Vec<WorkflowStep>, Strin
             {
                 return Err("A typeText step must include non-empty text.".into());
             }
-            let effect = method_effect(&method).to_string();
+            let effect = method_effect_for(&method, item.target_label.as_deref(), Some(&item.params))
+                .to_string();
             let title = if item.title.trim().is_empty() {
                 item.target_label.clone().unwrap_or_else(|| method.clone())
             } else {
@@ -1342,6 +1524,169 @@ fn list_workflows(library_path: String) -> Result<Vec<Workflow>, String> {
     Ok(workflows)
 }
 
+fn is_persistent_data_loss_phrase(value: &str) -> bool {
+    const PHRASES: &[&str] = &[
+        "empty recycle",
+        "empty trash",
+        "empty bin",
+        "to trash",
+        "to the trash",
+        "to recycle",
+        "recycle bin",
+        "permanently delete",
+        "delete permanently",
+        "uninstall",
+        "format drive",
+        "drop table",
+        "wipe disk",
+        "shred",
+        "purge records",
+        "purge all",
+        "destroy account",
+        "overwrite existing",
+        "replace file",
+        "revoke access",
+        "clear history",
+        "shift+delete",
+    ];
+    let lowered = value.to_ascii_lowercase();
+    PHRASES.iter().any(|phrase| lowered.contains(phrase))
+}
+
+fn policy_tokens(value: &str) -> Vec<String> {
+    value
+        .to_ascii_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn is_destruction_verb(token: &str) -> bool {
+    matches!(
+        token,
+        "delete"
+            | "remove"
+            | "erase"
+            | "destroy"
+            | "purge"
+            | "uninstall"
+            | "trash"
+            | "overwrite"
+            | "wipe"
+    )
+}
+
+/// A delete/remove/erase is reversible only when its *object* is a draft, filter,
+/// selection, highlight, or formatting — and no durable noun sits in that same
+/// local window. Mixed clauses ("remove the filter then delete the account")
+/// stay destructive because each verb is classified independently.
+fn verb_is_reversible(tokens: &[String], index: usize) -> bool {
+    const HINTS: &[&str] = &["filter", "draft", "selection", "highlight", "formatting"];
+    const BLOCK: &[&str] = &[
+        "account",
+        "user",
+        "file",
+        "email",
+        "message",
+        "item",
+        "post",
+        "mail",
+        "member",
+        "project",
+        "task",
+        "workspace",
+        "folder",
+        "permanently",
+        "data",
+    ];
+    if !matches!(tokens[index].as_str(), "delete" | "remove" | "erase") {
+        return false;
+    }
+    // A durable noun anywhere in the label keeps the action destructive, even
+    // when it sits outside the local verb window ("remove the filter and the user").
+    if tokens.iter().any(|item| BLOCK.contains(&item.as_str())) {
+        return false;
+    }
+    let window = &tokens[index..index.saturating_add(4).min(tokens.len())];
+    let hits_hint = window.iter().any(|item| HINTS.contains(&item.as_str()));
+    if !hits_hint {
+        return false;
+    }
+    // "Delete draft" often destroys a persisted mail/doc draft. Only treat draft
+    // as reversible when the object is clearly in-progress text/selection.
+    if window.iter().any(|item| item.as_str() == "draft")
+        && !window
+            .iter()
+            .any(|item| matches!(item.as_str(), "text" | "selection" | "highlight" | "formatting"))
+    {
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+fn is_reversible_remove(value: &str) -> bool {
+    let tokens = policy_tokens(value);
+    let mut saw_reversible = false;
+    let mut saw_irreversible = false;
+    for (index, token) in tokens.iter().enumerate() {
+        if !is_destruction_verb(token) {
+            continue;
+        }
+        if verb_is_reversible(&tokens, index) {
+            saw_reversible = true;
+        } else {
+            saw_irreversible = true;
+        }
+    }
+    saw_reversible && !saw_irreversible
+}
+
+fn is_destruction_target(target: &str) -> bool {
+    let trimmed = target.trim().to_ascii_lowercase();
+    matches!(
+        trimmed.as_str(),
+        "delete"
+            | "delete item"
+            | "delete file"
+            | "delete email"
+            | "delete message"
+            | "delete account"
+            | "delete user"
+            | "delete post"
+            | "remove user"
+            | "remove account"
+            | "remove member"
+            | "empty recycle bin"
+            | "empty trash"
+            | "move to recycle bin"
+    ) || {
+        let tokens = policy_tokens(&trimmed);
+        tokens
+            .iter()
+            .enumerate()
+            .any(|(index, token)| is_destruction_verb(token) && !verb_is_reversible(&tokens, index))
+    }
+}
+
+fn payload_has_persistent_data_loss(payload: Option<&Value>) -> bool {
+    let Some(Value::Object(map)) = payload else {
+        return false;
+    };
+    map.iter().any(|(key, value)| {
+        if matches!(
+            key.as_str(),
+            "text" | "value" | "url" | "mark" | "from" | "to" | "generation" | "processId" | "nx" | "ny" | "x" | "y"
+        ) {
+            return false;
+        }
+        value.as_str().is_some_and(|text| {
+            is_destruction_target(text) || is_persistent_data_loss_phrase(text)
+        })
+    })
+}
+
 pub fn evaluate_base_policy(request: &ActionRequest) -> ActionDecision {
     let intent = request.intent.to_lowercase();
     let effect = request.effect.to_lowercase();
@@ -1350,33 +1695,12 @@ pub fn evaluate_base_policy(request: &ActionRequest) -> ActionDecision {
         .clone()
         .unwrap_or_default()
         .to_lowercase();
-    let payload = request
-        .payload
-        .as_ref()
-        .map(Value::to_string)
-        .unwrap_or_default()
-        .to_lowercase();
-    let destructive_terms = [
-        "delete",
-        "remove",
-        "erase",
-        "trash",
-        "empty trash",
-        "purge",
-        "destroy",
-        "shift+delete",
-        "format drive",
-        "revoke access",
-        "clear history",
-        "overwrite existing",
-        "replace file",
-        "drop table",
-        "uninstall",
-    ];
     let destructive = effect == "destructive"
-        || destructive_terms
-            .iter()
-            .any(|term| intent.contains(term) || target.contains(term) || payload.contains(term));
+        || is_destruction_target(&target)
+        || is_destruction_target(&intent)
+        || is_persistent_data_loss_phrase(&intent)
+        || is_persistent_data_loss_phrase(&target)
+        || payload_has_persistent_data_loss(request.payload.as_ref());
     if destructive {
         return ActionDecision {
             decision: "hard_deny".into(),
@@ -1435,6 +1759,8 @@ fn kind_is_observe(kind: &str) -> bool {
             | "capturewindow"
             | "findelement"
             | "getvalue"
+            | "probe"
+            | "scroll"
             | "browser.gettext"
             | "browser.read"
             | "browser.scroll"
@@ -1448,11 +1774,20 @@ fn kind_is_observe(kind: &str) -> bool {
 }
 
 fn effective_effect(kind: &str, declared: &str) -> String {
+    effective_effect_for(kind, declared, None, None)
+}
+
+fn effective_effect_for(
+    kind: &str,
+    declared: &str,
+    target: Option<&str>,
+    payload: Option<&Value>,
+) -> String {
     // Supported methods have an Alfred-owned classification. A planner may omit
     // or mislabel `effect`, but that must neither bypass the safety floor nor
     // create an approval prompt for a method Alfred already understands.
     if ALLOWED_PLAN_METHODS.contains(&kind) {
-        return method_effect(kind).into();
+        return method_effect_for(kind, target, payload).into();
     }
     if declared == "observe" && !kind_is_observe(kind) {
         "unknown".into()
@@ -1577,6 +1912,16 @@ fn send_browser_command_inner(
     let overridden = approval_override && decision.decision == "request_user";
     if decision.decision != "allow" && !overridden {
         return Err(format!("{}: {}", decision.decision, decision.reason));
+    }
+    if command.method == "navigate" {
+        let url = command
+            .params
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !is_safe_http_url(url) {
+            return Err("browser.navigate requires an absolute HTTP(S) URL.".into());
+        }
     }
     let token = fs::read_to_string(browser_token_path(&app)?)
         .map_err(|_| "The browser bridge has not been paired yet.".to_string())?;
@@ -1761,6 +2106,9 @@ fn execute_native_action_inner(
         .map(|host| host.child.try_wait().ok().flatten().is_some())
         .unwrap_or(true);
     if needs_start {
+        // Drop the previous host (if any) so its worker thread, pipes, and
+        // child process are reaped before we spawn a replacement.
+        *guard = None;
         *guard = Some(spawn_native_host(app)?);
     }
     let host = guard
@@ -2640,7 +2988,12 @@ async fn drive_workflow_run(
                 .ok()
                 .map(|overrides| overrides.get(&run_id) == Some(&step.id))
                 .unwrap_or(false);
-            let floored_effect = effective_effect(&step.kind, &step.effect);
+            let floored_effect = effective_effect_for(
+                &step.kind,
+                &step.effect,
+                step.target_label.as_deref(),
+                step.payload.as_ref(),
+            );
             let request = ActionRequest {
                 protocol_version: protocol_version(),
                 run_id: run_id.clone(),
@@ -2910,7 +3263,12 @@ fn materialize_planner_prompt(
     prompt: &str,
 ) -> Result<(String, Option<PathBuf>), String> {
     const MAX_ARGV_PROMPT: usize = 5500;
-    if !matches!(provider, "grok" | "cursor" | "copilot") || prompt.len() <= MAX_ARGV_PROMPT {
+    // Path-based vision providers must see screenshot paths inside a file, not
+    // a truncated Windows argv. Spill whenever the prompt is large or carries
+    // screenshot paths — the CLI remains one planner backend, not the loop.
+    let must_spill = matches!(provider, "grok" | "cursor" | "copilot")
+        && (prompt.len() > MAX_ARGV_PROMPT || prompt.contains("SCREENSHOT FILES"));
+    if !must_spill {
         return Ok((prompt.to_string(), None));
     }
     let dir = app_data_dir(app)?.join("planner-prompts");
@@ -3111,16 +3469,18 @@ fn planner_result_digest(value: &Value) -> String {
             parts.push(snippet);
         }
         Value::Object(map) => {
-            if let Some(text) = map
-                .get("text")
-                .or_else(|| map.get("value"))
-                .or_else(|| map.get("observedText"))
-                .and_then(Value::as_str)
-                .filter(|text| !text.trim().is_empty())
-            {
-                let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                let snippet: String = collapsed.chars().take(500).collect();
-                parts.push(snippet);
+            for key in ["text", "value", "observedText", "prose"] {
+                if let Some(text) = map
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let snippet: String = collapsed.chars().take(500).collect();
+                    if !parts.iter().any(|part| part == &snippet) {
+                        parts.push(snippet);
+                    }
+                }
             }
             if map.get("hasMore").and_then(Value::as_bool) == Some(true) {
                 let next = map.get("nextOffset").and_then(Value::as_u64).unwrap_or(0);
@@ -3282,6 +3642,28 @@ fn parse_planner_action(output: &str) -> Result<PlannerReply, String> {
 
 const PLANNER_TURN_TIMEOUT_SECS: u64 = 180;
 
+fn kill_planner_process(pid: Option<u32>) {
+    let Some(pid) = pid else {
+        return;
+    };
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 fn find_string_field(value: &Value, keys: &[&str]) -> Option<String> {
     match value {
         Value::Object(map) => {
@@ -3362,6 +3744,7 @@ async fn run_planner_turn(
     let mut child = process
         .spawn()
         .map_err(|error| format!("Could not start {provider}: {error}"))?;
+    let planner_pid = child.id();
     // Providers that read the prompt from stdin (Codex) receive it now.
     if let Some(input) = prompt_input {
         if let Some(mut stdin) = child.stdin.take() {
@@ -3377,6 +3760,8 @@ async fn run_planner_turn(
     let mut last_heartbeat = started;
     loop {
         if run_mode(app, run_id) == "stop" {
+            kill_planner_process(planner_pid);
+            let _ = wait.await;
             return Err("stopped".into());
         }
         match tokio::time::timeout(Duration::from_millis(500), &mut wait).await {
@@ -3401,6 +3786,8 @@ async fn run_planner_turn(
             Err(_) => {
                 let now = std::time::Instant::now();
                 if now >= deadline {
+                    kill_planner_process(planner_pid);
+                    let _ = wait.await;
                     return Err("The planner did not answer within 180 seconds.".into());
                 }
                 // A CLI turn can legitimately take minutes; keep the cockpit
@@ -3423,6 +3810,82 @@ async fn run_planner_turn(
             }
         }
     }
+}
+
+/// Compacts a mark catalog (preferred) or a legacy UIA tree into planner lines.
+fn summarize_native_observation(value: &Value, application: &str, out: &mut Vec<String>) {
+    if let Some(marks) = value.get("marks").and_then(Value::as_array) {
+        let generation = value.get("generation").and_then(Value::as_u64).unwrap_or(0);
+        let title = value.get("title").and_then(Value::as_str).unwrap_or("");
+        let focused = value.get("focused").and_then(Value::as_str).unwrap_or("-");
+        let dpi = value.get("dpi").and_then(Value::as_u64).unwrap_or(0);
+        out.push(format!(
+            "{application}  gen={generation}  dpi={dpi}  focused={focused}"
+        ));
+        if !title.is_empty() {
+            out.push(format!("title: {title}"));
+        }
+        for mark in marks.iter().take(36) {
+            let id = mark.get("id").and_then(Value::as_str).unwrap_or("?");
+            let role = mark.get("role").and_then(Value::as_str).unwrap_or("Control");
+            let name: String = mark
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .chars()
+                .take(80)
+                .collect();
+            let automation_id = mark
+                .get("automationId")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let enabled = mark.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+            let chrome = mark.get("chrome").and_then(Value::as_bool).unwrap_or(false);
+            let patterns = mark
+                .get("patterns")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(|item| item.to_ascii_lowercase())
+                        .collect::<Vec<_>>()
+                        .join("+")
+                })
+                .unwrap_or_default();
+            let mut line = format!("{id}  {role}");
+            if !name.is_empty() {
+                line.push_str(&format!(" \"{name}\""));
+            }
+            if !automation_id.is_empty() {
+                line.push_str(&format!(" (id: {automation_id})"));
+            }
+            if !patterns.is_empty() {
+                line.push_str(&format!("  {patterns}"));
+            }
+            if !enabled {
+                line.push_str("  [disabled]");
+            }
+            if chrome {
+                line.push_str("  chrome");
+            }
+            out.push(line);
+        }
+        if marks.is_empty() {
+            out.push("(no interactive marks — call findElement {\"text\":\"...\"} or probe)".into());
+        }
+        if let Some(texts) = value.get("texts").and_then(Value::as_array) {
+            for snippet in texts.iter().filter_map(Value::as_str).take(12) {
+                let short: String = snippet.chars().take(160).collect();
+                if !short.is_empty() {
+                    out.push(format!("text: {short}"));
+                }
+            }
+        }
+        return;
+    }
+    out.push(format!("{application}:"));
+    summarize_native_tree(value, out, 0);
 }
 
 /// Compacts a UIA observation tree into the lines a planner can act on.
@@ -3533,9 +3996,16 @@ fn summarize_browser_read(result: &Value, out: &mut Vec<String>) {
         let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
         let snippet: String = collapsed.chars().take(2500).collect();
         if snippet.is_empty() {
-            out.push("(no extractable text on this page)".into());
+            out.push("(no extractable structured text on this page)".into());
         } else {
             out.push(snippet);
+        }
+    }
+    if let Some(prose) = result.get("prose").and_then(Value::as_str) {
+        let collapsed = prose.split_whitespace().collect::<Vec<_>>().join(" ");
+        let snippet: String = collapsed.chars().take(1500).collect();
+        if !snippet.is_empty() {
+            out.push(format!("read-prose: {snippet}"));
         }
     }
     if result.get("hasMore").and_then(Value::as_bool) == Some(true) {
@@ -3560,10 +4030,11 @@ fn browser_skill_block(bridge_connected: bool) -> &'static str {
 BROWSER SKILL — NATIVE VISUAL MODE (the optional extension is NOT connected):
 - `browser.*` methods and the pseudo-application "Installed browser" are unavailable. Never propose either one.
 - Operate the exact native browser listed in TARGET APPLICATIONS (normally Microsoft Edge).
-- Navigate with one bounded action: navigateApplication {"url":"https://..."}. Core restricts it to Edge/Chrome/Brave and HTTP(S). Then observeWindow.
-- Use observeWindow/findElement/getValue for semantic state, setValue/invokeElement where UI Automation exposes them, and click only with screenshot-grounded coordinates inside the browser window.
-- Screenshots attached to each turn are the visual ground truth. Re-observe after every navigation, compose, and submission.
-- For X posting, navigating directly to https://x.com/compose/post is allowed. Confirm the signed-in composer is visible. Target its editable control—not the browser address bar—when entering text; typeText itself verifies the text landed there. Click the enabled composer Post control, then navigate to the user's profile or X Latest search and re-observe. The exact authored text must appear as a published, non-editable post before claiming completion; a closed composer or successful click receipt is not publication proof.
+- Navigate with one bounded action: navigateApplication {"url":"https://..."}. Core restricts it to Edge/Chrome/Brave and HTTP(S). Then read the mark catalog.
+- Act by mark id (n12). findElement {"text":"Post"} searches the tree and returns marks. invokeElement/setValue/typeText/click take {"mark":"n12"}.
+- Screenshots are set-of-mark annotated. If the control has no badge, probe {"nx":0.42,"ny":0.61} in bitmap space, then act on the returned mark. Never emit screen x,y. Live browser clicks require a mark or a matching page control — nx/ny without one is refused.
+- Marks flagged chrome are browser toolbar/address bar — do not type page content into them.
+- For X posting, navigating directly to https://x.com/compose/post is allowed. Confirm the signed-in composer is visible. Target its editable mark—not the address bar—when entering text; typeText itself verifies the text landed there. invokeElement the enabled composer Post mark, then navigate to the user's profile or X Latest search and re-observe. The exact authored text must appear as a published, non-editable post before claiming completion; a closed composer or successful click receipt is not publication proof.
 - A login wall or CAPTCHA is a concrete blocker. Never invent success and never ask for credentials.
 - One small action per reply. Do not retry an unchanged action after an error."#;
     }
@@ -3580,7 +4051,9 @@ The optional extension is connected, so `browser.*` methods and application "Ins
 7. browser.getText {"ref"} for a single field; prefer browser.read for analysis of lists/tables.
 8. Login wall or CAPTCHA signals: report the concrete blocker. Never invent portal data.
 9. Analysis goals (Datadog RUM, logs, dashboards): navigate → wait → read → scroll/read more → summarize ONLY facts present in CURRENT DESKTOP STATE or ACTION HISTORY digests. If text is empty, say so; do not fabricate error rates or stack traces.
-10. One small action per reply. Prefer browser.find+click over coordinate clicks."#
+10. One small action per reply. Prefer browser.find+click over any coordinate click. After navigate, wait for the destination path — same-origin is not success.
+11. browser.hover {"ref"} and browser.dblclick {"ref"} are available for menus and dense grids.
+12. Send/publish an already-written draft by clicking the live Send/Post control, then observe the destination (sent folder, profile, confirmation). Do not invent authored text that was already on the page."#
 }
 
 fn goal_needs_browser_skill(goal: &str, applications: &[String]) -> bool {
@@ -3604,6 +4077,8 @@ fn goal_needs_browser_skill(goal: &str, applications: &[String]) -> bool {
         || lower.contains("twitter")
         || lower.contains("social media")
         || lower.contains("docs.google")
+        || lower.contains("gmail")
+        || lower.contains("email")
         || lower.contains("chrome")
         || lower.contains("edge")
 }
@@ -3636,13 +4111,17 @@ fn infer_applications_from_goal(goal: &str) -> Vec<String> {
                 "tweet",
                 "twitter",
                 "social media",
+                "gmail",
+                "docs.google",
+                "reddit",
+                "datadog",
             ],
             "Microsoft Edge",
         ),
         (&["excel", "spreadsheet", "workbook"], "Microsoft Excel"),
         (&["ms word", "word document", "word"], "Microsoft Word"),
         (&["powerpoint", "presentation"], "Microsoft PowerPoint"),
-        (&["outlook"], "Microsoft Outlook"),
+        (&["outlook", "email", "e-mail", "inbox"], "Microsoft Outlook"),
     ];
     let normalized = goal.to_lowercase();
     let words: std::collections::HashSet<&str> = normalized
@@ -3694,9 +4173,9 @@ fn planner_app_rule_for_capabilities(
 
 fn planner_methods(bridge_connected: bool) -> &'static str {
     if bridge_connected {
-        "listApplications (application \"Alfred\"; lists running app windows) | listInstalledApplications (application \"Alfred\"; lists exact launchable Start-menu names) | browser.observe | browser.navigate {\"url\"} | browser.click {\"ref\"} | browser.type {\"ref\",\"text\"} | browser.getText {\"ref\"} | browser.read {\"offset\":0} | browser.scroll {\"direction\":\"down\"} or {\"text\":\"find visible text\"} | browser.find {\"text\":\"label\"} | browser.wait {\"text\":\"fragment\",\"timeoutMs\":12000} | launchApplication | focusApplication | activate | observeWindow | captureWindow | findElement | getValue | invokeElement | setValue | click | typeText | key | shortcut"
+        "listApplications (application \"Alfred\") | listInstalledApplications (application \"Alfred\") | browser.observe | browser.navigate {\"url\"} | browser.find {\"text\"} | browser.click {\"ref\"} | browser.type {\"ref\",\"text\"} | browser.getText {\"ref\"} | browser.read {\"offset\":0} | browser.scroll {\"direction\":\"down\"} or {\"text\"} | browser.wait {\"text\",\"timeoutMs\"} | browser.hover {\"ref\"} | browser.dblclick {\"ref\"} | launchApplication | focusApplication | activate | observeWindow | findElement {\"text\"} | getValue {\"mark\"} | invokeElement {\"mark\"} | setValue {\"mark\",\"value\"} | typeText {\"mark\",\"text\"} | click {\"mark\"} | scroll {\"mark\"|\"direction\"|\"text\"} | probe {\"nx\",\"ny\"} | rightClick {\"mark\"} | doubleClick {\"mark\"} | hover {\"mark\"} | drag {\"from\",\"to\"} | key | shortcut"
     } else {
-        "listApplications (application \"Alfred\"; lists running app windows) | listInstalledApplications (application \"Alfred\"; lists exact launchable Start-menu names) | launchApplication (exact installed Start-menu application) | navigateApplication {\"url\":\"https://...\"} (Edge/Chrome/Brave only) | focusApplication | activate | observeWindow | captureWindow | findElement {\"automationId\"|\"name\"|\"controlType\"} | getValue (same selectors) | invokeElement (same selectors) | setValue (selectors + \"value\") | click {\"x\",\"y\"} | typeText {\"text\", optional \"automationId\"|\"name\"|\"controlType\"} | key {\"virtualKey\":13|9|27} | shortcut {\"keys\":\"CTRL+L\"|\"CTRL+S\"}"
+        "listApplications (application \"Alfred\") | listInstalledApplications (application \"Alfred\") | launchApplication (exact Start-menu name) | navigateApplication {\"url\":\"https://...\"} (Edge/Chrome/Brave + HTTP(S)) | focusApplication | activate | observeWindow | captureWindow | findElement {\"text\"} or {\"automationId\"|\"name\"|\"controlType\"} | getValue {\"mark\"} | invokeElement {\"mark\"} | setValue {\"mark\",\"value\"} | typeText {\"mark\",\"text\"} | click {\"mark\"} | probe {\"nx\",\"ny\"} | scroll {\"mark\"|\"direction\"|\"text\"} | rightClick {\"mark\"} | doubleClick {\"mark\"} | hover {\"mark\"} | drag {\"from\",\"to\"} | key {\"virtualKey\":13|9|27} | shortcut {\"keys\":\"CTRL+L\"|\"CTRL+S\"}"
     }
 }
 
@@ -3735,13 +4214,13 @@ fn build_planner_prompt(
         "optional DOM browser accelerator: not connected; native application control only"
     };
     let mut prompt = format!(
-        "You are the planning brain of Alfred, a supervised desktop automation agent running on the user's machine. Propose the next single action toward the goal.\n\nGOAL: {goal}\n\nTARGET APPLICATIONS: {apps}\n\nAVAILABLE CAPABILITIES: {capability}\n\nCURRENT DESKTOP STATE:\n{observations}\n\nACTION HISTORY (oldest first):\n{history_text}{plan_text}{skill}\n\nReply with exactly one JSON object and nothing else (no markdown fences, no prose):\n{{\"done\": false, \"title\": \"short human label\", \"kind\": \"<method>\", \"application\": \"<exact app name>\", \"intent\": \"what and why\", \"effect\": \"observe|create|modify_reversible|external_write\", \"targetLabel\": \"<element label>\", \"payload\": {{...}}}}\nWhen the goal appears fully complete, reply: {{\"done\": true, \"summary\": \"what was accomplished\"}}. Alfred treats this as a completion claim and performs a fresh evidence-review turn before closing the run.\nIf the goal has multiple phases, you may instead reply {{\"plan\": [\"short phase\", ...]}} (no \"kind\") to outline or revise your approach; it is pinned below as CURRENT PLAN.\n\nMethods available on this turn: {methods}.\n\nRules:\n- One small action per reply; observe or find before click/type when unsure.\n- NEVER propose deletion, trash, purge, overwrite, password entry, shell commands, or credential handling. Alfred hard-blocks them regardless of what you return.\n- Prefer setValue/invokeElement (semantic, focus-independent) over click/typeText.\n- Never include processId; Alfred injects the live one.\n- {app_rule}\n- If the last action failed or changed nothing, try a different approach instead of repeating it.\n- If a target application is not running, propose launchApplication. If the exact installed name is uncertain, call listInstalledApplications first.\n- Never claim to have read or analyzed content that does not appear in CURRENT DESKTOP STATE or ACTION HISTORY; if you cannot access the content the goal needs, reply done with a summary explaining the blocker instead of inventing results.",
+        "You are the planning brain of Alfred, a supervised desktop automation agent running on the user's machine. Propose the next single action toward the goal.\n\nGOAL: {goal}\n\nTARGET APPLICATIONS: {apps}\n\nAVAILABLE CAPABILITIES: {capability}\n\nCURRENT DESKTOP STATE:\n{observations}\n\nACTION HISTORY (oldest first):\n{history_text}{plan_text}{skill}\n\nReply with exactly one JSON object and nothing else (no markdown fences, no prose):\n{{\"done\": false, \"title\": \"short human label\", \"kind\": \"<method>\", \"application\": \"<exact app name>\", \"intent\": \"what and why\", \"effect\": \"observe|create|modify_reversible|external_write\", \"targetLabel\": \"<element label>\", \"payload\": {{...}}}}\nWhen the goal appears fully complete, reply: {{\"done\": true, \"summary\": \"what was accomplished\"}}. Alfred treats this as a completion claim and performs a fresh evidence-review turn before closing the run.\nIf the goal has multiple phases, you may instead reply {{\"plan\": [\"short phase\", ...]}} (no \"kind\") to outline or revise your approach; it is pinned below as CURRENT PLAN.\n\nMethods available on this turn: {methods}.\n\nRules:\n- One small action per reply; observe or find before click/type when unsure.\n- NEVER propose deletion, trash, purge, overwrite, password entry, shell commands, or credential handling. Alfred hard-blocks persistent data loss regardless of what you return.\n- Prefer marks (n12) or browser refs (e3). findElement {{\"text\"}} / browser.find before acting. Never emit screen x,y; use probe {{nx,ny}} only when a control has no mark.\n- Prefer setValue/invokeElement on a mark (semantic, focus-independent) over click/typeText.\n- Never include processId; Alfred injects the live one.\n- {app_rule}\n- If the last action failed or changed nothing, try a different approach instead of repeating it.\n- If a target application is not running, propose launchApplication. If the exact installed name is uncertain, call listInstalledApplications first.\n- Never claim to have read or analyzed content that does not appear in CURRENT DESKTOP STATE or ACTION HISTORY; if you cannot access the content the goal needs, reply done with a summary explaining the blocker instead of inventing results.",
         apps = planner_app_list(applications),
         methods = planner_methods(bridge_connected),
         app_rule = planner_app_rule_for_capabilities(applications, bridge_connected),
     );
     prompt.push_str(
-        "\n- For typeText, name the intended editable control in targetLabel and include any selectors visible in CURRENT DESKTOP STATE. Alfred rejects the action unless it can focus that target and read the entered text back from it.\n- Never treat a successful input or click call as proof of the final outcome. Re-observe the destination and verify the requested result itself is visible.",
+        "\n- For typeText, name the intended editable control in targetLabel and pass its mark. Alfred rejects the action unless it can focus that target and read the entered text back from it.\n- Never treat a successful input or click call as proof of the final outcome. Re-observe the destination and verify the requested result itself is visible.",
     );
     prompt.push_str(
         "\n- `shortcut` is available for two allow-listed combinations only: {\"keys\":\"CTRL+L\"} focuses a browser/Explorer address bar; {\"keys\":\"CTRL+S\"} opens Save/Save As.",
@@ -3878,8 +4357,8 @@ fn gather_observations(
                 });
             match section {
                 Ok(tree) => {
-                    let mut lines = vec![format!("{application}:")];
-                    summarize_native_tree(&tree, &mut lines, 0);
+                    let mut lines = Vec::new();
+                    summarize_native_observation(&tree, application, &mut lines);
                     observations.push_str(&lines.join("\n"));
                     observations.push('\n');
                 }
@@ -3949,11 +4428,45 @@ fn goal_requires_published_text(goal: &str) -> bool {
         || (lower.contains("x.com") && lower.contains("post"))
         || lower.contains("publish a post")
         || lower.contains("post on social")
+        || lower.contains("post on x")
+        || lower.contains("send an email")
+        || lower.contains("send email")
+        || lower.contains("send the email")
+        || lower.contains("publish to")
+}
+
+/// Publication proof is only forced when Alfred actually captured authored text
+/// this run. "Send the already-written draft" must not loop forever waiting for
+/// an absent string. A publish click without typed text still needs ordinary
+/// destination-page evidence via the generic completion review.
+fn requires_published_text_proof(
+    goal: &str,
+    last_typed_text: Option<&str>,
+    saw_publish_commit: bool,
+) -> bool {
+    last_typed_text.is_some() && (goal_requires_published_text(goal) || saw_publish_commit)
 }
 
 fn authored_text_anchor(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.len() < 3 || trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return None;
+    }
+    // Save-As paths and bare filenames are not publication text.
+    // Do not treat a colon in prose ("Subject: hello") as a path.
+    let looks_like_path = trimmed.contains('\\')
+        || trimmed.contains('/')
+        || (trimmed.len() >= 3
+            && trimmed.as_bytes()[1] == b':'
+            && trimmed.as_bytes()[0].is_ascii_alphabetic());
+    let looks_like_filename = !trimmed.contains(' ')
+        && std::path::Path::new(trimmed).extension().is_some_and(|ext| {
+            matches!(
+                ext.to_string_lossy().to_ascii_lowercase().as_str(),
+                "txt" | "md" | "docx" | "xlsx" | "pptx" | "pdf" | "csv" | "rtf"
+            )
+        });
+    if looks_like_path || looks_like_filename {
         return None;
     }
     Some(trimmed.chars().take(500).collect())
@@ -3964,6 +4477,7 @@ fn append_completion_review(
     claim: &str,
     required_text: Option<&str>,
     require_published_text: bool,
+    publish_without_anchor: bool,
 ) {
     prompt.push_str(&format!(
         "\n\nCOMPLETION REVIEW — do not trust the earlier claim. Re-check it only against CURRENT DESKTOP STATE from this fresh turn. ACTION HISTORY proves only that an input was attempted; it is never final-outcome evidence. Earlier claim: {claim}\n"
@@ -3973,11 +4487,11 @@ fn append_completion_review(
             prompt.push_str(&format!(
                 "REQUIRED PUBLISHED TEXT: {text}\nThe required text must be visible now as non-editable published content. Text still inside an Edit/Document composer, a closed composer, navigation to a feed, or a successful Post click is not proof. Navigate to the user's profile or an exact Latest search and observe the matching post before completing.\n"
             ));
-        } else {
-            prompt.push_str(
-                "No verified authored-text anchor has been recorded yet, so this publication goal cannot complete. Enter the content into the intended composer and let Alfred verify that input before submitting.\n",
-            );
         }
+    } else if publish_without_anchor {
+        prompt.push_str(
+            "A publish/send control was clicked, but no authored-text anchor was recorded this run. Do not invent one. Complete only if CURRENT DESKTOP STATE shows the destination outcome (sent-mail folder, published post, confirmation page URL/title, or a closed composer plus destination body) — not a successful click receipt.\n",
+        );
     }
     prompt.push_str(
         "If every requested outcome is visibly evidenced, reply exactly {\"done\":true,\"verified\":true,\"summary\":\"verified outcome\",\"evidence\":[\"specific text or state visible in CURRENT DESKTOP STATE\"]}. Every evidence item must describe current visible state, not an earlier action receipt. If anything is missing or uncertain, reply with verified:false and the next corrective action using the normal action schema. Never mark a blocker as successful completion.",
@@ -4014,9 +4528,54 @@ fn evidence_matches_grounding(evidence: &str, grounding: &str) -> bool {
     false
 }
 
+fn line_looks_like_composer(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let role_is_composer = trimmed.contains(" Document")
+        || trimmed.contains(" Edit")
+        || trimmed.starts_with("- Document ")
+        || trimmed.starts_with("- Edit ");
+    (role_is_composer && !trimmed.contains(" Hyperlink ") && !trimmed.contains(" ListItem "))
+        || trimmed.contains(" chrome")
+}
+
+fn line_looks_like_published_evidence(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("page content") {
+        return false;
+    }
+    trimmed.starts_with("text: ")
+        || trimmed.starts_with("read-prose:")
+        || trimmed.starts_with("- Text ")
+        || trimmed.starts_with("- a ")
+        || trimmed.starts_with("- Hyperlink ")
+        || trimmed.starts_with("- ListItem ")
+        || trimmed.contains(" Hyperlink ")
+        || trimmed.contains(" ListItem ")
+        || trimmed.contains(" Text ")
+        || trimmed.starts_with("TABLE:")
+        || trimmed.starts_with("LIST:")
+        || trimmed.starts_with("GRID:")
+        || (trimmed.starts_with('n')
+            && (trimmed.contains(" Hyperlink ")
+                || trimmed.contains(" ListItem ")
+                || trimmed.contains(" Text ")))
+}
+
 /// Publication text must be present in static page content. UIA exposes browser
 /// composers and address bars as Edit/Document controls, so excluding those
 /// prevents a draft (or a misdirected address-bar write) from proving success.
+fn line_contains_authored_prefix(line: &str, expected_prefix: &[String]) -> bool {
+    let words: Vec<String> = line
+        .to_ascii_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+        .collect();
+    words
+        .windows(expected_prefix.len())
+        .any(|window| window == expected_prefix)
+}
+
 fn observation_contains_published_text(observation: &str, expected: &str) -> bool {
     let expected_words: Vec<String> = expected
         .to_ascii_lowercase()
@@ -4029,27 +4588,28 @@ fn observation_contains_published_text(observation: &str, expected: &str) -> boo
     }
     let prefix_len = expected_words.len().min(10);
     let expected_prefix = &expected_words[..prefix_len];
+    // A still-open composer that holds the authored text means this is the
+    // compose surface, not a published post — even if a sibling text: snippet
+    // or leftover read-prose repeats the same prefix.
+    if observation.lines().any(|line| {
+        let trimmed = line.trim_start();
+        line_looks_like_composer(trimmed) && line_contains_authored_prefix(trimmed, expected_prefix)
+    }) {
+        return false;
+    }
     observation.lines().any(|line| {
         let trimmed = line.trim_start();
-        if !(trimmed.starts_with("- Text ")
-            || trimmed.starts_with("- Hyperlink ")
-            || trimmed.starts_with("- ListItem "))
-        {
+        if line_looks_like_composer(trimmed) {
             return false;
         }
-        let static_words: Vec<String> = line
-            .to_ascii_lowercase()
-            .split(|character: char| !character.is_alphanumeric())
-            .filter(|word| !word.is_empty())
-            .map(str::to_string)
-            .collect();
+        if !line_looks_like_published_evidence(trimmed) {
+            return false;
+        }
         // UIA labels are intentionally capped at 80 characters, so allow the
         // tail to be truncated while requiring the authored word sequence—not
         // just a bag of common topic words—in one static element. Aggregating
         // across unrelated search results would allow a similar post to pass.
-        static_words
-            .windows(prefix_len)
-            .any(|window| window == expected_prefix)
+        line_contains_authored_prefix(trimmed, expected_prefix)
     })
 }
 
@@ -4070,6 +4630,180 @@ fn is_verified_completion(
         && (!require_published_text
             || required_text
                 .is_some_and(|text| observation_contains_published_text(current_observation, text)))
+}
+
+fn goal_requires_save_proof(goal: &str) -> bool {
+    let lower = goal.to_ascii_lowercase();
+    !goal_requires_published_text(goal)
+        && !lower.contains("save me")
+        && (lower.contains("save as")
+            || lower.contains("save the file")
+            || lower.contains("save this file")
+            || lower.contains("save the document")
+            || lower.contains("save this document")
+            || lower.contains("save to desktop")
+            || lower.contains("save it as")
+            || lower.contains("save it to"))
+}
+
+fn live_resolved_label(value: &Value) -> Option<String> {
+    let result = value.get("result").unwrap_or(value);
+    result
+        .get("targetName")
+        .or_else(|| result.get("label"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(|label| label.chars().take(160).collect())
+}
+
+fn is_publish_commit_label(label: &str) -> bool {
+    let lowered = label.to_ascii_lowercase();
+    let tokens: Vec<&str> = lowered
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+    let Some(first) = tokens.first() else {
+        return false;
+    };
+    let publish_verb = matches!(*first, "post" | "publish" | "tweet")
+        || (*first == "send"
+            && tokens
+                .iter()
+                .any(|token| matches!(*token, "tweet" | "post" | "email" | "message")));
+    publish_verb
+        && !tokens.iter().any(|token| {
+            matches!(
+                *token,
+                "text"
+                    | "to"
+                    | "screen"
+                    | "link"
+                    | "sheet"
+                    | "invite"
+                    | "invitation"
+                    | "file"
+                    | "print"
+                    | "meeting"
+                    | "calendar"
+            )
+        })
+}
+
+fn is_save_commit(kind: &str, label: Option<&str>, payload: Option<&Value>) -> bool {
+    if kind == "shortcut" {
+        return payload
+            .and_then(|value| value.get("keys"))
+            .and_then(Value::as_str)
+            .is_some_and(|keys| keys.eq_ignore_ascii_case("CTRL+S"));
+    }
+    label.is_some_and(|value| {
+        let lowered = value.to_ascii_lowercase();
+        if lowered.contains("don't")
+            || lowered.contains("dont")
+            || lowered.contains("do not")
+        {
+            return false;
+        }
+        let tokens: Vec<&str> = lowered
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|token| !token.is_empty())
+            .collect();
+        tokens.iter().any(|token| *token == "save")
+            && !tokens
+                .iter()
+                .any(|token| matches!(*token, "as" | "not" | "never" | "cancel" | "dont"))
+    })
+}
+
+fn observation_title_for(observation: &str, application: Option<&str>) -> String {
+    if let Some(app) = application.map(str::trim).filter(|name| !name.is_empty()) {
+        let app_lower = app.to_ascii_lowercase();
+        let mut in_section = false;
+        for line in observation.lines() {
+            let trimmed = line.trim_start();
+            let lower = trimmed.to_ascii_lowercase();
+            let app_header = lower.starts_with(&app_lower)
+                && lower
+                    .as_bytes()
+                    .get(app_lower.len())
+                    .is_none_or(|byte| matches!(*byte, b' ' | b':' | b'\t'));
+            if app_header {
+                in_section = true;
+                continue;
+            }
+            if in_section {
+                if let Some(title) = trimmed.strip_prefix("title:") {
+                    return title.trim().to_string();
+                }
+                let next_app = trimmed.contains("  gen=")
+                    || (trimmed.ends_with(':')
+                        && !trimmed.starts_with("title:")
+                        && !trimmed.starts_with("text:")
+                        && !trimmed.starts_with("page:")
+                        && !trimmed.starts_with("read-prose:"));
+                if next_app {
+                    break;
+                }
+            }
+        }
+    }
+    observation
+        .lines()
+        .find_map(|line| {
+            line.trim_start()
+                .strip_prefix("title:")
+                .map(|title| title.trim().to_string())
+        })
+        .unwrap_or_default()
+}
+
+fn looks_like_filename(title: &str) -> bool {
+    let lower = title.to_ascii_lowercase();
+    [".txt", ".docx", ".xlsx", ".pdf", ".png", ".md", ".csv"]
+        .iter()
+        .any(|ext| lower.contains(ext))
+}
+
+fn observation_shows_save_transition(
+    current: &str,
+    baseline: Option<&str>,
+    expected_name: Option<&str>,
+    save_committed: bool,
+    application: Option<&str>,
+) -> bool {
+    if !save_committed {
+        return false;
+    }
+    let Some(baseline) = baseline else {
+        return false;
+    };
+    let current_title = observation_title_for(current, application);
+    let old_title = observation_title_for(baseline, application);
+    if let Some(name) = expected_name {
+        let file = name
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(name)
+            .to_ascii_lowercase();
+        // Filename proof is title-only. An Edit in a still-open Save As dialog
+        // often exposes the typed name as its accessible name; that is not a save.
+        if file.len() >= 4
+            && current_title.to_ascii_lowercase().contains(&file)
+            && !old_title.to_ascii_lowercase().contains(&file)
+        {
+            return true;
+        }
+    }
+    let old_dirty = old_title.contains('*');
+    let now_clean = !current_title.contains('*') && !current_title.is_empty();
+    if old_dirty
+        && now_clean
+        && current_title.replace('*', "").trim() == old_title.replace('*', "").trim()
+    {
+        return true;
+    }
+    looks_like_filename(&current_title) && current_title != old_title
 }
 
 /// The agent loop: observe → plan → policy-gate → execute → record, until the
@@ -4189,7 +4923,12 @@ async fn drive_goal_run(
                 &mut prompt,
                 claim,
                 memory.last_typed_text.as_deref(),
-                goal_requires_published_text(&goal),
+                requires_published_text_proof(
+                    &goal,
+                    memory.last_typed_text.as_deref(),
+                    memory.saw_publish_commit,
+                ),
+                memory.saw_publish_commit && memory.last_typed_text.is_none(),
             );
         }
         // Flag providers receive the files as CLI attachments; path providers get
@@ -4364,13 +5103,24 @@ async fn drive_goal_run(
             }
         };
         if reply.done {
-            let require_published_text = goal_requires_published_text(&goal);
+            let require_published_text = requires_published_text_proof(
+                &goal,
+                memory.last_typed_text.as_deref(),
+                memory.saw_publish_commit,
+            );
             let verified_reply = is_verified_completion(
                 &reply,
                 &memory.last_observation,
                 memory.last_typed_text.as_deref(),
                 require_published_text,
-            );
+            ) && (!goal_requires_save_proof(&goal)
+                || observation_shows_save_transition(
+                    &memory.last_observation,
+                    memory.save_baseline.as_deref(),
+                    memory.last_typed_text.as_deref(),
+                    memory.save_committed,
+                    memory.save_application.as_deref(),
+                ));
             let summary = reply
                 .summary
                 .unwrap_or_else(|| "The planner reports the goal is complete.".into());
@@ -4543,7 +5293,12 @@ async fn drive_goal_run(
             id: format!("goal-step-{step_index}"),
             title: title.clone(),
             kind: kind.clone(),
-            effect: effective_effect(&kind, &declared_effect),
+            effect: effective_effect_for(
+                &kind,
+                &declared_effect,
+                reply.target_label.as_deref(),
+                reply.payload.as_ref(),
+            ),
             application: Some(application.clone()),
             intent: reply.intent.clone(),
             target_label: reply.target_label.clone(),
@@ -4554,6 +5309,44 @@ async fn drive_goal_run(
             expect: None,
             save_as: None,
         };
+        if !is_browser && kind == "click" {
+            let payload = step.payload.as_ref();
+            let has_mark = payload
+                .and_then(|value| value.get("mark"))
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty());
+            let has_normalized = payload_has_normalized_point(payload);
+            if !has_mark && !has_normalized {
+                let message = "Rejected invalid planner action click: live goals must click a mark from observe/find/probe, not raw screen coordinates.".to_string();
+                remember_goal_event(&mut memory, message.clone());
+                memory.pending_action = None;
+                memory.consecutive_failures += 1;
+                let _ = save_goal_run_memory(&app, &mut memory);
+                emit_goal_event(
+                    &app,
+                    &run_id,
+                    step_index as usize,
+                    "Planner proposed an invalid action",
+                    &message,
+                    "running",
+                    progress,
+                );
+                if memory.consecutive_failures >= GOAL_RUN_MAX_CONSECUTIVE_FAILURES {
+                    memory.status = "failed".into();
+                    let _ = save_goal_run_memory(&app, &mut memory);
+                    fail_goal_run(
+                        &app,
+                        &run_id,
+                        &goal,
+                        step_index as usize,
+                        progress,
+                        "The planner repeatedly proposed invalid actions.".into(),
+                    );
+                    return;
+                }
+                continue;
+            }
+        }
         if let Err(error) = validate_workflow_step(&step) {
             let message = format!("Rejected invalid planner action {kind}: {error}");
             remember_goal_event(&mut memory, message.clone());
@@ -4718,12 +5511,36 @@ async fn drive_goal_run(
                 if matches!(kind.as_str(), "typeText" | "browser.type") {
                     if let Some(text) = payload
                         .get("text")
+                        .or_else(|| payload.get("value"))
                         .and_then(Value::as_str)
                         .and_then(authored_text_anchor)
                     {
-                        memory.last_typed_text = Some(text);
-                        memory.last_typed_application = Some(application.clone());
+                        let keep_existing = memory.last_typed_text.as_ref().is_some_and(|old| {
+                            old.chars().count() > text.chars().count()
+                        });
+                        if !keep_existing {
+                            memory.last_typed_text = Some(text);
+                            memory.last_typed_application = Some(application.clone());
+                        }
                     }
+                }
+                if let Some(live) = live_resolved_label(&value) {
+                    memory.last_resolved_label = Some(live.clone());
+                    if matches!(
+                        kind.as_str(),
+                        "invokeElement" | "click" | "doubleClick" | "browser.click" | "browser.dblclick"
+                    ) && is_publish_commit_label(&live)
+                    {
+                        memory.saw_publish_commit = true;
+                    }
+                }
+                let current_live = live_resolved_label(&value);
+                if is_save_commit(kind.as_str(), current_live.as_deref(), Some(&payload)) {
+                    if memory.save_baseline.is_none() {
+                        memory.save_baseline = Some(memory.last_observation.clone());
+                        memory.save_application = Some(application.clone());
+                    }
+                    memory.save_committed = true;
                 }
                 if is_browser {
                     if let Some(tab) = value
@@ -4892,6 +5709,11 @@ async fn start_goal_run(
         verification_attempts: 0,
         last_typed_text: None,
         last_typed_application: None,
+        last_resolved_label: None,
+        save_baseline: None,
+        save_application: None,
+        saw_publish_commit: false,
+        save_committed: false,
         status: "running".into(),
         completion_summary: None,
         updated_at: Utc::now(),
@@ -4970,6 +5792,9 @@ async fn start_goal_run(
         if let Ok(mut notes) = app_for_run.state::<RuntimeState>().steer_notes.lock() {
             notes.remove(&emitted_run);
         }
+        if let Ok(mut overrides) = app_for_run.state::<RuntimeState>().approved_overrides.lock() {
+            overrides.remove(&emitted_run);
+        }
     });
     Ok(run_id)
 }
@@ -5003,11 +5828,35 @@ fn should_keep_screenshots(retention: &str, final_status: &str) -> bool {
     }
 }
 
-/// Runs do not survive an app restart, so any folder left here is residue from a
-/// crashed or interrupted session.
-fn sweep_stale_screenshots(app: &AppHandle) {
-    if let Ok(root) = app_data_dir(app).map(|dir| dir.join("run-screenshots")) {
-        let _ = fs::remove_dir_all(root);
+/// Runs do not survive an app restart, so leftover planner spills, atomic-write
+/// temps, and screenshot folders from a crashed session must not accumulate.
+fn sweep_stale_session_files(app: &AppHandle) {
+    let Ok(root) = app_data_dir(app) else {
+        return;
+    };
+    let _ = fs::remove_dir_all(root.join("run-screenshots"));
+    let _ = fs::remove_dir_all(root.join("planner-prompts"));
+    let _ = fs::remove_dir_all(root.join("planner-workspace"));
+    for directory in [
+        root.clone(),
+        root.join("checkpoints"),
+        root.join("goal-runs"),
+        root.join("goal-run-steps"),
+        root.join("planner-workspace"),
+    ] {
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            if name.ends_with(".tmp") || name.starts_with('.') && name.contains(".tmp") {
+                let _ = fs::remove_file(path);
+            }
+        }
     }
 }
 
@@ -5434,7 +6283,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(RuntimeState::default())
         .setup(|app| {
-            sweep_stale_screenshots(app.handle());
+            sweep_stale_session_files(app.handle());
             start_scheduler(app.handle().clone());
             let args: Vec<String> = std::env::args().collect();
             if let Some(index) = args.iter().position(|value| value == "--run-workflow") {
@@ -5598,6 +6447,210 @@ mod tests {
             "modify_reversible"
         );
         assert_eq!(effective_effect("observeWindow", "unknown"), "observe");
+        assert_eq!(method_effect("launchApplication"), "external_write");
+        assert_eq!(method_effect("scroll"), "observe");
+        assert_eq!(
+            effective_effect("launchApplication", "unknown"),
+            "external_write"
+        );
+        assert_eq!(
+            effective_effect("navigateApplication", "observe"),
+            "external_write"
+        );
+        assert_eq!(
+            effective_effect("probe", "unknown"),
+            "observe"
+        );
+        assert_eq!(
+            method_effect_for(
+                "invokeElement",
+                Some("Post"),
+                Some(&serde_json::json!({"mark": "n12"}))
+            ),
+            "external_write"
+        );
+        assert_eq!(
+            method_effect_for(
+                "invokeElement",
+                Some("Format"),
+                Some(&serde_json::json!({"mark": "n3"}))
+            ),
+            "modify_reversible"
+        );
+    }
+    #[test]
+    fn allows_reversible_remove_and_draft_rewrite() {
+        assert_eq!(
+            evaluate_base_policy(&request(
+                "delete the selected file",
+                "modify_reversible",
+                Some("Confirm")
+            ))
+            .decision,
+            "hard_deny"
+        );
+        assert_eq!(
+            evaluate_base_policy(&request(
+                "move it to trash",
+                "modify_reversible",
+                Some("Yes")
+            ))
+            .decision,
+            "hard_deny"
+        );
+        assert_eq!(
+            evaluate_base_policy(&request(
+                "click the control",
+                "modify_reversible",
+                Some("Delete account")
+            ))
+            .decision,
+            "hard_deny"
+        );
+        assert_eq!(
+            evaluate_base_policy(&request(
+                "confirm",
+                "modify_reversible",
+                Some("Destroy account")
+            ))
+            .decision,
+            "hard_deny"
+        );
+        assert_eq!(
+            evaluate_base_policy(&request("click", "modify_reversible", Some("Purge all data")))
+                .decision,
+            "hard_deny"
+        );
+        assert_eq!(
+            evaluate_base_policy(&request("click", "modify_reversible", Some("Delete project")))
+                .decision,
+            "hard_deny"
+        );
+        assert_eq!(
+            evaluate_base_policy(&request("click", "modify_reversible", Some("Remove workspace")))
+                .decision,
+            "hard_deny"
+        );
+        assert_eq!(
+            evaluate_base_policy(&request("click", "modify_reversible", Some("Trash")))
+                .decision,
+            "hard_deny"
+        );
+        assert_eq!(
+            evaluate_base_policy(&request("click", "modify_reversible", Some("Overwrite")))
+                .decision,
+            "hard_deny"
+        );
+        assert_eq!(
+            evaluate_base_policy(&request("click", "modify_reversible", Some("Delete-account")))
+                .decision,
+            "hard_deny"
+        );
+        assert_eq!(
+            evaluate_base_policy(&request("click", "modify_reversible", Some("remove_user")))
+                .decision,
+            "hard_deny"
+        );
+        assert_eq!(
+            evaluate_base_policy(&request(
+                "delete the project after sorting",
+                "modify_reversible",
+                Some("Confirm")
+            ))
+            .decision,
+            "hard_deny"
+        );
+        assert_eq!(
+            evaluate_base_policy(&request(
+                "remove the filter then delete the account",
+                "modify_reversible",
+                Some("Confirm")
+            ))
+            .decision,
+            "hard_deny"
+        );
+        assert_eq!(
+            evaluate_base_policy(&request("click", "modify_reversible", Some("Delete draft")))
+                .decision,
+            "hard_deny"
+        );
+        assert_eq!(
+            evaluate_base_policy(&request(
+                "remove the filter and the user",
+                "modify_reversible",
+                Some("Confirm")
+            ))
+            .decision,
+            "hard_deny"
+        );
+        assert_eq!(
+            evaluate_base_policy(&request(
+                "delete the project after applying the filter",
+                "modify_reversible",
+                Some("Yes")
+            ))
+            .decision,
+            "hard_deny"
+        );
+        assert!(is_reversible_remove("remove the Status filter"));
+        assert!(is_reversible_remove("delete the draft text so we can retype"));
+        assert!(!is_reversible_remove("Delete draft"));
+        assert!(!is_reversible_remove("remove the filter and the user"));
+        assert!(!is_reversible_remove("remove the filter then delete the account"));
+        assert!(!is_reversible_remove("delete the project after sorting"));
+        assert_eq!(
+            evaluate_base_policy(&request(
+                "remove the Status filter",
+                "modify_reversible",
+                Some("Clear filter")
+            ))
+            .decision,
+            "allow"
+        );
+        let mut rewrite = request(
+            "delete the draft text so we can retype",
+            "modify_reversible",
+            Some("Post text"),
+        );
+        rewrite.payload = Some(serde_json::json!({"text": "A better draft", "mark": "n7"}));
+        assert_eq!(evaluate_base_policy(&rewrite).decision, "allow");
+    }
+    #[test]
+    fn native_mark_catalog_is_the_planner_observation() {
+        let observation = serde_json::json!({
+            "generation": 4,
+            "title": "Untitled - Notepad",
+            "dpi": 144,
+            "focused": "n1",
+            "marks": [
+                {
+                    "id": "n1",
+                    "role": "Document",
+                    "name": "Text Editor",
+                    "automationId": "15",
+                    "patterns": ["Value", "Text"],
+                    "enabled": true,
+                    "chrome": false
+                },
+                {
+                    "id": "n2",
+                    "role": "MenuItem",
+                    "name": "File",
+                    "automationId": "mFile",
+                    "patterns": ["Invoke"],
+                    "enabled": true,
+                    "chrome": false
+                }
+            ],
+            "texts": ["The document body that proves a later publication."]
+        });
+        let mut lines = Vec::new();
+        summarize_native_observation(&observation, "Notepad", &mut lines);
+        assert!(lines[0].contains("Notepad  gen=4"));
+        assert!(lines.iter().any(|line| line.contains("n1") && line.contains("Document")));
+        assert!(lines.iter().any(|line| line.contains("n2") && line.contains("mFile")));
+        assert!(lines.iter().any(|line| line.starts_with("text: ") && line.contains("document body")));
+        assert!(!lines.iter().any(|line| line.contains("[screen")));
     }
     #[test]
     fn provider_commands_are_restricted() {
@@ -5770,7 +6823,7 @@ mod tests {
             id: "one".into(),
             title: "Open PowerShell".into(),
             kind: "launchApplication".into(),
-            effect: "modify_reversible".into(),
+            effect: "external_write".into(),
             application: Some("PowerShell".into()),
             intent: Some("launch application".into()),
             target_label: Some("PowerShell".into()),
@@ -5887,6 +6940,27 @@ mod tests {
         assert!(!should_keep_screenshots("none", "failed"));
         assert_eq!(screenshot_slug("Microsoft Edge"), "microsoft-edge");
         assert_eq!(screenshot_slug("Installed browser"), "installed-browser");
+    }
+
+    #[test]
+    fn atomic_write_uses_unique_temp_and_cleans_it_up() {
+        let directory = std::env::temp_dir().join(format!("alfred-atomic-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("settings.json");
+        atomic_write(&path, br#"{"ok":true}"#).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"ok":true}"#);
+        let leftovers: Vec<_> = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp")
+            })
+            .collect();
+        let _ = fs::remove_dir_all(&directory);
+        assert!(leftovers.is_empty(), "atomic_write left temp files: {leftovers:?}");
     }
     #[test]
     fn blocks_delete_virtual_key_payload() {
@@ -6006,7 +7080,7 @@ mod tests {
         .unwrap();
         assert!(!is_verified_completion(&hallucinated, current, None, false));
         let mut prompt = String::from("state");
-        append_completion_review(&mut prompt, "Saved the file", None, false);
+        append_completion_review(&mut prompt, "Saved the file", None, false, false);
         assert!(prompt.contains("do not trust the earlier claim"));
         assert!(prompt.contains("CURRENT DESKTOP STATE"));
     }
@@ -6042,9 +7116,152 @@ mod tests {
         ));
 
         let mut prompt = String::from("state");
-        append_completion_review(&mut prompt, "Tweet published", Some(text), true);
+        append_completion_review(&mut prompt, "Tweet published", Some(text), true, false);
         assert!(prompt.contains("REQUIRED PUBLISHED TEXT"));
         assert!(prompt.contains("non-editable published content"));
+
+        let mark_catalog = "Microsoft Edge  gen=4  dpi=144  focused=n3\nn3  Hyperlink \"Fun fact: Octopuses have three hearts and two stop beating when they swim.\"\ntext: Fun fact: Octopuses have three hearts and two stop beating when they swim.";
+        assert!(is_verified_completion(&reply, mark_catalog, Some(text), true));
+        let mark_draft = "Microsoft Edge  gen=4  focused=n1\nn1  Document \"Fun fact: Octopuses have three hearts and two stop beating when they swim.\"  value+text";
+        assert!(!is_verified_completion(&reply, mark_draft, Some(text), true));
+        let draft_plus_text = "Microsoft Edge  gen=4  focused=n1\nn1  Document \"Fun fact: Octopuses have three hearts and two stop beating when they swim.\"  value+text\ntext: Fun fact: Octopuses have three hearts and two stop beating when they swim.";
+        assert!(
+            !is_verified_completion(&reply, draft_plus_text, Some(text), true),
+            "a sibling text: line must not prove publication while the composer still holds the draft"
+        );
+        let draft_plus_prose = "Installed browser:\n- Document e1 \"Fun fact: Octopuses have three hearts and two stop beating when they swim.\"\nread-prose: Fun fact: Octopuses have three hearts and two stop beating when they swim.";
+        assert!(!is_verified_completion(&reply, draft_plus_prose, Some(text), true));
+        let published_link = "Installed browser:\n- a e15 \"Fun fact: Octopuses have three hearts and two stop beating when they swim.\"";
+        assert!(is_verified_completion(&reply, published_link, Some(text), true));
+        let sanitized_feed = "Installed browser:\npage: https://x.com/you\nread-prose: Fun fact: Octopuses have three hearts and two stop beating when they swim.";
+        assert!(is_verified_completion(&reply, sanitized_feed, Some(text), true));
+    }
+    #[test]
+    fn save_goals_need_a_visible_transition() {
+        assert!(goal_requires_save_proof("Save the file to the Desktop"));
+        assert!(!goal_requires_save_proof("post a tweet"));
+        let before = "Notepad  gen=2\ntitle: Untitled - Notepad";
+        let already_open = "Excel  gen=3\ntitle: report.xlsx";
+        assert!(!observation_shows_save_transition(
+            already_open,
+            Some(already_open),
+            None,
+            false,
+            None
+        ));
+        assert!(observation_shows_save_transition(
+            "Notepad  gen=3\ntitle: hello.txt",
+            Some(before),
+            Some("hello.txt"),
+            true,
+            Some("Notepad")
+        ));
+        assert!(observation_shows_save_transition(
+            "Notepad  gen=3\ntitle: notes.txt",
+            Some("Notepad  gen=2\ntitle: *notes.txt"),
+            None,
+            true,
+            Some("Notepad")
+        ));
+        assert!(
+            !observation_shows_save_transition(
+                already_open,
+                Some(already_open),
+                None,
+                true,
+                Some("Excel")
+            ),
+            "an unchanged named title is not save proof"
+        );
+        assert!(
+            !observation_shows_save_transition(
+                before,
+                Some(before),
+                None,
+                true,
+                Some("Notepad")
+            ),
+            "Ctrl+S that leaves Untitled unchanged is not a save"
+        );
+        assert!(!goal_requires_save_proof(
+            "Save me time by summarizing this document"
+        ));
+        assert!(!observation_shows_save_transition(
+            "Notepad  gen=3\ntitle: hello.txt",
+            None,
+            Some("hello.txt"),
+            true,
+            Some("Notepad")
+        ));
+        assert!(
+            !observation_shows_save_transition(
+                "Notepad  gen=3\ntitle: Untitled - Notepad\nn4  Edit \"hello.txt\"",
+                Some(before),
+                Some("hello.txt"),
+                true,
+                Some("Notepad")
+            ),
+            "a typed Save As filename is not a committed title"
+        );
+        assert!(
+            !observation_shows_save_transition(
+                "Notepad  gen=3\ntitle: hello.txt",
+                Some(before),
+                Some("hello.txt"),
+                false,
+                Some("Notepad")
+            ),
+            "filename visibility without a save commit is not proof"
+        );
+        let multi = "Installed browser:\npage: https://example.test\ntitle: Example\nNotepad  gen=4  dpi=144  focused=n1\ntitle: hello.txt";
+        let multi_before = "Installed browser:\npage: https://example.test\ntitle: Example\nNotepad  gen=2  dpi=144  focused=n1\ntitle: Untitled - Notepad";
+        assert!(observation_shows_save_transition(
+            multi,
+            Some(multi_before),
+            Some("hello.txt"),
+            true,
+            Some("Notepad")
+        ));
+    }
+    #[test]
+    fn live_resolved_commit_labels_are_publish_or_save() {
+        assert!(is_publish_commit_label("Post"));
+        assert!(is_publish_commit_label("Send tweet"));
+        assert!(!is_publish_commit_label("Send"));
+        assert!(!is_publish_commit_label("Send invite"));
+        assert!(!is_publish_commit_label("Send file"));
+        assert!(!is_publish_commit_label("Continue"));
+        assert!(!is_publish_commit_label("Post text"));
+        assert!(!is_publish_commit_label("Share screen"));
+        assert!(is_save_commit(
+            "invokeElement",
+            Some("Save"),
+            Some(&serde_json::json!({}))
+        ));
+        assert!(!is_save_commit(
+            "invokeElement",
+            Some("Save As"),
+            Some(&serde_json::json!({}))
+        ));
+        assert!(!is_save_commit(
+            "invokeElement",
+            Some("Don't Save"),
+            Some(&serde_json::json!({}))
+        ));
+        assert!(!is_save_commit(
+            "click",
+            Some("Do not save"),
+            Some(&serde_json::json!({}))
+        ));
+        assert!(is_save_commit(
+            "shortcut",
+            None,
+            Some(&serde_json::json!({"keys": "CTRL+S"}))
+        ));
+        assert_eq!(
+            live_resolved_label(&serde_json::json!({"targetName": "Post"})).as_deref(),
+            Some("Post")
+        );
     }
 
     #[test]
@@ -6235,6 +7452,14 @@ mod tests {
             infer_applications_from_goal("Post a tweet on X"),
             vec!["Microsoft Edge".to_string()]
         );
+        assert_eq!(
+            infer_applications_from_goal("Send an email to the team"),
+            vec!["Microsoft Outlook".to_string()]
+        );
+        assert_eq!(
+            infer_applications_from_goal("Open Gmail and send the draft"),
+            vec!["Microsoft Edge".to_string()]
+        );
         assert!(infer_applications_from_goal("organize my thoughts").is_empty());
     }
     #[test]
@@ -6269,6 +7494,21 @@ mod tests {
         );
         let click = serde_json::json!({"ok": true, "result": {"clicked": true}});
         assert_eq!(planner_result_digest(&click), "");
+        assert!(payload_has_normalized_point(Some(&serde_json::json!({"nx": 0.4, "ny": 0.6}))));
+        assert!(!payload_has_normalized_point(Some(&serde_json::json!({"nx": null, "ny": null, "x": 900, "y": 600}))));
+        let prose_only = serde_json::json!({
+            "ok": true,
+            "result": {
+                "text": "",
+                "prose": "Octopuses have three hearts and live in the deep.",
+                "hasMore": true,
+                "nextOffset": 6000
+            }
+        });
+        let digest = planner_result_digest(&prose_only);
+        assert!(digest.contains("Octopuses have three hearts"));
+        assert!(digest.contains("hasMore"));
+        assert!(digest.contains("6000"));
     }
     #[test]
     fn planner_prompt_pins_the_working_plan() {
@@ -6390,6 +7630,60 @@ mod tests {
         assert!(!is_safe_http_url("javascript:alert(1)"));
         assert!(!is_safe_http_url("https://user:secret@example.com"));
         assert!(!is_safe_http_url("https:///missing-host"));
+        let file_nav = WorkflowStep {
+            id: "nav".into(),
+            title: "Open a file URL".into(),
+            kind: "browser.navigate".into(),
+            effect: "external_write".into(),
+            application: Some("Installed browser".into()),
+            intent: Some("navigate".into()),
+            target_label: Some("Address".into()),
+            payload: Some(serde_json::json!({"url": "file:///C:/Windows/System32/cmd.exe"})),
+            timeout_ms: default_timeout(),
+            retries: default_retries(),
+            wait_for: None,
+            expect: None,
+            save_as: None,
+        };
+        assert!(validate_workflow_step(&file_nav)
+            .unwrap_err()
+            .contains("absolute HTTP(S) URL"));
+    }
+
+    #[test]
+    fn publication_proof_needs_an_authored_anchor() {
+        assert!(requires_published_text_proof(
+            "send an email",
+            Some("Hello from Alfred"),
+            false
+        ));
+        assert!(
+            !requires_published_text_proof("send an email", None, true),
+            "a publish click without typed text must not demand an absent string"
+        );
+        assert!(!requires_published_text_proof(
+            "summarize this dashboard",
+            None,
+            false
+        ));
+        assert!(authored_text_anchor("Hello from Alfred").is_some());
+        assert!(authored_text_anchor("Subject: lunch tomorrow").is_some());
+        assert!(authored_text_anchor("C:\\Users\\me\\Desktop\\notes.txt").is_none());
+        assert!(authored_text_anchor("notes.txt").is_none());
+        assert!(authored_text_anchor("https://example.com").is_none());
+        let reply = parse_planner_action(
+            r#"{"done":true,"verified":true,"summary":"Email sent.","evidence":["Outlook title shows Sent Items"]}"#,
+        )
+        .unwrap();
+        let sent = "Microsoft Outlook  gen=3\ntitle: Sent Items";
+        assert!(
+            is_verified_completion(&reply, sent, None, false),
+            "destination-page evidence must complete a send-the-draft goal"
+        );
+        let mut prompt = String::from("state");
+        append_completion_review(&mut prompt, "Email sent", None, false, true);
+        assert!(prompt.contains("destination outcome"));
+        assert!(!prompt.contains("cannot complete"));
     }
     #[test]
     fn native_tree_summary_keeps_actionable_controls_only() {

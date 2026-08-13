@@ -40,6 +40,7 @@ if (-not (Test-Path "node_modules/.bin/tauri.cmd")) {
 $AlfredHostSource = Join-Path $env:LOCALAPPDATA "Alfred\dev-host"
 New-Item -ItemType Directory -Force -Path $AlfredHostSource | Out-Null
 Copy-Item "native/windows-host/Program.cs" $AlfredHostSource -Force
+Copy-Item "native/windows-host/Marks.cs" $AlfredHostSource -Force
 Copy-Item "native/windows-host/Alfred.WindowsHost.csproj" $AlfredHostSource -Force
 $AlfredHostProject = Join-Path $AlfredHostSource "Alfred.WindowsHost.csproj"
 dotnet build $AlfredHostProject -c Debug

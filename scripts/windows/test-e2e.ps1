@@ -12,6 +12,7 @@ if (-not $HostPath) {
   $HostSource = Join-Path $env:LOCALAPPDATA "Alfred\test-host"
   New-Item -ItemType Directory -Force -Path $HostSource | Out-Null
   Copy-Item (Join-Path $root "native\windows-host\Program.cs") $HostSource -Force
+  Copy-Item (Join-Path $root "native\windows-host\Marks.cs") $HostSource -Force
   Copy-Item (Join-Path $root "native\windows-host\Alfred.WindowsHost.csproj") $HostSource -Force
   $HostProject = Join-Path $HostSource "Alfred.WindowsHost.csproj"
   dotnet build $HostProject -c Debug
@@ -102,12 +103,14 @@ try {
     if (-not $refocused.ok) { throw "Host could not reclaim focus from another foreground app." }
     Write-Host "PASS foreground-lock recovery"
     $tree = Invoke-AlfredHost "observeWindow" @{ processId = $notepadId } "observe Notepad" "Notepad" "Notepad"
-    if (-not $tree.ok -or -not $tree.result.bounds) { throw "UI Automation observation failed: $($tree.error)" }
+    if (-not $tree.ok -or -not $tree.result.marks) { throw "UI Automation observation failed: $($tree.error)" }
+    $notepadGeneration = [int]$tree.result.generation
     $capture = Invoke-AlfredHost "captureWindow" @{ processId = $notepadId } "capture Notepad" "Notepad" "Notepad"
     if (-not $capture.ok -or $capture.result.base64.Length -lt 1000) { throw "Window capture did not return PNG evidence: $($capture.error)" }
-    $x = [int]($tree.result.bounds.x + [Math]::Max(80, $tree.result.bounds.width / 2))
-    $y = [int]($tree.result.bounds.y + [Math]::Max(100, $tree.result.bounds.height / 2))
-    if (-not (Invoke-AlfredHost "click" @{ x = $x; y = $y; processId = $notepadId } "focus Notepad editor" "Editor" "Notepad").ok) { throw "Targeted pointer input failed." }
+    if ([int]$capture.result.generation -ne $notepadGeneration) { throw "captureWindow reminted marks instead of annotating the current catalog." }
+    $editorMark = @($tree.result.marks) | Where-Object { $_.role -match 'Document|Edit' } | Select-Object -First 1
+    if (-not $editorMark) { throw "observeWindow did not expose a Notepad editor mark." }
+    if (-not (Invoke-AlfredHost "click" @{ mark = $editorMark.id; processId = $notepadId } "focus Notepad editor" "Editor" "Notepad").ok) { throw "Targeted pointer input failed." }
     $typed = Invoke-AlfredHost "typeText" @{ text = "Alfred Windows end-to-end smoke test"; processId = $notepadId } "type smoke-test text" "Notepad editor" "Notepad"
     if (-not $typed.ok -or -not $typed.result.verified -or $typed.result.observedText -notmatch "end-to-end smoke test") {
       throw "Targeted keyboard input was not verified in the intended control: $($typed.error)"
@@ -124,7 +127,28 @@ try {
     if (-not (Invoke-AlfredHost "key" @{ virtualKey = 13; processId = $notepadId } "press enter" "Editor" "Notepad").ok) { throw "Allowed key (Enter) was rejected." }
     $outside = Invoke-AlfredHost "click" @{ x = -32000; y = -32000; processId = $notepadId } "click target" "Editor" "Notepad"
     if ($outside.ok) { throw "A click outside the target window bounds was not refused." }
-    Write-Host "PASS targeted input postcondition, bounds validation, and key allow-list"
+    $calculatorObserve = Invoke-AlfredHost "observeWindow" @{ processId = [int]$calculator.result.processId } "observe Calculator" "Calculator" "Calculator"
+    if (-not $calculatorObserve.ok) { throw "Calculator observe failed after Notepad marks were minted." }
+    $notepadStill = Invoke-AlfredHost "typeText" @{ text = $unicodeText; mark = $editorMark.id; processId = $notepadId } "reuse Notepad mark after observing Calculator" "Notepad editor" "Notepad"
+    if (-not $notepadStill.ok -or -not $notepadStill.result.verified) {
+      throw "Observing Calculator expired or rebound the Notepad mark: $($notepadStill.error)"
+    }
+    $calcId = [int]$calculator.result.processId
+    $probe = Invoke-AlfredHost "probe" @{ nx = 0.5; ny = 0.72; processId = $calcId } "probe Calculator keypad" "Equals" "Calculator"
+    if (-not $probe.ok) { throw "probe failed: $($probe.error)" }
+    if ($probe.result.kind -eq "mark") {
+      $probed = Invoke-AlfredHost "click" @{ mark = $probe.result.mark; processId = $calcId } "click probed Calculator mark" "Equals" "Calculator"
+      if (-not $probed.ok) { throw "click after probe failed: $($probed.error)" }
+    }
+    $browserPixel = Invoke-AlfredHost "click" @{ nx = 0.5; ny = 0.5; processId = $notepadId } "click unverified browser pixel" "Post" "Microsoft Edge"
+    if ($browserPixel.ok -or $browserPixel.error -notmatch "unverified browser coordinate") {
+      throw "Browser nx/ny without a matching control was not refused: $($browserPixel.error)"
+    }
+    $emptyBin = Invoke-AlfredHost "click" @{ mark = $editorMark.id; processId = $notepadId } "empty recycle bin" "Empty Recycle Bin" "Notepad"
+    if ($emptyBin.ok -or $emptyBin.error -notmatch "Destructive") {
+      throw "Live destructive name Empty Recycle Bin was not refused: $($emptyBin.error)"
+    }
+    Write-Host "PASS targeted input postcondition, bounds validation, key allow-list, and per-process marks"
     $badNavigation = Invoke-AlfredHost "navigateApplication" @{ url = "file:///C:/Windows/System32/cmd.exe"; processId = $notepadId } "navigate outside HTTP" "Address bar" "Notepad"
     if ($badNavigation.ok) { throw "Native navigation accepted a non-browser application and non-HTTP URL." }
     $badCredentialUrl = Invoke-AlfredHost "navigateApplication" @{ url = "https://user:secret@example.com"; processId = $notepadId } "navigate credential URL" "Address bar" "Microsoft Edge"

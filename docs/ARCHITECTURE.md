@@ -32,11 +32,11 @@ Guardrails: a machine-wide run lock, evidence-backed action postconditions, a co
 
 ### Prompt-injection posture
 
-Observations contain untrusted content (web page text, window titles), so planner output is treated as adversarial by construction: the declared `effect` is never trusted — Core derives a floor from the method, destructive language and the Delete key are hard-denied regardless of phrasing, unknown effects park for human approval, coordinate input is constrained to the named application's window, and application launch accepts only fixed aliases or exact installed Start-menu names. The planner can therefore never authorize a native action on its own; it can only propose one.
+Observations contain untrusted content (web page text, window titles), so planner output is treated as adversarial by construction: the declared `effect` is never trusted — Core derives a floor from the method and commit-verb targets (`observe` / `modify_reversible` / `external_write`), persistent data-loss actions and the Delete key are hard-denied, the host/extension re-check the resolved control’s live name rather than `targetLabel`, unknown effects park for human approval, live goals act by per-window mark rather than raw screen pixels, and application launch accepts only fixed aliases or exact installed Start-menu names. The planner can therefore never authorize a native action on its own; it can only propose one.
 
 ### Hybrid visual grounding
 
-Vision-only control is feasible, but it is not the reliability target: screenshots are essential for canvas-rendered and image-heavy content, while accessibility selectors are more deterministic for ordinary controls and survive display scaling better than coordinates. Alfred therefore uses both. New installations enable screenshot sharing by default and users can disable it because images leave the machine through the selected provider.
+Vision-only control is feasible, but it is not the reliability target: screenshots are essential for canvas-rendered and image-heavy content, while accessibility selectors are more deterministic for ordinary controls and survive display scaling better than coordinates. Alfred therefore uses both. Each native observe produces a **mark catalog** (`n12`) and each capture is set-of-mark annotated so the planner acts by id, not screen pixels. `findElement` / `probe` mint marks when the default catalog hid a control. New installations enable screenshot sharing by default and users can disable it because images leave the machine through the selected provider.
 
 Each turn captures one image per target application (`PrintWindow` for native windows, visible-tab capture when the optional browser bridge is present) into a per-run folder under the app-data directory. The delivery pipe differs per CLI:
 
@@ -62,7 +62,7 @@ Core detects and supervises Codex, GitHub Copilot, Cursor, and Grok CLIs. It sta
 
 ### Native automation hosts
 
-The Windows .NET host implements running/installed application enumeration, UI Automation tree observation and semantic invocation, window screenshot capture, and narrowly-scoped `SendInput` click/type/key operations. Known inbox apps use fixed executable aliases; any other app can launch only through an exact installed Start-menu shortcut, never an arbitrary executable path or command line. It communicates over capability-authenticated JSON Lines and repeats the destructive-language block in-process. A Swift AXUIElement/ScreenCaptureKit host remains the macOS platform milestone; the shared shell and Core already build on macOS.
+The Windows .NET host implements running/installed application enumeration, UI Automation mark catalogs and semantic invocation (Invoke/Value/Toggle/Scroll patterns first), set-of-mark `PrintWindow` capture, PerMonitorV2 coordinate mapping, and narrowly-scoped `SendInput` for click/type/key/scroll/drag only when a pattern is missing. Known inbox apps use fixed executable aliases; any other app can launch only through an exact installed Start-menu shortcut, never an arbitrary executable path or command line. It communicates over capability-authenticated JSON Lines and repeats the destructive-language block in-process. A Swift AXUIElement/ScreenCaptureKit host remains the macOS platform milestone; the shared shell and Core already build on macOS.
 
 ### Browser bridge
 

@@ -5,6 +5,18 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { Icon } from "./icons";
 import type { AppSettings, ProviderStatus, RunCheckpoint, RunEvent, SystemInfo, View, Workflow, WorkflowSchedule } from "./types";
 
+const MAX_COCKPIT_EVENTS = 80;
+
+function appendRunEvent(current: RunEvent[], payload: RunEvent) {
+  const next = [...current, payload];
+  if (next.length <= MAX_COCKPIT_EVENTS) return next;
+  return next.slice(next.length - MAX_COCKPIT_EVENTS).map((event, index, kept) => (
+    index < kept.length - 1 && event.evidenceDataUrl
+      ? { ...event, evidenceDataUrl: undefined }
+      : event
+  ));
+}
+
 function relativeDate(date: string) {
   const minutes = Math.max(1, Math.round((Date.now() - new Date(date).getTime()) / 60000));
   if (minutes < 60) return `${minutes}m ago`;
@@ -291,11 +303,16 @@ function ExecutionCockpit({ workflow, settings, onWorkflowChanged, onClose }: { 
     listen<RunEvent>("alfred://run-event", ({ payload }) => {
       if (!active) return;
       if (payload.runId !== activeRun.current) {
-        if (!activeRun.current) early.current.push(payload);
+        if (!activeRun.current) {
+          early.current.push(payload);
+          if (early.current.length > 80) early.current.splice(0, early.current.length - 80);
+        }
         return;
       }
-      if (pausedRef.current || takeoverRef.current) queued.current.push(payload);
-      else setEvents((current) => [...current, payload]);
+      if (pausedRef.current || takeoverRef.current) {
+        queued.current.push(payload);
+        if (queued.current.length > 80) queued.current.splice(0, queued.current.length - 80);
+      } else setEvents((current) => appendRunEvent(current, payload));
     }).then((unlisten) => { if (active) dispose = unlisten; else unlisten(); });
     return () => { active = false; dispose?.(); };
   }, []);
@@ -313,7 +330,7 @@ function ExecutionCockpit({ workflow, settings, onWorkflowChanged, onClose }: { 
       setRunId(id);
       const held = early.current.filter((event) => event.runId === id);
       early.current = [];
-      if (held.length) setEvents((current) => [...current, ...held]);
+      if (held.length) setEvents((current) => held.reduce(appendRunEvent, current));
     }).catch((caught) => setStartError(String(caught)));
     return () => { activeRun.current = ""; early.current = []; };
   }, [workflow.id, workflow.status, workflow.goal, workflow.requiredApps, workflow.plannerProvider, settings.provider]);
@@ -328,7 +345,7 @@ function ExecutionCockpit({ workflow, settings, onWorkflowChanged, onClose }: { 
       invoke<RunCheckpoint | null>("get_checkpoint", { runId }).then((checkpoint) => {
         if (cancelled || !checkpoint || checkpoint.status === "running") return;
         if (checkpoint.status === "completed") {
-          setEvents((current) => current.at(-1)?.status === "completed" ? current : [...current, {
+          setEvents((current) => current.at(-1)?.status === "completed" ? current : appendRunEvent(current, {
             runId,
             sequence: checkpoint.nextStepIndex,
             stepId: "recovered",
@@ -338,9 +355,9 @@ function ExecutionCockpit({ workflow, settings, onWorkflowChanged, onClose }: { 
             status: "completed",
             progress: 100,
             timestamp: checkpoint.updatedAt,
-          }]);
+          }));
         } else {
-          setEvents((current) => ["failed", "stopped"].includes(current.at(-1)?.status ?? "") ? current : [...current, {
+          setEvents((current) => ["failed", "stopped"].includes(current.at(-1)?.status ?? "") ? current : appendRunEvent(current, {
             runId,
             sequence: checkpoint.nextStepIndex,
             stepId: "terminal",
@@ -350,7 +367,7 @@ function ExecutionCockpit({ workflow, settings, onWorkflowChanged, onClose }: { 
             status: checkpoint.status,
             progress: current.at(-1)?.progress ?? 0,
             timestamp: checkpoint.updatedAt,
-          }]);
+          }));
         }
       }).catch(() => undefined);
     }, 3000);
@@ -360,7 +377,7 @@ function ExecutionCockpit({ workflow, settings, onWorkflowChanged, onClose }: { 
   const resume = () => {
     setPaused(false); setTakeover(false);
     if (runId && livePlanner) invoke("set_run_control", { runId, control: "running" });
-    if (queued.current.length) { setEvents((current) => [...current, ...queued.current]); queued.current = []; }
+    if (queued.current.length) { setEvents((current) => queued.current.reduce(appendRunEvent, current)); queued.current = []; }
   };
   const controlRun = (control: "paused" | "stop") => {
     if (runId && livePlanner) invoke("set_run_control", { runId, control }).catch(() => undefined);
@@ -374,7 +391,7 @@ function ExecutionCockpit({ workflow, settings, onWorkflowChanged, onClose }: { 
     try {
       const checkpoint = await invoke<RunCheckpoint>("complete_goal_run", { runId });
       setPaused(false); setTakeover(false); queued.current = [];
-      setEvents((current) => current.at(-1)?.status === "completed" ? current : [...current, {
+      setEvents((current) => current.at(-1)?.status === "completed" ? current : appendRunEvent(current, {
         runId,
         sequence: checkpoint.nextStepIndex,
         stepId: "user-completed",
@@ -384,7 +401,7 @@ function ExecutionCockpit({ workflow, settings, onWorkflowChanged, onClose }: { 
         status: "completed",
         progress: 100,
         timestamp: checkpoint.updatedAt,
-      }]);
+      }));
     } catch (caught) { setStartError(String(caught)); }
   };
   const saveAsWorkflow = async () => {
@@ -417,8 +434,10 @@ function ExecutionCockpit({ workflow, settings, onWorkflowChanged, onClose }: { 
       catch (caught) { setStartError(String(caught)); return; }
     }
     const echo: RunEvent = { runId, sequence: 9999, stepId: `steer-${Date.now()}`, title, detail: note, application: "You", status: "running", progress: events.at(-1)?.progress ?? 3, timestamp: new Date().toISOString() };
-    if (pausedRef.current || takeoverRef.current) queued.current.push(echo);
-    else setEvents((current) => [...current, echo]);
+    if (pausedRef.current || takeoverRef.current) {
+      queued.current.push(echo);
+      if (queued.current.length > MAX_COCKPIT_EVENTS) queued.current.splice(0, queued.current.length - MAX_COCKPIT_EVENTS);
+    } else setEvents((current) => appendRunEvent(current, echo));
   };
 
   const current = events.at(-1);
@@ -585,7 +604,7 @@ function SettingsView({ settings, providers, system, onSave }: { settings: AppSe
     <section className="settings-section"><h2>Computer control</h2><p>Native host: <strong>{system.nativeHost}</strong>. Safe actions run automatically; destructive actions remain blocked.</p><div className="bridge-status"><i className={browserConnected ? "connected" : ""}/><div><strong>{browserConnected ? "Optional browser accelerator connected" : "Native visual browser control active"}</strong><span>{browserConnected ? "DOM-backed browser actions are available in addition to native control." : "The extension is optional. Alfred can operate the browser through screenshots and Windows UI Automation."}</span></div><button onClick={async () => setBrowserConnected(await invoke<boolean>("browser_bridge_status"))}>Check</button></div></section>
     <section className="settings-section"><h2>Workflow library</h2><p>Automations are portable YAML files in a folder you control.</p><div className="settings-path"><Icon name="folder" size={18}/><span>{draft.libraryPath}</span><button onClick={choose}>Change</button></div><small className="platform-note">Running on {system.os} · {system.architecture}</small></section>
     <section className="settings-section"><h2>Screenshot retention</h2><select value={draft.screenshotRetention} onChange={(event) => setDraft({ ...draft, screenshotRetention: event.target.value as AppSettings["screenshotRetention"] })}><option value="failures">Only when a run needs attention</option><option value="all">Every run</option><option value="none">Discard immediately</option></select></section>
-    <section className="settings-section"><h2>Hybrid visual grounding</h2><p>Alfred combines screenshots with accessibility data. This is more reliable than either vision-only or UI Automation-only control. Images leave this device through the selected provider.</p><label className="toggle-row"><input type="checkbox" checked={draft.shareScreenshotsWithPlanner} onChange={(event) => setDraft({ ...draft, shareScreenshotsWithPlanner: event.target.checked })}/><span>Share target-app screenshots with the selected brain (recommended for reliable control)</span></label></section>
+    <section className="settings-section"><h2>Hybrid visual grounding</h2><p>Alfred numbers on-screen controls (set-of-mark) and combines that with UI Automation. The planner clicks marks, not raw pixels. Images leave this device through the selected provider.</p><label className="toggle-row"><input type="checkbox" checked={draft.shareScreenshotsWithPlanner} onChange={(event) => setDraft({ ...draft, shareScreenshotsWithPlanner: event.target.checked })}/><span>Share target-app screenshots with the selected brain (recommended for reliable control)</span></label></section>
     <section className="settings-section danger-zone"><h2>Safety policy</h2><div className="immutable-setting"><Icon name="shield" size={19}/><div><strong>Persistent-data deletion blocked</strong><span>This protection is enforced in Core, the Windows host, and the browser extension.</span></div><span>Always on</span></div></section>
   </div>{message && <div className="info-callout"><Icon name="check" size={18}/><span>{message}</span></div>}<div className="settings-save"><span>{saved ? "Settings saved" : "Changes stay local to this machine."}</span><button className="primary-button" onClick={async () => { await onSave(draft); setSaved(true); setTimeout(() => setSaved(false), 1800); }}>Save changes</button></div></div>;
 }

@@ -15,6 +15,8 @@ This skill is injected into the goal-run planner prompt whenever the goal or tar
 | `browser.scroll` | Page viewport or scroll text into view | `{ "direction": "down" }` or `{ "text": "RUM" }` |
 | `browser.find` | Playwright-like getByText → refs | `{ "text": "Errors" }` |
 | `browser.click` | Click a ref from observe/find | `{ "ref": "e3" }` |
+| `browser.dblclick` | Double-click a ref | `{ "ref": "e3" }` |
+| `browser.hover` | Hover a ref (menus, tooltips) | `{ "ref": "e3" }` |
 | `browser.type` | Type into an input ref | `{ "ref": "e5", "text": "..." }` |
 | `browser.getText` | Single-element text (≤2000 chars) | `{ "ref": "e2" }` |
 
@@ -32,8 +34,9 @@ This skill is injected into the goal-run planner prompt whenever the goal or tar
 
 - Not a headless Playwright cluster
 - Not a Datadog API client (UI only)
-- Not reliable for canvas-only UIs (Google Docs)
+- Canvas-only UIs (Google Docs) still need native marks / probe; DOM refs miss the canvas
 - Not unattended public posting
+- `browser.navigate` succeeds only on the requested path or a real committed URL change — staying on the same origin is not enough
 
 ## Extension reload
 
