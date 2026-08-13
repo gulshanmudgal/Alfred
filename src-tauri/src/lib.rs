@@ -6,12 +6,12 @@ use std::os::windows::process::CommandExt as _;
 use std::{
     collections::HashMap,
     fs,
-    io::{BufRead, BufReader as StdBufReader, Write},
+    io::{BufRead, BufReader as StdBufReader, Read, Write},
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{mpsc, Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
@@ -147,6 +147,12 @@ pub struct AppSettings {
     /// to a provider. Useful when diagnosing a failed run.
     #[serde(default)]
     diagnostic_logging: bool,
+    /// Per-provider model id last chosen in Settings. Empty means the CLI default.
+    #[serde(default)]
+    planner_models: HashMap<String, String>,
+    /// Per-provider reasoning effort last chosen in Settings. Empty means the CLI default.
+    #[serde(default)]
+    planner_efforts: HashMap<String, String>,
 }
 
 impl Default for AppSettings {
@@ -159,6 +165,8 @@ impl Default for AppSettings {
             theme: "system".into(),
             share_screenshots_with_planner: true,
             diagnostic_logging: false,
+            planner_models: HashMap::new(),
+            planner_efforts: HashMap::new(),
         }
     }
 }
@@ -181,6 +189,46 @@ pub struct ProviderStatus {
     installed: bool,
     version: Option<String>,
     credential_stored: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderEffortOption {
+    id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderModelOption {
+    id: String,
+    display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_effort: Option<String>,
+    #[serde(default)]
+    efforts: Vec<ProviderEffortOption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderModelCatalog {
+    provider: String,
+    installed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_model: Option<String>,
+    #[serde(default)]
+    models: Vec<ProviderModelOption>,
+    /// CLI-wide efforts when the CLI does not publish a per-model list.
+    #[serde(default)]
+    efforts: Vec<ProviderEffortOption>,
+    /// How Alfred should apply a chosen effort: `flag`, `model-param`, or empty.
+    #[serde(default)]
+    effort_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -895,6 +943,808 @@ fn detect_providers() -> Vec<ProviderStatus> {
         .collect()
 }
 
+fn empty_model_catalog(provider: &str, installed: bool, error: Option<String>) -> ProviderModelCatalog {
+    ProviderModelCatalog {
+        provider: provider.into(),
+        installed,
+        default_model: None,
+        models: Vec::new(),
+        efforts: Vec::new(),
+        effort_mode: String::new(),
+        source: None,
+        error,
+    }
+}
+
+fn effort_option(id: impl Into<String>, description: Option<String>) -> ProviderEffortOption {
+    ProviderEffortOption {
+        id: id.into(),
+        description,
+    }
+}
+
+fn model_option(
+    id: impl Into<String>,
+    display_name: impl Into<String>,
+    default_effort: Option<String>,
+    efforts: Vec<ProviderEffortOption>,
+) -> ProviderModelOption {
+    let id = id.into();
+    ProviderModelOption {
+        display_name: display_name.into(),
+        id,
+        default_effort,
+        efforts,
+    }
+}
+
+fn looks_like_model_id(value: &str) -> bool {
+    let trimmed = value.trim();
+    let first = trimmed.chars().next();
+    let lower = trimmed.to_ascii_lowercase();
+    !trimmed.is_empty()
+        && trimmed.len() <= 160
+        && !trimmed.starts_with('-')
+        && first.is_some_and(|c| c.is_ascii_alphanumeric())
+        && !matches!(
+            lower.as_str(),
+            "error"
+                | "usage"
+                | "options"
+                | "commands"
+                | "warning"
+                | "unknown"
+                | "available"
+                | "default"
+                | "model"
+                | "models"
+        )
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | '/' | ':' | '[' | ']' | '=' | ','))
+}
+
+fn looks_like_effort_id(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= 32
+        && !matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "choices" | "level" | "effort" | "reasoning" | "one" | "of" | "are" | "use"
+        )
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn sanitize_planner_model(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    looks_like_model_id(trimmed).then(|| trimmed.to_string())
+}
+
+fn sanitize_planner_effort(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    looks_like_effort_id(trimmed).then(|| trimmed.to_string())
+}
+
+fn parse_quoted_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    for ch in text.chars() {
+        if ch == '"' {
+            if in_quote {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                in_quote = false;
+            } else {
+                in_quote = true;
+            }
+        } else if in_quote {
+            current.push(ch);
+        }
+    }
+    tokens
+}
+
+fn is_probe_or_noise_token(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("invalid") || lower.contains("__") || lower == "level" || lower == "effort"
+}
+
+fn parse_effort_ids_from_text(text: &str) -> Vec<String> {
+    let lower = text.to_ascii_lowercase();
+    let markers = ["use one of:", "allowed choices are", "possible values:", "choices:"];
+    for marker in markers {
+        if let Some(index) = lower.find(marker) {
+            let tail = text[index + marker.len()..]
+                .split('\n')
+                .take(4)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let quoted = parse_quoted_tokens(&tail)
+                .into_iter()
+                .filter(|part| looks_like_effort_id(part) && !is_probe_or_noise_token(part))
+                .collect::<Vec<_>>();
+            if !quoted.is_empty() {
+                return quoted;
+            }
+            let parsed = tail
+                .split(|ch: char| matches!(ch, ',' | ';' | '.' | ')' | ']' | '|'))
+                .map(|part| part.trim().trim_matches('"').trim_matches('\'').to_string())
+                .filter(|part| looks_like_effort_id(part) && !is_probe_or_noise_token(part))
+                .collect::<Vec<_>>();
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+    }
+    parse_quoted_tokens(text)
+        .into_iter()
+        .filter(|token| looks_like_effort_id(token) && !is_probe_or_noise_token(token))
+        .collect()
+}
+
+fn unique_effort_options(ids: impl IntoIterator<Item = String>) -> Vec<ProviderEffortOption> {
+    let mut seen = HashMap::new();
+    let mut options = Vec::new();
+    for id in ids {
+        if seen.insert(id.clone(), ()).is_none() && looks_like_effort_id(&id) {
+            options.push(effort_option(id, None));
+        }
+    }
+    options
+}
+
+fn backtick_section<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("`{key}`");
+    let start = text.find(&needle)? + needle.len();
+    let rest = &text[start..];
+    let end = rest.find("\n  `").unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+fn parse_codex_model_catalog(json: &str) -> Result<ProviderModelCatalog, String> {
+    #[derive(Deserialize)]
+    struct CodexCatalog {
+        models: Vec<CodexModel>,
+    }
+    #[derive(Deserialize)]
+    struct CodexModel {
+        slug: String,
+        #[serde(default)]
+        display_name: Option<String>,
+        #[serde(default)]
+        visibility: Option<String>,
+        #[serde(default)]
+        default_reasoning_level: Option<String>,
+        #[serde(default)]
+        supported_reasoning_levels: Vec<CodexEffort>,
+        #[serde(default)]
+        priority: Option<i64>,
+    }
+    #[derive(Deserialize)]
+    struct CodexEffort {
+        effort: String,
+        #[serde(default)]
+        description: Option<String>,
+    }
+
+    let start = json.find('{').ok_or_else(|| "Codex did not return a model catalog.".to_string())?;
+    let catalog: CodexCatalog = serde_json::from_str(&json[start..])
+        .map_err(|error| format!("Could not parse the Codex model catalog: {error}"))?;
+    let mut models = catalog
+        .models
+        .into_iter()
+        .filter(|model| {
+            model
+                .visibility
+                .as_deref()
+                .map(|value| value.eq_ignore_ascii_case("list"))
+                .unwrap_or(true)
+        })
+        .map(|model| {
+            let efforts = model
+                .supported_reasoning_levels
+                .into_iter()
+                .filter(|item| looks_like_effort_id(&item.effort))
+                .map(|item| effort_option(item.effort, item.description))
+                .collect::<Vec<_>>();
+            (
+                model.priority.unwrap_or(i64::MAX),
+                model_option(
+                    model.slug,
+                    model.display_name.unwrap_or_default(),
+                    model.default_reasoning_level.filter(|value| looks_like_effort_id(value)),
+                    efforts,
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    models.sort_by_key(|(priority, _)| *priority);
+    let models = models
+        .into_iter()
+        .map(|(_, mut model)| {
+            if model.display_name.trim().is_empty() {
+                model.display_name = model.id.clone();
+            }
+            model
+        })
+        .collect::<Vec<_>>();
+    if models.is_empty() {
+        return Err("Codex returned an empty model catalog.".into());
+    }
+    let default_model = models.first().map(|model| model.id.clone());
+    let efforts = unique_effort_options(
+        models
+            .iter()
+            .flat_map(|model| model.efforts.iter().map(|effort| effort.id.clone())),
+    );
+    Ok(ProviderModelCatalog {
+        provider: "codex".into(),
+        installed: true,
+        default_model,
+        models,
+        efforts,
+        effort_mode: "flag".into(),
+        source: Some("codex debug models".into()),
+        error: None,
+    })
+}
+
+fn parse_copilot_models_from_help(help: &str) -> Vec<ProviderModelOption> {
+    backtick_section(help, "model")
+        .map(parse_quoted_tokens)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| looks_like_model_id(id))
+        .map(|id| model_option(id.clone(), id, None, Vec::new()))
+        .collect()
+}
+
+fn parse_copilot_efforts_from_help(help: &str) -> Vec<ProviderEffortOption> {
+    let lower = help.to_ascii_lowercase();
+    let Some(index) = lower
+        .find("--effort")
+        .or_else(|| lower.find("reasoning-effort"))
+    else {
+        return Vec::new();
+    };
+    let window = &help[index..index.saturating_add(500).min(help.len())];
+    unique_effort_options(parse_effort_ids_from_text(window))
+}
+
+fn parse_grok_models_list(text: &str) -> (Option<String>, Vec<ProviderModelOption>) {
+    let mut default_model = None;
+    let mut models: Vec<ProviderModelOption> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Default model:") {
+            let id = rest.trim();
+            if looks_like_model_id(id) {
+                default_model = Some(id.to_string());
+            }
+            continue;
+        }
+        let marked = trimmed
+            .strip_prefix("* ")
+            .or_else(|| trimmed.strip_prefix("- "))
+            .or_else(|| trimmed.strip_prefix("• "));
+        if let Some(marked) = marked {
+            let id = marked.split_whitespace().next().unwrap_or_default();
+            if looks_like_model_id(id) && !models.iter().any(|model: &ProviderModelOption| model.id == id) {
+                models.push(model_option(id, id, None, Vec::new()));
+            }
+        }
+    }
+    (default_model, models)
+}
+
+fn models_from_json_value(value: &Value) -> Vec<ProviderModelOption> {
+    match value {
+        Value::Array(items) => items.iter().flat_map(models_from_json_value).collect(),
+        Value::Object(map) => {
+            if let Some(nested) = map
+                .get("models")
+                .or_else(|| map.get("data"))
+                .or_else(|| map.get("items"))
+            {
+                return models_from_json_value(nested);
+            }
+            let Some(id) = ["id", "slug", "name", "model"]
+                .into_iter()
+                .find_map(|key| map.get(key).and_then(Value::as_str))
+                .filter(|value| looks_like_model_id(value))
+            else {
+                return Vec::new();
+            };
+            let display = ["display_name", "displayName", "title", "name"]
+                .into_iter()
+                .find_map(|key| map.get(key).and_then(Value::as_str))
+                .unwrap_or(id);
+            let default_effort = ["default_reasoning_level", "defaultEffort", "default_effort"]
+                .into_iter()
+                .find_map(|key| map.get(key).and_then(Value::as_str))
+                .filter(|value| looks_like_effort_id(value))
+                .map(str::to_string);
+            let efforts = map
+                .get("supported_reasoning_levels")
+                .or_else(|| map.get("efforts"))
+                .or_else(|| map.get("reasoning_efforts"))
+                .map(|value| match value {
+                    Value::Array(items) => items
+                        .iter()
+                        .filter_map(|item| match item {
+                            Value::String(id) if looks_like_effort_id(id) => {
+                                Some(effort_option(id.clone(), None))
+                            }
+                            Value::Object(inner) => inner
+                                .get("effort")
+                                .or_else(|| inner.get("id"))
+                                .and_then(Value::as_str)
+                                .filter(|id| looks_like_effort_id(id))
+                                .map(|id| {
+                                    effort_option(
+                                        id,
+                                        inner
+                                            .get("description")
+                                            .and_then(Value::as_str)
+                                            .map(str::to_string),
+                                    )
+                                }),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                })
+                .unwrap_or_default();
+            vec![model_option(id, display, default_effort, efforts)]
+        }
+        Value::String(id) if looks_like_model_id(id) => {
+            vec![model_option(id.clone(), id.clone(), None, Vec::new())]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn parse_line_oriented_models(text: &str) -> Vec<ProviderModelOption> {
+    let mut models: Vec<ProviderModelOption> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("available model")
+            || lower.starts_with("usage:")
+            || lower.starts_with("options:")
+            || lower.starts_with("commands:")
+        {
+            continue;
+        }
+        let token = trimmed
+            .trim_start_matches(['*', '-', '•', '>', '|'])
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_matches(|ch: char| matches!(ch, ',' | ';' | ':' | '"' | '\''));
+        if looks_like_model_id(token) && !models.iter().any(|model: &ProviderModelOption| model.id == token) {
+            models.push(model_option(token, token, None, Vec::new()));
+        }
+    }
+    models
+}
+
+fn parse_cursor_models_list(text: &str) -> Vec<ProviderModelOption> {
+    let trimmed = text.trim();
+    if let Some(start) = trimmed.find(['{', '[']) {
+        if let Ok(value) = serde_json::from_str::<Value>(&trimmed[start..]) {
+            let parsed = models_from_json_value(&value);
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+    }
+    parse_line_oriented_models(trimmed)
+}
+
+fn parse_help_effort_mode(help: &str) -> (String, Vec<ProviderEffortOption>) {
+    let lower = help.to_ascii_lowercase();
+    if lower.contains("--effort") || lower.contains("--reasoning-effort") {
+        let index = lower
+            .find("--effort")
+            .or_else(|| lower.find("--reasoning-effort"))
+            .unwrap_or(0);
+        let window = &help[index..index.saturating_add(600).min(help.len())];
+        return ("flag".into(), unique_effort_options(parse_effort_ids_from_text(window)));
+    }
+    if lower.contains("[effort=") || lower.contains("effort=") {
+        return (
+            "model-param".into(),
+            unique_effort_options(parse_effort_ids_from_text(help)),
+        );
+    }
+    (String::new(), Vec::new())
+}
+
+struct CapturedCli {
+    stdout: String,
+    stderr: String,
+    success: bool,
+}
+
+fn wait_for_output(mut child: Child, timeout: Duration) -> Result<std::process::Output, String> {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        if let Some(mut pipe) = stdout {
+            let _ = pipe.read_to_end(&mut buffer);
+        }
+        buffer
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        if let Some(mut pipe) = stderr {
+            let _ = pipe.read_to_end(&mut buffer);
+        }
+        buffer
+    });
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = stdout_handle
+                    .join()
+                    .unwrap_or_default();
+                let stderr = stderr_handle
+                    .join()
+                    .unwrap_or_default();
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            Ok(None) => {
+                kill_planner_process(Some(child.id()));
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("The planner CLI timed out while listing models.".into());
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+fn provider_secret_env(provider: &str) -> Option<(&'static str, String)> {
+    let secret = vault_entry(provider)
+        .ok()
+        .and_then(|entry| entry.get_password().ok())?;
+    if secret.trim().is_empty() {
+        return None;
+    }
+    let key = match provider {
+        "codex" => "OPENAI_API_KEY",
+        "copilot" => "GH_TOKEN",
+        "cursor" => "CURSOR_API_KEY",
+        "grok" => "XAI_API_KEY",
+        _ => return None,
+    };
+    Some((key, secret))
+}
+
+fn capture_provider_cli(
+    provider: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<CapturedCli, String> {
+    let command_name = provider_definitions()
+        .into_iter()
+        .find(|(id, _, _)| *id == provider)
+        .map(|(_, _, command)| command)
+        .unwrap_or(provider);
+    let path = resolve_provider_command(command_name)
+        .ok_or_else(|| format!("{command_name} is not installed."))?;
+    let owned = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
+    let resolved = resolved_process(&path, &owned, true)?;
+    let mut process = Command::new(&resolved.program);
+    hide_windows_console(&mut process);
+    process
+        .args(&resolved.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some((key, secret)) = provider_secret_env(provider) {
+        process.env(key, secret);
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(raw_argument) = resolved.windows_raw_argument {
+        process.raw_arg(raw_argument);
+    }
+    let child = process
+        .spawn()
+        .map_err(|error| format!("Could not start {command_name}: {error}"))?;
+    let output = wait_for_output(child, timeout)?;
+    Ok(CapturedCli {
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        success: output.status.success(),
+    })
+}
+
+fn combined_cli_text(captured: &CapturedCli) -> String {
+    if captured.stdout.trim().is_empty() {
+        captured.stderr.clone()
+    } else if captured.stderr.trim().is_empty() {
+        captured.stdout.clone()
+    } else {
+        format!("{}\n{}", captured.stdout, captured.stderr)
+    }
+}
+
+fn fetch_codex_model_catalog() -> ProviderModelCatalog {
+    let live = capture_provider_cli("codex", &["debug", "models"], Duration::from_secs(45));
+    match live.and_then(|captured| parse_codex_model_catalog(&captured.stdout)) {
+        Ok(catalog) => catalog,
+        Err(live_error) => {
+            match capture_provider_cli("codex", &["debug", "models", "--bundled"], Duration::from_secs(20))
+                .and_then(|captured| parse_codex_model_catalog(&captured.stdout))
+            {
+                Ok(mut catalog) => {
+                    catalog.source = Some("codex debug models --bundled".into());
+                    catalog
+                }
+                Err(bundled_error) => empty_model_catalog(
+                    "codex",
+                    true,
+                    Some(format!("{live_error} {bundled_error}")),
+                ),
+            }
+        }
+    }
+}
+
+fn fetch_copilot_model_catalog() -> ProviderModelCatalog {
+    let config_help = capture_provider_cli("copilot", &["help", "config"], Duration::from_secs(20));
+    let flag_help = capture_provider_cli("copilot", &["--help"], Duration::from_secs(20));
+    let mut catalog = empty_model_catalog("copilot", true, None);
+    match config_help {
+        Ok(captured) => {
+            catalog.models = parse_copilot_models_from_help(&combined_cli_text(&captured));
+            catalog.source = Some("copilot help config".into());
+        }
+        Err(error) => catalog.error = Some(error),
+    }
+    match flag_help {
+        Ok(captured) => {
+            catalog.efforts = parse_copilot_efforts_from_help(&combined_cli_text(&captured));
+            catalog.effort_mode = if catalog.efforts.is_empty() {
+                String::new()
+            } else {
+                "flag".into()
+            };
+            if catalog.models.is_empty() {
+                catalog.models = parse_copilot_models_from_help(&combined_cli_text(&captured));
+            }
+        }
+        Err(error) => {
+            if catalog.error.is_none() {
+                catalog.error = Some(error);
+            }
+        }
+    }
+    if catalog.models.is_empty() && catalog.error.is_none() {
+        catalog.error = Some("Copilot did not list any models.".into());
+    }
+    catalog
+}
+
+fn probe_grok_efforts(model: &str) -> Vec<ProviderEffortOption> {
+    let captured = capture_provider_cli(
+        "grok",
+        &[
+            "--model",
+            model,
+            "--reasoning-effort",
+            "__alfred_invalid__",
+            "-p",
+            "hi",
+            "--output-format",
+            "json",
+            "--no-subagents",
+        ],
+        Duration::from_secs(8),
+    );
+    match captured {
+        Ok(output) => unique_effort_options(parse_effort_ids_from_text(&combined_cli_text(&output))),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn fetch_grok_model_catalog() -> ProviderModelCatalog {
+    let captured = match capture_provider_cli("grok", &["models"], Duration::from_secs(25)) {
+        Ok(captured) => captured,
+        Err(error) => return empty_model_catalog("grok", true, Some(error)),
+    };
+    let (default_model, mut models) = parse_grok_models_list(&combined_cli_text(&captured));
+    if models.is_empty() {
+        return empty_model_catalog(
+            "grok",
+            true,
+            Some("Grok did not list any models.".into()),
+        );
+    }
+    for model in models.iter_mut().take(12) {
+        model.efforts = probe_grok_efforts(&model.id);
+    }
+    if let Some(default_id) = default_model.as_deref() {
+        if let Some(model) = models.iter_mut().find(|model| model.id == default_id) {
+            if model.efforts.is_empty() {
+                model.efforts = probe_grok_efforts(&model.id);
+            }
+        }
+    }
+    ProviderModelCatalog {
+        provider: "grok".into(),
+        installed: true,
+        default_model,
+        models,
+        efforts: Vec::new(),
+        effort_mode: "flag".into(),
+        source: Some("grok models".into()),
+        error: None,
+    }
+}
+
+fn fetch_cursor_model_catalog() -> ProviderModelCatalog {
+    let mut catalog = empty_model_catalog("cursor", true, None);
+    let list_attempts: [&[&str]; 2] = [&["--list-models"], &["models"]];
+    for args in list_attempts {
+        match capture_provider_cli("cursor", args, Duration::from_secs(25)) {
+            Ok(captured) if captured.success => {
+                let parsed = parse_cursor_models_list(&captured.stdout);
+                if !parsed.is_empty() {
+                    catalog.models = parsed;
+                    catalog.source = Some(format!("cursor-agent {}", args.join(" ")));
+                    catalog.error = None;
+                    break;
+                }
+            }
+            Ok(captured) => {
+                if catalog.error.is_none() {
+                    catalog.error = Some(combined_cli_text(&captured).chars().take(240).collect());
+                }
+            }
+            Err(error) => {
+                if catalog.error.is_none() {
+                    catalog.error = Some(error);
+                }
+            }
+        }
+    }
+    if let Ok(help) = capture_provider_cli("cursor", &["--help"], Duration::from_secs(15)) {
+        let (mode, efforts) = parse_help_effort_mode(&combined_cli_text(&help));
+        catalog.effort_mode = mode;
+        catalog.efforts = efforts;
+    }
+    if catalog.models.is_empty() && catalog.error.is_none() {
+        catalog.error = Some("Cursor did not list any models.".into());
+    }
+    catalog
+}
+
+fn list_provider_models_sync(provider: String) -> ProviderModelCatalog {
+    let Some((_, _, command)) = provider_definitions()
+        .into_iter()
+        .find(|(id, _, _)| *id == provider)
+    else {
+        return empty_model_catalog(&provider, false, Some(format!("Unknown provider: {provider}")));
+    };
+    if resolve_provider_command(command).is_none() {
+        return empty_model_catalog(
+            &provider,
+            false,
+            Some(format!("{command} is not installed.")),
+        );
+    }
+    match provider.as_str() {
+        "codex" => fetch_codex_model_catalog(),
+        "copilot" => fetch_copilot_model_catalog(),
+        "grok" => fetch_grok_model_catalog(),
+        "cursor" => fetch_cursor_model_catalog(),
+        _ => empty_model_catalog(&provider, false, Some(format!("Unknown provider: {provider}"))),
+    }
+}
+
+#[tauri::command]
+async fn list_provider_models(provider: String) -> ProviderModelCatalog {
+    let label = provider.clone();
+    tokio::task::spawn_blocking(move || list_provider_models_sync(provider))
+        .await
+        .unwrap_or_else(|_| {
+            empty_model_catalog(
+                &label,
+                false,
+                Some("Could not list planner models.".into()),
+            )
+        })
+}
+
+fn planner_selection_from_settings(settings: &AppSettings, provider: &str) -> (Option<String>, Option<String>) {
+    let model = settings
+        .planner_models
+        .get(provider)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let effort = settings
+        .planner_efforts
+        .get(provider)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    (model, effort)
+}
+
+fn apply_planner_selection(
+    provider: &str,
+    args: &mut Vec<String>,
+    model: Option<&str>,
+    effort: Option<&str>,
+) {
+    let model = model.and_then(sanitize_planner_model);
+    let effort = effort.and_then(sanitize_planner_effort);
+    match provider {
+        "codex" => {
+            let mut prefix = Vec::new();
+            if let Some(model) = model {
+                prefix.push("-m".into());
+                prefix.push(model);
+            }
+            if let Some(effort) = effort {
+                prefix.push("-c".into());
+                prefix.push(format!("model_reasoning_effort=\"{effort}\""));
+            }
+            prefix.append(args);
+            *args = prefix;
+        }
+        "copilot" => {
+            if let Some(model) = model {
+                args.push("--model".into());
+                args.push(model);
+            }
+            if let Some(effort) = effort {
+                args.push("--effort".into());
+                args.push(effort);
+            }
+        }
+        "grok" => {
+            if let Some(model) = model {
+                args.push("-m".into());
+                args.push(model);
+            }
+            if let Some(effort) = effort {
+                args.push("--reasoning-effort".into());
+                args.push(effort);
+            }
+        }
+        "cursor" => {
+            if let Some(model) = model {
+                let value = match effort {
+                    Some(effort) if !model.contains('[') => format!("{model}[effort={effort}]"),
+                    _ => model,
+                };
+                args.insert(0, "--model".into());
+                args.insert(1, value);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// How a provider CLI receives images. The models behind every supported CLI are
 /// multimodal; only the delivery pipe differs:
 /// - Flag: Codex `-i/--image <FILE>...`, Copilot `--attachment <path>` (valid in
@@ -933,6 +1783,18 @@ fn provider_invocation_for_session(
     images: &[PathBuf],
     session_id: Option<&str>,
     resume: bool,
+) -> Result<ProviderInvocation, String> {
+    planner_invocation(provider, prompt, images, session_id, resume, None, None)
+}
+
+fn planner_invocation(
+    provider: &str,
+    prompt: &str,
+    images: &[PathBuf],
+    session_id: Option<&str>,
+    resume: bool,
+    model: Option<&str>,
+    effort: Option<&str>,
 ) -> Result<ProviderInvocation, String> {
     let (args, stdin) =
         match provider {
@@ -986,7 +1848,8 @@ fn provider_invocation_for_session(
                     args.push(&resume_arg);
                 }
                 args.push(prompt);
-                let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+                let mut args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+                apply_planner_selection(provider, &mut args, model, effort);
                 return finish_provider_invocation(provider, args, None, images);
             }
             // Prefer whole-message JSON: streaming-json emits token-level
@@ -1013,7 +1876,8 @@ fn provider_invocation_for_session(
             }
             _ => return Err(format!("Unknown provider: {provider}")),
         };
-    let args: Vec<String> = args.into_iter().map(str::to_string).collect();
+    let mut args: Vec<String> = args.into_iter().map(str::to_string).collect();
+    apply_planner_selection(provider, &mut args, model, effort);
     finish_provider_invocation(provider, args, stdin, images)
 }
 
@@ -1076,7 +1940,17 @@ fn provider_command(
     session_id: Option<&str>,
     resume: bool,
 ) -> Result<(tokio::process::Command, Option<String>), String> {
-    let invocation = provider_invocation_for_session(provider, prompt, images, session_id, resume)?;
+    let settings = get_settings(app.clone()).unwrap_or_default();
+    let (model, effort) = planner_selection_from_settings(&settings, provider);
+    let invocation = planner_invocation(
+        provider,
+        prompt,
+        images,
+        session_id,
+        resume,
+        model.as_deref(),
+        effort.as_deref(),
+    )?;
     let resolved = resolve_provider_command(&invocation.command).ok_or_else(|| {
         format!(
             "{} is not available to Alfred. Install it, sign in, then restart Alfred.",
@@ -1106,24 +1980,8 @@ fn provider_command(
     if let Some(raw_argument) = resolved.windows_raw_argument {
         process.as_std_mut().raw_arg(raw_argument);
     }
-    if let Ok(secret) = vault_entry(provider)
-        .and_then(|entry| entry.get_password().map_err(|error| error.to_string()))
-    {
-        match provider {
-            "codex" => {
-                process.env("OPENAI_API_KEY", secret);
-            }
-            "copilot" => {
-                process.env("GH_TOKEN", secret);
-            }
-            "cursor" => {
-                process.env("CURSOR_API_KEY", secret);
-            }
-            "grok" => {
-                process.env("XAI_API_KEY", secret);
-            }
-            _ => {}
-        }
+    if let Some((key, secret)) = provider_secret_env(provider) {
+        process.env(key, secret);
     }
     Ok((process, invocation.stdin))
 }
@@ -6954,6 +7812,7 @@ pub fn run() {
             get_settings,
             save_settings,
             detect_providers,
+            list_provider_models,
             store_provider_secret,
             has_provider_secret,
             list_workflows,
@@ -7323,6 +8182,227 @@ mod tests {
             .args
             .iter()
             .any(|arg| arg == "--no-custom-instructions"));
+    }
+    #[test]
+    #[ignore]
+    fn live_provider_catalogs_smoke() {
+        for provider in ["codex", "copilot", "grok", "cursor"] {
+            let catalog = list_provider_models_sync(provider.into());
+            eprintln!(
+                "{provider}: installed={} models={} efforts={} mode={} source={:?} err={:?}",
+                catalog.installed,
+                catalog.models.len(),
+                catalog.efforts.len(),
+                catalog.effort_mode,
+                catalog.source,
+                catalog.error
+            );
+            if catalog.installed && provider != "cursor" {
+                assert!(
+                    !catalog.models.is_empty(),
+                    "{provider} listed no models: {:?}",
+                    catalog.error
+                );
+            }
+        }
+    }
+    #[test]
+    fn planner_selection_is_passed_to_each_cli() {
+        let codex = planner_invocation(
+            "codex",
+            "plan",
+            &[],
+            None,
+            false,
+            Some("gpt-5.6-luna"),
+            Some("xhigh"),
+        )
+        .unwrap();
+        assert!(codex
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "-m" && pair[1] == "gpt-5.6-luna"));
+        assert!(codex.args.iter().any(|arg| {
+            arg.starts_with("model_reasoning_effort=") && arg.contains("xhigh")
+        }));
+
+        let copilot = planner_invocation(
+            "copilot",
+            "plan",
+            &[],
+            None,
+            false,
+            Some("gpt-5.4"),
+            Some("high"),
+        )
+        .unwrap();
+        assert!(copilot
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "--model" && pair[1] == "gpt-5.4"));
+        assert!(copilot
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "--effort" && pair[1] == "high"));
+
+        let grok = planner_invocation(
+            "grok",
+            "plan",
+            &[],
+            None,
+            false,
+            Some("grok-4.6"),
+            Some("low"),
+        )
+        .unwrap();
+        assert!(grok
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "-m" && pair[1] == "grok-4.6"));
+        assert!(grok
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "--reasoning-effort" && pair[1] == "low"));
+
+        let cursor = planner_invocation(
+            "cursor",
+            "plan",
+            &[],
+            None,
+            false,
+            Some("gpt-5.5"),
+            Some("high"),
+        )
+        .unwrap();
+        assert!(cursor
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "--model" && pair[1] == "gpt-5.5[effort=high]"));
+
+        let cursor_effort_only = planner_invocation(
+            "cursor",
+            "plan",
+            &[],
+            None,
+            false,
+            None,
+            Some("high"),
+        )
+        .unwrap();
+        assert!(!cursor_effort_only
+            .args
+            .iter()
+            .any(|arg| arg.contains("effort") || arg.contains("[high]")));
+    }
+    #[test]
+    fn planner_selection_ignores_unsafe_tokens() {
+        let invocation = planner_invocation(
+            "codex",
+            "plan",
+            &[],
+            None,
+            false,
+            Some("--sandbox"),
+            Some("xhigh;rm"),
+        )
+        .unwrap();
+        assert!(!invocation
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "-m" && pair[1] == "--sandbox"));
+        assert!(!invocation
+            .args
+            .iter()
+            .any(|arg| arg.contains("rm") || arg.contains(';')));
+    }
+    #[test]
+    fn parses_codex_catalog_and_hides_unlistable_models() {
+        let json = r#"{
+            "models": [
+                {
+                    "slug": "gpt-5.6-luna",
+                    "display_name": "GPT-5.6-Luna",
+                    "visibility": "list",
+                    "default_reasoning_level": "medium",
+                    "supported_reasoning_levels": [
+                        {"effort": "low", "description": "Fast"},
+                        {"effort": "xhigh", "description": "Deep"}
+                    ],
+                    "priority": 3
+                },
+                {
+                    "slug": "hidden-review",
+                    "display_name": "Hidden",
+                    "visibility": "hide",
+                    "supported_reasoning_levels": [{"effort": "low"}],
+                    "priority": 1
+                }
+            ]
+        }"#;
+        let catalog = parse_codex_model_catalog(json).unwrap();
+        assert_eq!(catalog.models.len(), 1);
+        assert_eq!(catalog.models[0].id, "gpt-5.6-luna");
+        assert_eq!(catalog.default_model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(
+            catalog.models[0]
+                .efforts
+                .iter()
+                .map(|effort| effort.id.as_str())
+                .collect::<Vec<_>>(),
+            ["low", "xhigh"]
+        );
+    }
+    #[test]
+    fn parses_copilot_and_grok_cli_listings() {
+        let copilot_help = r#"
+  `model`: AI model to use for Copilot CLI.
+    - "claude-sonnet-5"
+    - "gpt-5.4"
+
+  `contextTier`: context window tier.
+"#;
+        let models = parse_copilot_models_from_help(copilot_help);
+        assert_eq!(
+            models.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(),
+            ["claude-sonnet-5", "gpt-5.4"]
+        );
+
+        let flag_help = r#"
+  --effort, --reasoning-effort <level>  Set the reasoning effort level (choices:
+                                        "none", "minimal", "low", "medium",
+                                        "high", "xhigh", "max")
+"#;
+        let efforts = parse_copilot_efforts_from_help(flag_help);
+        assert_eq!(
+            efforts.iter().map(|effort| effort.id.as_str()).collect::<Vec<_>>(),
+            ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+        );
+        assert!(parse_copilot_efforts_from_help(
+            "  `model`: AI model to use for Copilot CLI.\n    - \"claude-sonnet-5\"\n  `contextTier`: \"default\"\n"
+        )
+        .is_empty());
+
+        let grok = "You are logged in with grok.com.\n\nDefault model: grok-4.6\n\nAvailable models:\n  * grok-4.6 (default)\n  - grok-4.5\n";
+        let (default_model, models) = parse_grok_models_list(grok);
+        assert_eq!(default_model.as_deref(), Some("grok-4.6"));
+        assert_eq!(
+            models.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(),
+            ["grok-4.6", "grok-4.5"]
+        );
+        assert_eq!(
+            parse_effort_ids_from_text(
+                "--effort/--reasoning-effort: unknown effort level '__invalid__'; use one of: xhigh, high, medium, low"
+            ),
+            ["xhigh", "high", "medium", "low"]
+        );
+
+        let cursor_error = parse_cursor_models_list(
+            "error: unknown command --list-models\nUsage: cursor-agent [options]\nCommands:\n  models",
+        );
+        assert!(
+            cursor_error.is_empty(),
+            "failed cursor output was parsed as models: {cursor_error:?}"
+        );
     }
     #[test]
     fn extracts_documented_provider_session_ids() {

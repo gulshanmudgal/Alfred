@@ -41,7 +41,9 @@ $AlfredHostSource = Join-Path $env:LOCALAPPDATA "Alfred\dev-host"
 New-Item -ItemType Directory -Force -Path $AlfredHostSource | Out-Null
 Copy-Item "native/windows-host/*.cs" $AlfredHostSource -Force
 Copy-Item "native/windows-host/Alfred.WindowsHost.csproj" $AlfredHostSource -Force
+Copy-Item "src-tauri/icons/icon.ico" (Join-Path $AlfredHostSource "icon.ico") -Force
 $AlfredHostProject = Join-Path $AlfredHostSource "Alfred.WindowsHost.csproj"
+(Get-Content $AlfredHostProject) -replace '<ApplicationIcon>.*</ApplicationIcon>', '<ApplicationIcon>icon.ico</ApplicationIcon>' | Set-Content $AlfredHostProject
 dotnet build $AlfredHostProject -c Debug
 $AlfredHostExecutable = Join-Path $AlfredHostSource "bin\Debug\net10.0-windows\win-x64\alfred-windows-host.exe"
 if (-not (Test-Path $AlfredHostExecutable)) {

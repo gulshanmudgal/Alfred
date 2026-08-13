@@ -8,7 +8,12 @@
     ],
     "windows": {
       "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true },
-      "nsis": { "installMode": "currentUser" },
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "headerImage": "icons/nsis/header.bmp",
+        "sidebarImage": "icons/nsis/sidebar.bmp"
+      },
       "signCommand": "pwsh.exe -NoProfile -File ..\\scripts\\windows\\sign.ps1 %1"
     }
   }

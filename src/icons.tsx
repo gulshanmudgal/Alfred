@@ -4,13 +4,39 @@ interface IconProps {
   name: string;
   size?: number;
   strokeWidth?: number;
+  tiled?: boolean;
 }
+
+export const iconTones: Record<string, string> = {
+  home: "#007AFF",
+  workflow: "#AF52DE",
+  runs: "#34C759",
+  settings: "#8E8E93",
+  plus: "#007AFF",
+  search: "#5AC8FA",
+  shield: "#30D158",
+  folder: "#FF9F0A",
+  brain: "#5856D6",
+  monitor: "#64D2FF",
+  check: "#34C759",
+  arrow: "#007AFF",
+  pause: "#FF9F0A",
+  stop: "#FF3B30",
+  hand: "#FF375F",
+  sparkle: "#FF2D55",
+  clock: "#64D2FF",
+  calendar: "#FF9500",
+  lock: "#64D2FF",
+  link: "#007AFF",
+  chevron: "#8E8E93",
+  close: "#FF3B30",
+};
 
 const paths: Record<string, ReactNode> = {
   home: <><path d="m3 11 9-8 9 8"/><path d="M5 10v10h14V10"/><path d="M9 20v-6h6v6"/></>,
   workflow: <><rect x="3" y="3" width="6" height="6" rx="2"/><rect x="15" y="15" width="6" height="6" rx="2"/><path d="M9 6h4a4 4 0 0 1 4 4v5"/><path d="m14 12 3 3 3-3"/></>,
   runs: <><path d="M8 5v14l11-7Z"/><circle cx="12" cy="12" r="10"/></>,
-  settings: <><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1v.1h-4v-.1a1.7 1.7 0 0 0-1.1-1.6 1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1-.4h-.1v-4H3A1.7 1.7 0 0 0 4.6 8.5a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1v-.1h4V3a1.7 1.7 0 0 0 1.1 1.6 1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9c.12.37.34.7.6 1 .28.3.64.43 1 .4h.1v4H21a1.7 1.7 0 0 0-1.6.6Z"/></>,
+  settings: <><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1v.1h-4v-.1a1.7 1.7 0 0 0-1.1-1.6 1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1-.4h-.1v-4H3A1.7 1.7 0 0 0 4.6 8.5a1.7 1.7 0 0 0-.34-1.88l-.06.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1v-.1h4V3a1.7 1.7 0 0 0 1.1 1.6 1.7 1.7 0 0 0 1.88-.34l.06.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9c.12.37.34.7.6 1 .28.3.64.43 1 .4h.1v4H21a1.7 1.7 0 0 0-1.6.6Z"/></>,
   plus: <><path d="M12 5v14M5 12h14"/></>,
   search: <><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></>,
   shield: <><path d="M12 22s8-4 8-11V5l-8-3-8 3v6c0 7 8 11 8 11Z"/><path d="m9 12 2 2 4-5"/></>,
@@ -24,16 +50,24 @@ const paths: Record<string, ReactNode> = {
   hand: <><path d="M18 11V7a2 2 0 0 0-4 0v3-5a2 2 0 0 0-4 0v5-3a2 2 0 0 0-4 0v6l-1-1a2 2 0 0 0-3 3l5 6h8a6 6 0 0 0 6-6v-4a2 2 0 0 0-4 0"/></>,
   sparkle: <><path d="m12 3 1.2 3.8L17 8l-3.8 1.2L12 13l-1.2-3.8L7 8l3.8-1.2Z"/><path d="m19 14 .7 2.3L22 17l-2.3.7L19 20l-.7-2.3L16 17l2.3-.7Z"/></>,
   clock: <><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></>,
+  calendar: <><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M8 3v4M16 3v4M3 10h18"/></>,
   lock: <><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></>,
   link: <><path d="M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1.2 1.2"/><path d="M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1.2-1.2"/></>,
   chevron: <path d="m6 9 6 6 6-6"/>,
   close: <path d="M18 6 6 18M6 6l12 12"/>,
 };
 
-export function Icon({ name, size = 20, strokeWidth = 1.8 }: IconProps) {
-  return (
+export function Icon({ name, size = 20, strokeWidth = 1.8, tiled = false }: IconProps) {
+  const tone = iconTones[name] ?? "#007AFF";
+  const glyph = (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       {paths[name] ?? paths.sparkle}
     </svg>
+  );
+  if (!tiled) return glyph;
+  return (
+    <span className="glyph-tile" style={{ color: tone, background: `color-mix(in srgb, ${tone} 16%, #ffffff)` }}>
+      {glyph}
+    </span>
   );
 }

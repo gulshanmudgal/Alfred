@@ -1,4 +1,4 @@
-export type View = "home" | "workflows" | "runs" | "schedules" | "settings";
+export type View = "home" | "library" | "settings";
 
 export interface AppSettings {
   onboardingComplete: boolean;
@@ -8,6 +8,31 @@ export interface AppSettings {
   theme: "system" | "light" | "dark";
   shareScreenshotsWithPlanner: boolean;
   diagnosticLogging: boolean;
+  plannerModels: Record<string, string>;
+  plannerEfforts: Record<string, string>;
+}
+
+export interface ProviderEffortOption {
+  id: string;
+  description?: string;
+}
+
+export interface ProviderModelOption {
+  id: string;
+  displayName: string;
+  defaultEffort?: string;
+  efforts: ProviderEffortOption[];
+}
+
+export interface ProviderModelCatalog {
+  provider: string;
+  installed: boolean;
+  defaultModel?: string;
+  models: ProviderModelOption[];
+  efforts: ProviderEffortOption[];
+  effortMode?: string;
+  source?: string;
+  error?: string;
 }
 
 export interface SystemInfo {
