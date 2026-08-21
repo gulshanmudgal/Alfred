@@ -5,7 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { AlfredLogo } from "./AlfredLogo";
 import { Icon } from "./icons";
 import { ProviderMark, TRADEMARK_NOTICE, providerOwner } from "./providers";
-import type { AppSettings, ProviderEffortOption, ProviderModelCatalog, ProviderStatus, RunCheckpoint, RunEvent, SystemInfo, View, Workflow, WorkflowSchedule } from "./types";
+import type { AppSettings, ProviderEffortOption, ProviderModelCatalog, ProviderStatus, RunCheckpoint, RunEvent, SystemInfo, View, Workflow, WorkflowSchedule, WorkflowStep } from "./types";
 
 const MAX_COCKPIT_EVENTS = 80;
 
@@ -67,6 +67,43 @@ function plannerSummary(settings: AppSettings, provider: string) {
 
 function isArchivedWorkflow(workflow: Workflow) {
   return workflow.status.toLowerCase() === "archived";
+}
+
+function isReplayProbeStep(step: WorkflowStep) {
+  if (step.saveAs?.trim()) return false;
+  return [
+    "observeWindow",
+    "captureWindow",
+    "findElement",
+    "listApplications",
+    "listInstalledApplications",
+    "probe",
+    "getValue",
+    "browser.observe",
+    "browser.read",
+    "browser.find",
+    "browser.getText",
+    "browser.captureVisible",
+  ].includes(step.kind);
+}
+
+// Mirrors backend workflow_can_replay: a run is a replay only when the
+// workflow holds at least one valid non-probe recorded action. Keep in sync
+// with is_replay_probe_step / validate_workflow_step in src-tauri/src/lib.rs.
+function workflowCanReplay(workflow: Workflow) {
+  if (["archived", "example", "recording"].includes(workflow.status.toLowerCase())) return false;
+  return workflow.steps.some((step) => !isReplayProbeStep(step) && isValidWorkflowStep(step));
+}
+
+function isValidWorkflowStep(step: WorkflowStep) {
+  if (!step.application?.trim()) return false;
+  // Rust treats a missing payload as {} (params defaults to the empty object),
+  // so only a non-object payload is invalid here.
+  if (step.payload !== undefined && (typeof step.payload !== "object" || Array.isArray(step.payload))) return false;
+  const payload = step.payload ?? {};
+  if (step.kind === "typeText" && !String(payload.text ?? "").trim()) return false;
+  if (step.kind === "wait" && !String(payload.text ?? "").trim() && !step.targetLabel?.trim()) return false;
+  return true;
 }
 
 function OverflowMenu({ label, children }: { label: string; children: ReactNode }) {
@@ -609,11 +646,23 @@ function ExecutionCockpit({ workflow, settings, onWorkflowChanged, onClose }: { 
     return () => { active = false; dispose?.(); };
   }, []);
 
+  // Read via ref at start time: settings.provider/libraryPath only matter
+  // before the run starts (they pick the planner for a goal run and locate
+  // the library for a replay). Depending on them directly re-fires this
+  // effect mid-run, tries to start a second run, and hits the run lock.
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+
   useEffect(() => {
-    const command = workflow.status === "example" ? "start_demo_run" : "start_goal_run";
+    const current = settingsRef.current;
+    if (!current) return;
+    const replay = workflowCanReplay(workflow);
+    const command = workflow.status === "example" ? "start_demo_run" : replay ? "start_workflow_run" : "start_goal_run";
     const args = workflow.status === "example"
       ? { workflowId: workflow.id }
-      : { goal: workflow.goal, applications: workflow.requiredApps, provider: workflow.plannerProvider ?? settings.provider };
+      : replay
+        ? { libraryPath: current.libraryPath, workflowId: workflow.id }
+        : { goal: workflow.goal, applications: workflow.requiredApps, provider: workflow.plannerProvider ?? current.provider };
     invoke<string>(command, args).then((id) => {
       activeRun.current = id;
       setRunId(id);
@@ -622,7 +671,8 @@ function ExecutionCockpit({ workflow, settings, onWorkflowChanged, onClose }: { 
       if (held.length) setEvents((current) => held.reduce(appendRunEvent, current));
     }).catch((caught) => setStartError(String(caught)));
     return () => { activeRun.current = ""; early.current = []; };
-  }, [workflow.id, workflow.status, workflow.goal, workflow.requiredApps, workflow.plannerProvider, settings.provider]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workflow.id, workflow.status, workflow.goal, workflow.requiredApps, workflow.plannerProvider, workflow.steps.length]);
 
   useEffect(() => {
     if (!runId || startError || workflow.status === "example" || ["completed", "failed", "stopped"].includes(events.at(-1)?.status ?? "")) return;
@@ -728,8 +778,25 @@ function ExecutionCockpit({ workflow, settings, onWorkflowChanged, onClose }: { 
   const progress = current?.progress ?? 3;
   const complete = progress === 100 && current?.status === "completed";
   const waitingApproval = current?.status === "waiting";
+  // A replay can fall back to the live planner mid-run when a recorded step
+  // no longer matches. Once planner events that don't map to recorded steps
+  // appear, follow the run instead of the static recorded plan.
+  const startedAsReplay = workflowCanReplay(workflow);
+  const replaySteps = startedAsReplay ? workflow.steps.filter((step) => !isReplayProbeStep(step)) : [];
+  const knownStepIds = new Set(replaySteps.map((step) => step.id));
+  // Backend lifecycle events (goal-{sequence}, recovered/terminal/
+  // user-completed/steer echoes) are not planner actions. Planner actions
+  // use goal-step-{n} ids, so only the bare goal-{number} form is exempt —
+  // a broader goal-* prefix would hide the takeover and keep the panel in
+  // replay mode forever.
+  const isLifecycleEvent = (id: string) => /^goal-\d+$/.test(id) || id.startsWith("recovered") || id.startsWith("terminal") || id.startsWith("user-completed") || id.startsWith("steer-") || id === "replay-verify";
+  const plannerEvents = events.filter((event) => !knownStepIds.has(event.stepId) && !isLifecycleEvent(event.stepId));
+  const fellBackToPlanner = startedAsReplay && plannerEvents.some((event) => event.status === "completed" || event.status === "running");
+  const replaying = startedAsReplay && !fellBackToPlanner;
   const completedSteps = livePlanner ? events.filter((event) => event.status === "completed").slice(-8) : [];
-  const planned = livePlanner
+  const planned = replaying
+    ? replaySteps.map((step) => step.title)
+    : livePlanner
     ? (completedSteps.length ? completedSteps.map((event) => event.title) : ["Actions appear here as they happen."])
     : workflow.steps.length ? workflow.steps.map((step) => step.title) : ["Prepare workspace", "Open approved website", "Read invoice table", "Check safety policy", "Append workbook rows", "Verify the result"];
 
@@ -783,9 +850,17 @@ function ExecutionCockpit({ workflow, settings, onWorkflowChanged, onClose }: { 
           <div className="panel-heading"><span>Steps</span><b>{progress}%</b></div>
           <div className="plan-list">
             {planned.map((step, index) => {
-              const event = livePlanner
+              // In replay mode rows come from recorded steps and match events
+              // by recorded step id. In a live goal run (including the
+              // planner fallback for a non-replayable workflow) rows ARE the
+              // completed events, so index directly — recorded step ids never
+              // appear in a goal run's event stream.
+              const recorded = replaying ? replaySteps[index] : undefined;
+              const event = recorded
+                ? [...events].reverse().find((item) => item.stepId === recorded.id)
+                : livePlanner
                 ? completedSteps[index]
-                : workflow.steps.length ? [...events].reverse().find((item) => item.stepId === workflow.steps[index]?.id) : events.find((item) => item.sequence === index);
+                : events.find((item) => item.sequence === index);
               const done = event?.status === "completed";
               const active = event?.status === "running" || event?.status === "failed" || (!event && index === 0);
               return (

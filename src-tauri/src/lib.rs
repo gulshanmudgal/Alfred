@@ -32,7 +32,11 @@ fn hide_windows_console(command: &mut Command) {
 #[derive(Default)]
 struct RuntimeState {
     native_host: Arc<Mutex<Option<NativeHostProcess>>>,
-    run_controls: Arc<Mutex<HashMap<String, String>>>,
+    /// run_id -> (mode, epoch). The epoch increments on every mode change;
+    /// both live under one lock so a run blocked on a long observation can
+    /// snapshot them atomically and detect a pause/resume cycle even after
+    /// the mode has flipped back to "running".
+    run_controls: Arc<Mutex<HashMap<String, RunControl>>>,
     /// One-step policy overrides granted by the user at the "waiting" prompt:
     /// run_id -> step_id. Lets an approved request_user step pass once, including
     /// unknown-effect steps that no permission grant could cover. hard_deny is
@@ -41,6 +45,21 @@ struct RuntimeState {
     /// Mid-run user guidance queued by the cockpit's steer bar: run_id ->
     /// pending notes. The goal loop drains them into the planner's history.
     steer_notes: Arc<Mutex<HashMap<String, Vec<String>>>>,
+}
+
+#[derive(Clone)]
+struct RunControl {
+    mode: String,
+    epoch: u64,
+}
+
+impl RunControl {
+    fn running() -> Self {
+        Self {
+            mode: "running".into(),
+            epoch: 0,
+        }
+    }
 }
 
 /// The host speaks newline-delimited JSON on stdio. A dedicated worker thread owns
@@ -320,6 +339,13 @@ pub struct Workflow {
     planner_provider: Option<String>,
     required_apps: Vec<String>,
     steps: Vec<WorkflowStep>,
+    /// Outcome strings captured when this workflow was learned. Replay observes
+    /// the live desktop and will not declare success unless these still match.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    completion_evidence: Vec<String>,
+    /// Authored text Alfred proved it typed while learning the workflow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_typed_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -559,10 +585,7 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("write");
-    let temporary = path.with_file_name(format!(
-        ".{stem}.{}.tmp",
-        Uuid::new_v4().simple()
-    ));
+    let temporary = path.with_file_name(format!(".{stem}.{}.tmp", Uuid::new_v4().simple()));
     let written = fs::write(&temporary, contents);
     if let Err(error) = written {
         let _ = fs::remove_file(&temporary);
@@ -606,9 +629,11 @@ fn run_log_path(app: &AppHandle, run_id: &str) -> Result<PathBuf, String> {
 
 fn compact_log_value(value: &Value) -> Value {
     match value {
-        Value::String(text) if text.len() > 400 => {
-            Value::String(format!("{}…(+{} chars)", text.chars().take(200).collect::<String>(), text.len() - 200))
-        }
+        Value::String(text) if text.len() > 400 => Value::String(format!(
+            "{}…(+{} chars)",
+            text.chars().take(200).collect::<String>(),
+            text.len() - 200
+        )),
         Value::Object(map) => {
             let mut compact = serde_json::Map::new();
             for (key, item) in map {
@@ -943,7 +968,11 @@ fn detect_providers() -> Vec<ProviderStatus> {
         .collect()
 }
 
-fn empty_model_catalog(provider: &str, installed: bool, error: Option<String>) -> ProviderModelCatalog {
+fn empty_model_catalog(
+    provider: &str,
+    installed: bool,
+    error: Option<String>,
+) -> ProviderModelCatalog {
     ProviderModelCatalog {
         provider: provider.into(),
         installed,
@@ -999,9 +1028,10 @@ fn looks_like_model_id(value: &str) -> bool {
                 | "model"
                 | "models"
         )
-        && trimmed
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | '/' | ':' | '[' | ']' | '=' | ','))
+        && trimmed.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '.' | '_' | '-' | '+' | '/' | ':' | '[' | ']' | '=' | ',')
+        })
 }
 
 fn looks_like_effort_id(value: &str) -> bool {
@@ -1055,7 +1085,12 @@ fn is_probe_or_noise_token(value: &str) -> bool {
 
 fn parse_effort_ids_from_text(text: &str) -> Vec<String> {
     let lower = text.to_ascii_lowercase();
-    let markers = ["use one of:", "allowed choices are", "possible values:", "choices:"];
+    let markers = [
+        "use one of:",
+        "allowed choices are",
+        "possible values:",
+        "choices:",
+    ];
     for marker in markers {
         if let Some(index) = lower.find(marker) {
             let tail = text[index + marker.len()..]
@@ -1131,7 +1166,9 @@ fn parse_codex_model_catalog(json: &str) -> Result<ProviderModelCatalog, String>
         description: Option<String>,
     }
 
-    let start = json.find('{').ok_or_else(|| "Codex did not return a model catalog.".to_string())?;
+    let start = json
+        .find('{')
+        .ok_or_else(|| "Codex did not return a model catalog.".to_string())?;
     let catalog: CodexCatalog = serde_json::from_str(&json[start..])
         .map_err(|error| format!("Could not parse the Codex model catalog: {error}"))?;
     let mut models = catalog
@@ -1156,7 +1193,9 @@ fn parse_codex_model_catalog(json: &str) -> Result<ProviderModelCatalog, String>
                 model_option(
                     model.slug,
                     model.display_name.unwrap_or_default(),
-                    model.default_reasoning_level.filter(|value| looks_like_effort_id(value)),
+                    model
+                        .default_reasoning_level
+                        .filter(|value| looks_like_effort_id(value)),
                     efforts,
                 ),
             )
@@ -1233,7 +1272,11 @@ fn parse_grok_models_list(text: &str) -> (Option<String>, Vec<ProviderModelOptio
             .or_else(|| trimmed.strip_prefix("• "));
         if let Some(marked) = marked {
             let id = marked.split_whitespace().next().unwrap_or_default();
-            if looks_like_model_id(id) && !models.iter().any(|model: &ProviderModelOption| model.id == id) {
+            if looks_like_model_id(id)
+                && !models
+                    .iter()
+                    .any(|model: &ProviderModelOption| model.id == id)
+            {
                 models.push(model_option(id, id, None, Vec::new()));
             }
         }
@@ -1329,7 +1372,11 @@ fn parse_line_oriented_models(text: &str) -> Vec<ProviderModelOption> {
             .next()
             .unwrap_or_default()
             .trim_matches(|ch: char| matches!(ch, ',' | ';' | ':' | '"' | '\''));
-        if looks_like_model_id(token) && !models.iter().any(|model: &ProviderModelOption| model.id == token) {
+        if looks_like_model_id(token)
+            && !models
+                .iter()
+                .any(|model: &ProviderModelOption| model.id == token)
+        {
             models.push(model_option(token, token, None, Vec::new()));
         }
     }
@@ -1357,7 +1404,10 @@ fn parse_help_effort_mode(help: &str) -> (String, Vec<ProviderEffortOption>) {
             .or_else(|| lower.find("--reasoning-effort"))
             .unwrap_or(0);
         let window = &help[index..index.saturating_add(600).min(help.len())];
-        return ("flag".into(), unique_effort_options(parse_effort_ids_from_text(window)));
+        return (
+            "flag".into(),
+            unique_effort_options(parse_effort_ids_from_text(window)),
+        );
     }
     if lower.contains("[effort=") || lower.contains("effort=") {
         return (
@@ -1395,12 +1445,8 @@ fn wait_for_output(mut child: Child, timeout: Duration) -> Result<std::process::
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let stdout = stdout_handle
-                    .join()
-                    .unwrap_or_default();
-                let stderr = stderr_handle
-                    .join()
-                    .unwrap_or_default();
+                let stdout = stdout_handle.join().unwrap_or_default();
+                let stderr = stderr_handle.join().unwrap_or_default();
                 return Ok(std::process::Output {
                     status,
                     stdout,
@@ -1450,7 +1496,10 @@ fn capture_provider_cli(
         .unwrap_or(provider);
     let path = resolve_provider_command(command_name)
         .ok_or_else(|| format!("{command_name} is not installed."))?;
-    let owned = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
+    let owned = args
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect::<Vec<_>>();
     let resolved = resolved_process(&path, &owned, true)?;
     let mut process = Command::new(&resolved.program);
     hide_windows_console(&mut process);
@@ -1492,8 +1541,12 @@ fn fetch_codex_model_catalog() -> ProviderModelCatalog {
     match live.and_then(|captured| parse_codex_model_catalog(&captured.stdout)) {
         Ok(catalog) => catalog,
         Err(live_error) => {
-            match capture_provider_cli("codex", &["debug", "models", "--bundled"], Duration::from_secs(20))
-                .and_then(|captured| parse_codex_model_catalog(&captured.stdout))
+            match capture_provider_cli(
+                "codex",
+                &["debug", "models", "--bundled"],
+                Duration::from_secs(20),
+            )
+            .and_then(|captured| parse_codex_model_catalog(&captured.stdout))
             {
                 Ok(mut catalog) => {
                     catalog.source = Some("codex debug models --bundled".into());
@@ -1561,7 +1614,9 @@ fn probe_grok_efforts(model: &str) -> Vec<ProviderEffortOption> {
         Duration::from_secs(8),
     );
     match captured {
-        Ok(output) => unique_effort_options(parse_effort_ids_from_text(&combined_cli_text(&output))),
+        Ok(output) => {
+            unique_effort_options(parse_effort_ids_from_text(&combined_cli_text(&output)))
+        }
         Err(_) => Vec::new(),
     }
 }
@@ -1573,11 +1628,7 @@ fn fetch_grok_model_catalog() -> ProviderModelCatalog {
     };
     let (default_model, mut models) = parse_grok_models_list(&combined_cli_text(&captured));
     if models.is_empty() {
-        return empty_model_catalog(
-            "grok",
-            true,
-            Some("Grok did not list any models.".into()),
-        );
+        return empty_model_catalog("grok", true, Some("Grok did not list any models.".into()));
     }
     for model in models.iter_mut().take(12) {
         model.efforts = probe_grok_efforts(&model.id);
@@ -1643,7 +1694,11 @@ fn list_provider_models_sync(provider: String) -> ProviderModelCatalog {
         .into_iter()
         .find(|(id, _, _)| *id == provider)
     else {
-        return empty_model_catalog(&provider, false, Some(format!("Unknown provider: {provider}")));
+        return empty_model_catalog(
+            &provider,
+            false,
+            Some(format!("Unknown provider: {provider}")),
+        );
     };
     if resolve_provider_command(command).is_none() {
         return empty_model_catalog(
@@ -1657,7 +1712,11 @@ fn list_provider_models_sync(provider: String) -> ProviderModelCatalog {
         "copilot" => fetch_copilot_model_catalog(),
         "grok" => fetch_grok_model_catalog(),
         "cursor" => fetch_cursor_model_catalog(),
-        _ => empty_model_catalog(&provider, false, Some(format!("Unknown provider: {provider}"))),
+        _ => empty_model_catalog(
+            &provider,
+            false,
+            Some(format!("Unknown provider: {provider}")),
+        ),
     }
 }
 
@@ -1667,15 +1726,14 @@ async fn list_provider_models(provider: String) -> ProviderModelCatalog {
     tokio::task::spawn_blocking(move || list_provider_models_sync(provider))
         .await
         .unwrap_or_else(|_| {
-            empty_model_catalog(
-                &label,
-                false,
-                Some("Could not list planner models.".into()),
-            )
+            empty_model_catalog(&label, false, Some("Could not list planner models.".into()))
         })
 }
 
-fn planner_selection_from_settings(settings: &AppSettings, provider: &str) -> (Option<String>, Option<String>) {
+fn planner_selection_from_settings(
+    settings: &AppSettings,
+    provider: &str,
+) -> (Option<String>, Option<String>) {
     let model = settings
         .planner_models
         .get(provider)
@@ -2083,9 +2141,12 @@ fn is_commit_action(kind: &str, target: Option<&str>, payload: Option<&Value>) -
         return true;
     }
     payload.is_some_and(|value| {
-        ["name", "text", "mark"]
-            .into_iter()
-            .any(|key| value.get(key).and_then(Value::as_str).is_some_and(is_commit_label))
+        ["name", "text", "mark"].into_iter().any(|key| {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(is_commit_label)
+        })
     })
 }
 
@@ -2156,7 +2217,8 @@ fn payload_has_normalized_point(payload: Option<&Value>) -> bool {
     let Some(value) = payload else {
         return false;
     };
-    json_finite_unit_interval(value, "nx").is_some() && json_finite_unit_interval(value, "ny").is_some()
+    json_finite_unit_interval(value, "nx").is_some()
+        && json_finite_unit_interval(value, "ny").is_some()
 }
 
 fn native_browser_application(applications: &[String]) -> String {
@@ -2195,10 +2257,7 @@ fn validate_workflow_step(step: &WorkflowStep) -> Result<(), String> {
         return Err("A typeText step must include non-empty text.".into());
     }
     if step.kind == "wait" {
-        let text = params
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let text = params.get("text").and_then(Value::as_str).unwrap_or("");
         let target = step.target_label.as_deref().unwrap_or("");
         if text.trim().is_empty() && target.trim().is_empty() {
             return Err("wait requires text to look for.".into());
@@ -2301,6 +2360,639 @@ fn validate_workflow_step(step: &WorkflowStep) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn json_nonempty_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+}
+
+/// Lookups recorded so the planner could see the tree. Replaying them against a
+/// new desktop is wasted round-trips; mutating steps re-bind by target label.
+/// Keep the step when `saveAs` captured a value later actions interpolate.
+fn is_replay_probe_step(step: &WorkflowStep) -> bool {
+    if step
+        .save_as
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|name| !name.is_empty())
+    {
+        return false;
+    }
+    matches!(
+        step.kind.as_str(),
+        "observeWindow"
+            | "captureWindow"
+            | "findElement"
+            | "listApplications"
+            | "listInstalledApplications"
+            | "probe"
+            | "getValue"
+            | "browser.observe"
+            | "browser.read"
+            | "browser.find"
+            | "browser.getText"
+            | "browser.captureVisible"
+    )
+}
+
+fn workflow_can_replay(workflow: &Workflow) -> bool {
+    // Every non-probe step must validate: replaying a workflow whose steps
+    // are only partly valid would fail mid-run at the first invalid one, so
+    // such a workflow routes to the live planner up front instead.
+    !is_archived_status(&workflow.status)
+        && workflow.status != "example"
+        && workflow.status != "recording"
+        && workflow
+            .steps
+            .iter()
+            .any(|step| !is_replay_probe_step(step))
+        && workflow
+            .steps
+            .iter()
+            .filter(|step| !is_replay_probe_step(step))
+            .all(|step| validate_workflow_step(step).is_ok())
+}
+
+fn sanitize_replay_payload(payload: &mut Value) {
+    let Value::Object(map) = payload else {
+        return;
+    };
+    for key in [
+        "processId",
+        "mark",
+        "generation",
+        "ref",
+        "tabId",
+        "x",
+        "y",
+        "nx",
+        "ny",
+        "from",
+        "to",
+    ] {
+        map.remove(key);
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct ReplayMatchHints {
+    label: Option<String>,
+    automation_id: Option<String>,
+    control_type: Option<String>,
+    name: Option<String>,
+}
+
+fn replay_match_hints(payload: &Value, target_label: Option<&str>) -> ReplayMatchHints {
+    ReplayMatchHints {
+        label: target_label
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        automation_id: json_nonempty_str(payload, "automationId").map(str::to_string),
+        control_type: json_nonempty_str(payload, "controlType")
+            .or_else(|| json_nonempty_str(payload, "role"))
+            .or_else(|| json_nonempty_str(payload, "tag"))
+            .map(str::to_string),
+        name: json_nonempty_str(payload, "name").map(str::to_string),
+    }
+}
+
+fn replay_identity_name(hints: &ReplayMatchHints) -> Option<&str> {
+    hints
+        .name
+        .as_deref()
+        .or(hints.label.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn match_string_eq(item: &Value, keys: &[&str], expected: &str) -> bool {
+    keys.iter().any(|key| {
+        json_nonempty_str(item, key).is_some_and(|got| got.eq_ignore_ascii_case(expected))
+    })
+}
+
+fn match_control_type(item: &Value, expected: &str) -> bool {
+    let expected = expected.trim().trim_start_matches("ControlType.");
+    ["role", "controlType", "tag"].iter().any(|key| {
+        json_nonempty_str(item, key).is_some_and(|got| {
+            got.trim()
+                .trim_start_matches("ControlType.")
+                .eq_ignore_ascii_case(expected)
+        })
+    })
+}
+
+fn native_mark_id(item: &Value) -> Option<String> {
+    json_nonempty_str(item, "id")
+        .or_else(|| json_nonempty_str(item, "mark"))
+        .map(str::to_string)
+}
+
+fn browser_ref_id(item: &Value) -> Option<String> {
+    json_nonempty_str(item, "ref").map(str::to_string)
+}
+
+fn unique_replay_match(
+    candidates: Vec<&Value>,
+    hints: &ReplayMatchHints,
+    id_of: fn(&Value) -> Option<String>,
+    what: &str,
+) -> Result<String, String> {
+    let subject = replay_identity_name(hints).unwrap_or(what);
+    if candidates.is_empty() {
+        return Err(format!("Could not find \"{subject}\" for replay."));
+    }
+    let mut filtered = candidates;
+    if let Some(automation_id) = hints.automation_id.as_deref() {
+        let by_id: Vec<&Value> = filtered
+            .iter()
+            .copied()
+            .filter(|item| match_string_eq(item, &["automationId"], automation_id))
+            .collect();
+        if by_id.is_empty() {
+            return Err(format!(
+                "Recorded automation id \"{automation_id}\" is not on the live desktop."
+            ));
+        }
+        filtered = by_id;
+    }
+    if let Some(control_type) = hints.control_type.as_deref() {
+        let by_type: Vec<&Value> = filtered
+            .iter()
+            .copied()
+            .filter(|item| match_control_type(item, control_type))
+            .collect();
+        if by_type.is_empty() {
+            return Err(format!(
+                "No live match for \"{subject}\" with control type {control_type}."
+            ));
+        }
+        filtered = by_type;
+    }
+    if let Some(name) = replay_identity_name(hints) {
+        let exact: Vec<&Value> = filtered
+            .iter()
+            .copied()
+            .filter(|item| match_string_eq(item, &["name", "label"], name))
+            .collect();
+        if exact.len() == 1 {
+            return id_of(exact[0])
+                .ok_or_else(|| format!("Live match for \"{name}\" is missing an id."));
+        }
+        if exact.len() > 1 {
+            return Err(format!(
+                "Ambiguous replay target \"{name}\": {} exact matches. The planner will take over.",
+                exact.len()
+            ));
+        }
+    }
+    if filtered.len() == 1 {
+        return id_of(filtered[0])
+            .ok_or_else(|| format!("Live match for \"{subject}\" is missing an id."));
+    }
+    Err(format!(
+        "Ambiguous replay target \"{subject}\": {} matches. Need a unique label, automation id, or control type.",
+        filtered.len()
+    ))
+}
+
+fn unique_native_mark(value: &Value, hints: &ReplayMatchHints) -> Result<String, String> {
+    let matches = value.get("matches").and_then(Value::as_array);
+    let candidates: Vec<&Value> = if let Some(items) = matches {
+        items.iter().collect()
+    } else if native_mark_id(value).is_some() {
+        vec![value]
+    } else {
+        Vec::new()
+    };
+    unique_replay_match(candidates, hints, native_mark_id, "target")
+}
+
+fn unique_browser_ref(value: &Value, hints: &ReplayMatchHints) -> Result<String, String> {
+    let result = value.get("result").unwrap_or(value);
+    let matches = result.get("matches").and_then(Value::as_array);
+    let candidates: Vec<&Value> = if let Some(items) = matches {
+        items.iter().collect()
+    } else if browser_ref_id(result).is_some() {
+        vec![result]
+    } else {
+        Vec::new()
+    };
+    unique_replay_match(candidates, hints, browser_ref_id, "target")
+}
+
+fn payload_has_name(payload: &Value) -> bool {
+    json_nonempty_str(payload, "name").is_some()
+        || json_nonempty_str(payload, "automationId").is_some()
+}
+
+fn replay_uses_name_target(kind: &str) -> bool {
+    matches!(kind, "invokeElement" | "setValue" | "typeText" | "getValue")
+}
+
+fn replay_needs_live_ref(kind: &str) -> bool {
+    matches!(
+        kind,
+        "browser.click" | "browser.type" | "browser.hover" | "browser.dblclick" | "browser.getText"
+    )
+}
+
+fn replay_needs_live_mark(kind: &str) -> bool {
+    matches!(
+        kind,
+        "click" | "rightClick" | "doubleClick" | "hover" | "scroll"
+    )
+}
+
+fn drag_replay_endpoints(
+    payload: &Value,
+    target_label: Option<&str>,
+) -> Result<(String, String), String> {
+    let from = json_nonempty_str(payload, "fromLabel")
+        .map(str::to_string)
+        .or_else(|| {
+            target_label
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+    let to = json_nonempty_str(payload, "toLabel").map(str::to_string);
+    match (from, to) {
+        (Some(from), Some(to)) => Ok((from, to)),
+        _ => Err(
+            "drag cannot replay without fromLabel and toLabel; handing off to the planner.".into(),
+        ),
+    }
+}
+
+fn inferred_step_expect(step: &WorkflowStep) -> Option<StepCondition> {
+    match step.kind.as_str() {
+        // Deliberately no expect for typeText/setValue/browser.type: a
+        // name-only condition is true before the text is typed, so the
+        // idempotent-resume pre-check would skip the action and the typed
+        // content would never land. The final outcome check verifies typed
+        // text through `last_typed_text` instead.
+        "navigateApplication" | "browser.navigate" => {
+            let url = step
+                .payload
+                .as_ref()
+                .and_then(|payload| json_nonempty_str(payload, "url"))?
+                .to_string();
+            Some(StepCondition {
+                url_contains: Some(url),
+                ..Default::default()
+            })
+        }
+        _ => None,
+    }
+}
+
+fn apply_inferred_expect(step: &mut WorkflowStep) {
+    if step.expect.is_none() {
+        step.expect = inferred_step_expect(step);
+    }
+}
+
+fn replay_apps(workflow: &Workflow) -> Vec<String> {
+    if !workflow.required_apps.is_empty() {
+        return workflow.required_apps.clone();
+    }
+    let mut apps = Vec::new();
+    for application in workflow
+        .steps
+        .iter()
+        .filter_map(|step| step.application.clone())
+    {
+        if application != "Alfred"
+            && !apps
+                .iter()
+                .any(|known: &String| known.eq_ignore_ascii_case(&application))
+        {
+            apps.push(application);
+        }
+    }
+    apps
+}
+
+fn replay_saw_publish_commit(workflow: &Workflow) -> bool {
+    workflow.steps.iter().any(|step| {
+        matches!(
+            step.kind.as_str(),
+            "invokeElement" | "click" | "doubleClick" | "browser.click" | "browser.dblclick"
+        ) && step
+            .target_label
+            .as_deref()
+            .is_some_and(is_publish_commit_label)
+    })
+}
+
+fn observation_bundle_is_empty(observations: &str) -> bool {
+    let trimmed = observations.trim();
+    trimmed.is_empty() || trimmed == "(no observations available)"
+}
+
+fn learned_completion_evidence(items: &[String]) -> Vec<String> {
+    items
+        .iter()
+        .filter(|item| {
+            let lower = item.to_ascii_lowercase();
+            !lower.contains("user-confirmed") && !lower.contains("user confirmed")
+        })
+        .cloned()
+        .collect()
+}
+
+fn replay_outcome_is_evidenced(workflow: &Workflow, observation: &str) -> Result<(), String> {
+    if observation_bundle_is_empty(observation) {
+        return Err(
+            "Could not observe the target applications after replaying saved steps.".into(),
+        );
+    }
+    let typed = workflow.last_typed_text.as_deref();
+    let publish =
+        requires_published_text_proof(&workflow.goal, typed, replay_saw_publish_commit(workflow));
+    let evidence = learned_completion_evidence(&workflow.completion_evidence);
+    if !evidence.is_empty() {
+        let missing: Vec<&str> = evidence
+            .iter()
+            .map(String::as_str)
+            .filter(|item| !evidence_matches_grounding(item, observation))
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "Saved outcome evidence was not visible: {}",
+                missing.join("; ")
+            ));
+        }
+        if publish {
+            let text = typed.ok_or_else(|| {
+                "Publication replay needs the authored text to still be visible.".to_string()
+            })?;
+            if !observation_contains_published_text(observation, text) {
+                return Err(
+                    "Authored text is not visible as published content after replay.".into(),
+                );
+            }
+        }
+        return Ok(());
+    }
+    if publish {
+        if let Some(text) = typed {
+            if observation_contains_published_text(observation, text) {
+                return Ok(());
+            }
+        }
+        return Err(
+            "Publish/send replay needs the authored text visible in the current desktop.".into(),
+        );
+    }
+    if goal_requires_save_proof(&workflow.goal) {
+        return Err("Save replay needs a fresh evidence review of the live file state.".into());
+    }
+    if let Some(text) = typed {
+        let needle: String = text.chars().take(40).collect();
+        if !needle.is_empty()
+            && !observation
+                .to_ascii_lowercase()
+                .contains(&needle.to_ascii_lowercase())
+        {
+            return Err(format!("Typed text was not visible after replay: {needle}"));
+        }
+        return Ok(());
+    }
+    // Nothing was captured that could be re-checked on the live desktop.
+    // Claiming success here would be vacuous — the docs promise replay only
+    // succeeds when the learned outcome is still visible — so hand back an
+    // error and let the run fall through to the planner. Note: the fallback
+    // run records its evidence in run-local memory only; the workflow file
+    // is not updated, so a no-evidence workflow (e.g. a click-only run that
+    // completed via user confirmation) falls back to the planner on every
+    // replay until the user re-saves it with captured evidence.
+    Err("The saved workflow carries no outcome evidence to verify against the live desktop.".into())
+}
+
+fn mint_live_mark(
+    app: &AppHandle,
+    run_id: &str,
+    step_id: &str,
+    application: &str,
+    hints: &ReplayMatchHints,
+) -> Result<(String, Option<i64>), String> {
+    // The returned mark is always a unique live match when this succeeds.
+    if !cfg!(windows) {
+        return Err("This recorded step requires the Windows automation host.".into());
+    }
+    let runtime = app.state::<RuntimeState>();
+    let pid = resolve_application_process_id(app, &runtime, application)?;
+    let search = replay_identity_name(hints).unwrap_or("target");
+    if let Some(automation_id) = hints.automation_id.as_deref() {
+        let mut payload = serde_json::json!({ "processId": pid, "automationId": automation_id });
+        if let (Some(name), Value::Object(map)) = (hints.name.as_deref(), &mut payload) {
+            map.insert("name".into(), Value::from(name));
+        }
+        if let (Some(control_type), Value::Object(map)) =
+            (hints.control_type.as_deref(), &mut payload)
+        {
+            map.insert("controlType".into(), Value::from(control_type));
+        }
+        let request = ActionRequest {
+            protocol_version: protocol_version(),
+            run_id: run_id.into(),
+            workflow_step: format!("{step_id}-rebind"),
+            application: application.into(),
+            intent: format!("re-bind {search} for replay"),
+            effect: "observe".into(),
+            target_label: hints.label.clone(),
+            payload: Some(payload),
+        };
+        if let Ok(found) = execute_native_action_inner(
+            app,
+            &runtime,
+            request,
+            "findElement".into(),
+            Duration::from_secs(15),
+            false,
+        ) {
+            if let Ok(mark) = unique_native_mark(&found, hints) {
+                return Ok((mark, Some(pid)));
+            }
+        }
+    }
+    let mut payload = serde_json::json!({ "processId": pid, "text": search });
+    if let (Some(control_type), Value::Object(map)) = (hints.control_type.as_deref(), &mut payload)
+    {
+        map.insert("controlType".into(), Value::from(control_type));
+    }
+    let request = ActionRequest {
+        protocol_version: protocol_version(),
+        run_id: run_id.into(),
+        workflow_step: format!("{step_id}-rebind"),
+        application: application.into(),
+        intent: format!("re-bind {search} for replay"),
+        effect: "observe".into(),
+        target_label: hints.label.clone(),
+        payload: Some(payload),
+    };
+    let found = execute_native_action_inner(
+        app,
+        &runtime,
+        request,
+        "findElement".into(),
+        Duration::from_secs(15),
+        false,
+    )?;
+    let mark = unique_native_mark(&found, hints)?;
+    Ok((mark, Some(pid)))
+}
+
+fn mint_live_ref(
+    app: &AppHandle,
+    run_id: &str,
+    step_id: &str,
+    hints: &ReplayMatchHints,
+    pinned_tab: Option<i64>,
+) -> Result<String, String> {
+    let search = replay_identity_name(hints)
+        .ok_or_else(|| "browser replay needs a target label to re-bind.".to_string())?;
+    let mut params = serde_json::json!({ "text": search });
+    if let (Some(tab), Value::Object(map)) = (pinned_tab, &mut params) {
+        map.insert("tabId".into(), Value::from(tab));
+    }
+    let found = send_browser_command_inner(
+        app.clone(),
+        BrowserCommand {
+            id: format!("{step_id}-rebind"),
+            method: "find".into(),
+            effect: "observe".into(),
+            intent: format!("re-bind {search} for replay"),
+            target_label: hints.label.clone(),
+            params,
+            run_id: Some(run_id.into()),
+        },
+        false,
+    )?;
+    unique_browser_ref(&found, hints)
+}
+
+fn ensure_payload_object(payload: &mut Value) {
+    if !payload.is_object() {
+        *payload = serde_json::json!({});
+    }
+}
+
+/// Rebind errors that cannot resolve on a retry: only structural problems —
+/// a missing recorded label, missing drag endpoints, or a non-Windows host.
+/// Absent/ambiguous live matches CAN change while a window or page finishes
+/// rendering, so those stay retryable.
+fn rebind_error_is_deterministic(error: &str) -> bool {
+    error.contains("requires the Windows automation host")
+        || error.contains("cannot replay without fromLabel and toLabel")
+        || error.contains("needs a target label to re-bind")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rebind_replay_payload(
+    app: &AppHandle,
+    run_id: &str,
+    step: &WorkflowStep,
+    application: &str,
+    is_browser: bool,
+    payload: &mut Value,
+    pinned_tab: Option<i64>,
+    target_label: Option<&str>,
+) -> Result<Option<i64>, String> {
+    ensure_payload_object(payload);
+    let hints = replay_match_hints(payload, target_label);
+    if step.kind == "drag" {
+        let (from_label, to_label) = drag_replay_endpoints(payload, target_label)?;
+        let (from, from_pid) = mint_live_mark(
+            app,
+            run_id,
+            &format!("{}-from", step.id),
+            application,
+            &ReplayMatchHints {
+                label: Some(from_label.clone()),
+                ..ReplayMatchHints::default()
+            },
+        )?;
+        let (to, _) = mint_live_mark(
+            app,
+            run_id,
+            &format!("{}-to", step.id),
+            application,
+            &ReplayMatchHints {
+                label: Some(to_label.clone()),
+                ..ReplayMatchHints::default()
+            },
+        )?;
+        if let Value::Object(map) = payload {
+            map.insert("from".into(), Value::from(from));
+            map.insert("to".into(), Value::from(to));
+        }
+        return Ok(from_pid);
+    }
+    if is_browser && replay_needs_live_ref(&step.kind) {
+        // sanitize_replay_payload strips any recorded ref before we get here,
+        // so a live ref is always minted fresh.
+        let live_ref = mint_live_ref(app, run_id, &step.id, &hints, pinned_tab)?;
+        if let Value::Object(map) = payload {
+            map.insert("ref".into(), Value::from(live_ref));
+        }
+        return Ok(None);
+    }
+    if replay_uses_name_target(&step.kind) {
+        // A bare name reaches the host's first-match lookup, so two controls
+        // named "Send" or "OK" can silently steer the action to the wrong
+        // one. When identity hints exist, mint a unique live mark and let the
+        // action target it — ambiguity then errors out and hands off to the
+        // planner instead of clicking the first hit. Without hints (no
+        // recorded label), the name alone remains the fallback.
+        if !is_browser
+            && cfg!(windows)
+            && (replay_identity_name(&hints).is_some() || hints.automation_id.is_some())
+        {
+            let (mark, pid) = mint_live_mark(app, run_id, &step.id, application, &hints)?;
+            if let Value::Object(map) = payload {
+                map.insert("mark".into(), Value::from(mark));
+            }
+            return Ok(pid);
+        }
+        if !payload_has_name(payload) {
+            if let Some(label) = replay_identity_name(&hints) {
+                if let Value::Object(map) = payload {
+                    map.insert("name".into(), Value::from(label));
+                }
+            }
+        }
+        return Ok(None);
+    }
+    if replay_needs_live_mark(&step.kind) {
+        if step.kind == "scroll"
+            && (json_nonempty_str(payload, "direction").is_some()
+                || json_nonempty_str(payload, "text").is_some())
+        {
+            return Ok(None);
+        }
+        // sanitize_replay_payload strips any recorded mark before we get
+        // here, so a live mark is always minted fresh.
+        if replay_identity_name(&hints).is_none() && hints.automation_id.is_none() {
+            return Err(format!(
+                "{} needs a target label to re-bind on replay.",
+                step.kind
+            ));
+        }
+        let (mark, pid) = mint_live_mark(app, run_id, &step.id, application, &hints)?;
+        if let Value::Object(map) = payload {
+            map.insert("mark".into(), Value::from(mark));
+        }
+        return Ok(pid);
+    }
+    Ok(None)
 }
 
 fn strip_json_fence(value: &str) -> &str {
@@ -2426,14 +3118,15 @@ fn validate_provider_plan(plan: ProviderPlan) -> Result<Vec<WorkflowStep>, Strin
             {
                 return Err("A typeText step must include non-empty text.".into());
             }
-            let effect = method_effect_for(&method, item.target_label.as_deref(), Some(&item.params))
-                .to_string();
+            let effect =
+                method_effect_for(&method, item.target_label.as_deref(), Some(&item.params))
+                    .to_string();
             let title = if item.title.trim().is_empty() {
                 item.target_label.clone().unwrap_or_else(|| method.clone())
             } else {
                 item.title.trim().to_string()
             };
-            let step = WorkflowStep {
+            let mut step = WorkflowStep {
                 id: Uuid::new_v4().to_string(),
                 title,
                 kind: method.clone(),
@@ -2452,6 +3145,7 @@ fn validate_provider_plan(plan: ProviderPlan) -> Result<Vec<WorkflowStep>, Strin
                 expect: None,
                 save_as: None,
             };
+            apply_inferred_expect(&mut step);
             validate_workflow_step(&step)?;
             let decision = evaluate_base_policy(&ActionRequest {
                 protocol_version: protocol_version(),
@@ -2567,6 +3261,8 @@ fn is_archived_status(status: &str) -> bool {
 fn ensure_workflow_runnable(workflow: &Workflow) -> Result<(), String> {
     if is_archived_status(&workflow.status) {
         Err("This workflow is archived. Restore it before running or scheduling it.".into())
+    } else if workflow.status == "recording" {
+        Err("This workflow is still being recorded. Finish the recording before running it.".into())
     } else {
         Ok(())
     }
@@ -2787,9 +3483,12 @@ fn verb_is_reversible(tokens: &[String], index: usize) -> bool {
     // "Delete draft" often destroys a persisted mail/doc draft. Only treat draft
     // as reversible when the object is clearly in-progress text/selection.
     if window.iter().any(|item| item.as_str() == "draft")
-        && !window
-            .iter()
-            .any(|item| matches!(item.as_str(), "text" | "selection" | "highlight" | "formatting"))
+        && !window.iter().any(|item| {
+            matches!(
+                item.as_str(),
+                "text" | "selection" | "highlight" | "formatting"
+            )
+        })
     {
         return false;
     }
@@ -2848,13 +3547,24 @@ fn payload_has_persistent_data_loss(payload: Option<&Value>) -> bool {
     map.iter().any(|(key, value)| {
         if matches!(
             key.as_str(),
-            "text" | "value" | "url" | "mark" | "from" | "to" | "generation" | "processId" | "nx" | "ny" | "x" | "y"
+            "text"
+                | "value"
+                | "url"
+                | "mark"
+                | "from"
+                | "to"
+                | "generation"
+                | "processId"
+                | "nx"
+                | "ny"
+                | "x"
+                | "y"
         ) {
             return false;
         }
-        value.as_str().is_some_and(|text| {
-            is_destruction_target(text) || is_persistent_data_loss_phrase(text)
-        })
+        value
+            .as_str()
+            .is_some_and(|text| is_destruction_target(text) || is_persistent_data_loss_phrase(text))
     })
 }
 
@@ -3106,9 +3816,7 @@ fn merge_trusted_browser_result(mut value: Value, native: Value) -> Value {
         .unwrap_or("")
         .to_string();
     if let Value::Object(map) = &mut value {
-        let result = map
-            .entry("result")
-            .or_insert_with(|| serde_json::json!({}));
+        let result = map.entry("result").or_insert_with(|| serde_json::json!({}));
         if let Value::Object(result_map) = result {
             result_map.insert("trustedInput".into(), Value::Bool(true));
             result_map.insert("how".into(), Value::String(how.clone()));
@@ -3121,7 +3829,8 @@ fn merge_trusted_browser_result(mut value: Value, native: Value) -> Value {
             if native.get("verified").and_then(Value::as_bool) == Some(true) {
                 result_map.insert("verified".into(), Value::Bool(true));
             }
-            if native.get("clicked").and_then(Value::as_bool) == Some(true) || how.contains("Click") {
+            if native.get("clicked").and_then(Value::as_bool) == Some(true) || how.contains("Click")
+            {
                 result_map.insert("clicked".into(), Value::Bool(true));
             }
             result_map.insert("needsTrustedInput".into(), Value::Bool(false));
@@ -3143,15 +3852,14 @@ fn apply_trusted_browser_input(
         return Ok(value);
     };
     let Some((nx, ny)) = browser_trusted_point(&value) else {
-        return Err(
-            "The page asked for trusted input but did not expose a viewport point.".into(),
-        );
+        return Err("The page asked for trusted input but did not expose a viewport point.".into());
     };
     if !cfg!(windows) {
         return Ok(value);
     }
     let runtime = app.state::<RuntimeState>();
-    let mut last_error = "No allow-listed browser window is available for trusted input.".to_string();
+    let mut last_error =
+        "No allow-listed browser window is available for trusted input.".to_string();
     for application in ["Microsoft Edge", "Google Chrome", "Brave"] {
         let pid = match resolve_application_process_id(app, &runtime, application) {
             Ok(pid) => pid,
@@ -3180,7 +3888,10 @@ fn apply_trusted_browser_input(
         }
         let request = ActionRequest {
             protocol_version: protocol_version(),
-            run_id: command.run_id.clone().unwrap_or_else(|| "browser-live".into()),
+            run_id: command
+                .run_id
+                .clone()
+                .unwrap_or_else(|| "browser-live".into()),
             workflow_step: command.id.clone(),
             application: application.into(),
             intent: format!("trusted OS {method} after the DOM path was ignored"),
@@ -3311,8 +4022,6 @@ fn send_browser_command(app: AppHandle, command: BrowserCommand) -> Result<Value
     send_browser_command_inner(app, command, false)
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
 fn substitute_text(text: &str, variables: &HashMap<String, String>) -> String {
     let mut result = text.to_string();
     for (key, replacement) in variables {
@@ -3323,8 +4032,6 @@ fn substitute_text(text: &str, variables: &HashMap<String, String>) -> String {
 
 /// Replaces `${name}` placeholders in every string of a step payload with values
 /// captured by earlier steps, so data can flow from one application into another.
-#[cfg(test)]
-#[allow(dead_code)]
 fn substitute_variables(value: &mut Value, variables: &HashMap<String, String>) {
     match value {
         Value::String(text) => *text = substitute_text(text, variables),
@@ -3344,8 +4051,6 @@ fn substitute_variables(value: &mut Value, variables: &HashMap<String, String>) 
 
 /// Pulls the savable value out of a step result: native actions return the result
 /// directly, browser actions wrap it in an envelope.
-#[cfg(test)]
-#[allow(dead_code)]
 fn extract_saved_value(value: &Value) -> Option<String> {
     for key in ["value", "text", "label", "url", "title"] {
         if let Some(found) = value.get(key).and_then(Value::as_str) {
@@ -3405,7 +4110,11 @@ fn approve_run_step(app: AppHandle, run_id: String) -> Result<(), String> {
         .run_controls
         .lock()
         .map_err(|_| "Run control state is unavailable.")?
-        .insert(run_id.clone(), "running".into());
+        .entry(run_id.clone())
+        .and_modify(|control| {
+            control.mode = "running".into();
+            control.epoch += 1;
+        });
     let _ = fs::remove_file(&path);
     Ok(())
 }
@@ -3613,14 +4322,10 @@ fn checkpoint_path(app: &AppHandle, run_id: &str) -> Result<PathBuf, String> {
     Ok(checkpoints_dir(app)?.join(format!("{run_id}.json")))
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
 fn variables_path(app: &AppHandle, run_id: &str) -> Result<PathBuf, String> {
     Ok(checkpoints_dir(app)?.join(format!("{run_id}.variables.json")))
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
 fn load_variables(app: &AppHandle, run_id: &str) -> HashMap<String, String> {
     variables_path(app, run_id)
         .ok()
@@ -3629,8 +4334,6 @@ fn load_variables(app: &AppHandle, run_id: &str) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
 fn save_variables(app: &AppHandle, run_id: &str, variables: &HashMap<String, String>) {
     if let Ok(path) = variables_path(app, run_id) {
         let _ = write_json(&path, variables);
@@ -3640,8 +4343,6 @@ fn save_variables(app: &AppHandle, run_id: &str, variables: &HashMap<String, Str
 /// Evaluates one step condition against live application state. Native steps use a
 /// UIA lookup in the resolved process; browser steps use a DOM observation of the
 /// pinned (or active) tab. `${variable}` placeholders are resolved first.
-#[cfg(test)]
-#[allow(dead_code)]
 fn evaluate_step_condition(
     app: &AppHandle,
     application: &str,
@@ -3741,8 +4442,6 @@ fn evaluate_step_condition(
     Ok(if condition.absent { !found } else { found })
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
 enum WaitOutcome {
     Satisfied,
     TimedOut,
@@ -3752,8 +4451,6 @@ enum WaitOutcome {
 /// Polls a condition until it holds or the deadline passes. Transient lookup
 /// errors (busy app, restarting host) keep the wait alive; stop/pause from the
 /// user are honored between polls.
-#[cfg(test)]
-#[allow(dead_code)]
 async fn wait_for_condition(
     app: &AppHandle,
     run_id: &str,
@@ -3925,7 +4622,10 @@ fn complete_goal_run(app: AppHandle, run_id: String) -> Result<RunCheckpoint, St
         },
     );
     if let Ok(mut controls) = app.state::<RuntimeState>().run_controls.lock() {
-        controls.insert(run_id, "stop".into());
+        if let Some(control) = controls.get_mut(&run_id) {
+            control.mode = "stop".into();
+            control.epoch += 1;
+        }
     }
     Ok(checkpoint)
 }
@@ -3945,12 +4645,13 @@ fn save_goal_run_as_workflow(
     }
     let path = goal_run_steps_path(&app, &run_id)?;
     let mut steps: Vec<WorkflowStep> = read_json_or_default(&path)?;
-    steps.retain(|step| validate_workflow_step(step).is_ok());
+    steps.retain(|step| validate_workflow_step(step).is_ok() && !is_replay_probe_step(step));
     if steps.is_empty() {
         return Err("This run did not capture any reusable actions.".into());
     }
     for step in &mut steps {
         step.id = Uuid::new_v4().to_string();
+        apply_inferred_expect(step);
     }
     let mut required_apps = Vec::new();
     for application in steps.iter().filter_map(|step| step.application.clone()) {
@@ -3959,8 +4660,13 @@ fn save_goal_run_as_workflow(
         }
     }
     let now = Utc::now();
-    let planner_provider =
-        get_goal_run_memory(app.clone(), run_id.clone())?.map(|memory| memory.provider);
+    let memory = get_goal_run_memory(app.clone(), run_id.clone())?;
+    let planner_provider = memory.as_ref().map(|item| item.provider.clone());
+    let completion_evidence = memory
+        .as_ref()
+        .map(|item| learned_completion_evidence(&item.completion_evidence))
+        .unwrap_or_default();
+    let last_typed_text = memory.and_then(|item| item.last_typed_text);
     let workflow = Workflow {
         id: Uuid::new_v4().to_string(),
         name: name.trim().to_string(),
@@ -3972,6 +4678,8 @@ fn save_goal_run_as_workflow(
         planner_provider,
         required_apps,
         steps,
+        completion_evidence,
+        last_typed_text,
     };
     if workflow.name.is_empty() || workflow.goal.is_empty() {
         return Err("A saved workflow needs both a name and a goal.".into());
@@ -3985,8 +4693,23 @@ fn run_mode(app: &AppHandle, run_id: &str) -> String {
         .run_controls
         .lock()
         .ok()
-        .and_then(|map| map.get(run_id).cloned())
+        .and_then(|map| map.get(run_id).map(|control| control.mode.clone()))
         .unwrap_or_else(|| "stop".into())
+}
+
+/// Atomic (mode, epoch) snapshot of a run's control state. The epoch counts
+/// mode changes (pause, resume, stop), so a snapshot taken after a blocking
+/// observation differs from one taken before whenever the user touched the
+/// controls mid-read — even if the mode reads "running" again at the end.
+fn control_snapshot(app: &AppHandle, run_id: &str) -> Option<(String, u64)> {
+    app.state::<RuntimeState>()
+        .run_controls
+        .lock()
+        .ok()
+        .and_then(|map| {
+            map.get(run_id)
+                .map(|control| (control.mode.clone(), control.epoch))
+        })
 }
 
 /// Waits while a run is paused. Returns true when the run must stop.
@@ -4001,8 +4724,6 @@ async fn wait_if_paused(app: &AppHandle, run_id: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-#[allow(dead_code)]
 fn fail_run_step(
     app: &AppHandle,
     run_id: &str,
@@ -4091,7 +4812,10 @@ async fn park_run_for_approval(
         let _ = write_json(&path, &pending);
     }
     if let Ok(mut controls) = app.state::<RuntimeState>().run_controls.lock() {
-        controls.insert(run_id.into(), "waiting".into());
+        if let Some(control) = controls.get_mut(run_id) {
+            control.mode = "waiting".into();
+            control.epoch += 1;
+        }
     }
     let _ = app.emit(
         "alfred://run-event",
@@ -4134,11 +4858,11 @@ async fn park_run_for_approval(
     }
 }
 
-/// Async for the same reason as start_goal_run: the Windows app-resolution
-/// preflight below performs native-host round-trips that must not block the
-/// WebView's main thread.
-#[cfg(test)]
-#[allow(dead_code)]
+/// Starts a saved-workflow replay. Live windows, PIDs, marks, and browser refs
+/// are re-resolved on every step; stale coordinates are stripped. If a recorded
+/// step no longer matches the desktop, the same run hands off to the live
+/// planner. Async so native-host startup cannot freeze the WebView.
+#[tauri::command]
 async fn start_workflow_run(
     app: AppHandle,
     library_path: String,
@@ -4146,9 +4870,21 @@ async fn start_workflow_run(
     resume_run_id: Option<String>,
 ) -> Result<String, String> {
     let (_, workflow) = load_workflow(&library_path, &workflow_id)?;
-    for step in &workflow.steps {
-        validate_workflow_step(step)?;
+    ensure_workflow_runnable(&workflow)?;
+    if !workflow_can_replay(&workflow) {
+        // Not replayable (no valid recorded action): run the goal live. A
+        // resume checkpoint belongs to a replay of the same workflow, so it is
+        // not applicable to a fresh goal run.
+        return start_goal_run(
+            app,
+            workflow.goal,
+            workflow.required_apps,
+            workflow.planner_provider,
+            None,
+        )
+        .await;
     }
+    let settings = get_settings(app.clone())?;
     let run_id = resume_run_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let start_index = get_checkpoint(app.clone(), run_id.clone())?
         .map(|item| item.next_step_index)
@@ -4163,21 +4899,12 @@ async fn start_workflow_run(
         if controls.contains_key(&run_id) {
             return Err("This run is already active.".into());
         }
-        controls.insert(run_id.clone(), "running".into());
+        controls.insert(run_id.clone(), RunControl::running());
     }
     let start = (|| {
         try_acquire_run_lock(&lock_path, &run_id)?;
-        // Preflight: every application the workflow needs must be running before the
-        // first step, so a missing app fails fast with a clear message.
         if cfg!(windows) {
-            let runtime = app.state::<RuntimeState>();
-            for required in &workflow.required_apps {
-                if required == "Alfred" || required == "Installed browser" {
-                    continue;
-                }
-                resolve_application_process_id(&app, &runtime, required)
-                    .map_err(|error| format!("{required} is not ready: {error}"))?;
-            }
+            native_host_executable(&app)?;
         }
         save_checkpoint(
             &app,
@@ -4200,6 +4927,7 @@ async fn start_workflow_run(
     }
     let emitted_run = run_id.clone();
     let app_for_run = app.clone();
+    let screenshot_retention = settings.screenshot_retention.clone();
     tauri::async_runtime::spawn(async move {
         drive_workflow_run(
             app_for_run.clone(),
@@ -4208,16 +4936,35 @@ async fn start_workflow_run(
             start_index,
         )
         .await;
+        let final_status = get_checkpoint(app_for_run.clone(), emitted_run.clone())
+            .ok()
+            .flatten()
+            .map(|checkpoint| checkpoint.status)
+            .unwrap_or_default();
+        cleanup_run_screenshots(
+            &app_for_run,
+            &emitted_run,
+            &screenshot_retention,
+            &final_status,
+        );
         release_run_lock(&lock_path, &emitted_run);
         if let Ok(mut controls) = app_for_run.state::<RuntimeState>().run_controls.lock() {
             controls.remove(&emitted_run);
+        }
+        if let Ok(mut notes) = app_for_run.state::<RuntimeState>().steer_notes.lock() {
+            notes.remove(&emitted_run);
+        }
+        if let Ok(mut overrides) = app_for_run
+            .state::<RuntimeState>()
+            .approved_overrides
+            .lock()
+        {
+            overrides.remove(&emitted_run);
         }
     });
     Ok(run_id)
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
 async fn drive_workflow_run(
     app: AppHandle,
     run_id: String,
@@ -4231,6 +4978,16 @@ async fn drive_workflow_run(
     let mut pinned_tab: Option<i64> = None;
     // Values captured by saveAs steps; persisted so checkpoint resumes keep them.
     let mut variables = load_variables(&app, &run_id);
+    let mut history: Vec<String> = Vec::new();
+    emit_goal_event(
+        &app,
+        &run_id,
+        start_index,
+        "Replaying saved steps",
+        "Running the recorded actions against live windows. The planner takes over only if a step no longer matches.",
+        "running",
+        3,
+    );
     for (index, step) in workflow.steps.iter().enumerate().skip(start_index) {
         if wait_if_paused(&app, &run_id).await {
             stop_run(&app, &run_id, &workflow.id, index);
@@ -4238,6 +4995,20 @@ async fn drive_workflow_run(
         }
         if let Some(path) = &lock_path {
             write_run_lock(path, &run_id);
+        }
+        if is_replay_probe_step(step) {
+            let _ = save_checkpoint(
+                &app,
+                &RunCheckpoint {
+                    run_id: run_id.clone(),
+                    workflow_id: workflow.id.clone(),
+                    next_step_index: index + 1,
+                    status: "running".into(),
+                    error: None,
+                    updated_at: Utc::now(),
+                },
+            );
+            continue;
         }
         let application = step.application.clone().unwrap_or_else(|| "Alfred".into());
         let is_browser = step.kind.starts_with("browser.");
@@ -4294,19 +5065,20 @@ async fn drive_workflow_run(
             {
                 WaitOutcome::Satisfied => {}
                 WaitOutcome::TimedOut => {
-                    fail_run_step(
+                    continue_replay_with_planner(
                         &app,
                         &run_id,
-                        &workflow.id,
-                        index,
-                        total,
+                        &workflow,
                         step,
-                        &application,
+                        index,
+                        history,
+                        pinned_tab,
                         format!(
                             "Precondition \"{label}\" was not met within {} ms.",
                             timeout.as_millis()
                         ),
-                    );
+                    )
+                    .await;
                     return;
                 }
                 WaitOutcome::Stopped => {
@@ -4329,10 +5101,37 @@ async fn drive_workflow_run(
                 .clone()
                 .unwrap_or_else(|| serde_json::json!({}));
             substitute_variables(&mut payload, &variables);
+            sanitize_replay_payload(&mut payload);
             let mut target_label = step.target_label.clone();
             if let Some(label) = &mut target_label {
                 *label = substitute_text(label, &variables);
             }
+            let rebound_pid = match rebind_replay_payload(
+                &app,
+                &run_id,
+                step,
+                &application,
+                is_browser,
+                &mut payload,
+                pinned_tab,
+                target_label.as_deref(),
+            ) {
+                Ok(pid) => pid,
+                Err(error) => {
+                    // Rebind failures that cannot change between attempts —
+                    // missing labels, non-Windows host, ambiguous matches —
+                    // burn retries and 500 ms sleeps for nothing; go straight
+                    // to the planner like hard_deny.
+                    let retryable = !rebind_error_is_deterministic(&error);
+                    last_error = error;
+                    attempt += 1;
+                    if !retryable || attempt > attempts {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+            };
             // Idempotent resume: when the desired end state already holds (a
             // previous attempt applied it but the response was lost), skip the
             // action instead of applying it twice.
@@ -4354,9 +5153,18 @@ async fn drive_workflow_run(
             }
             // Every attempt re-resolves the application to a live process, so a
             // stale recorded PID can never steer input into the wrong window.
+            // rebind_replay_payload already resolved the same application while
+            // minting the live mark, so reuse that pid instead of paying a
+            // second host round-trip per step.
             if !is_browser && cfg!(windows) && needs_process_resolution(&step.kind, &application) {
-                let runtime = app.state::<RuntimeState>();
-                match resolve_application_process_id(&app, &runtime, &application) {
+                let resolved = match rebound_pid {
+                    Some(pid) => Ok(pid),
+                    None => {
+                        let runtime = app.state::<RuntimeState>();
+                        resolve_application_process_id(&app, &runtime, &application)
+                    }
+                };
+                match resolved {
                     Ok(pid) => {
                         if let Value::Object(ref mut map) = payload {
                             map.insert("processId".into(), Value::from(pid));
@@ -4497,16 +5305,24 @@ async fn drive_workflow_run(
             }
         }
         let Some(value) = outcome else {
-            fail_run_step(
-                &app,
-                &run_id,
-                &workflow.id,
-                index,
-                total,
-                step,
-                &application,
-                format!("{last_error} (after {attempts} attempt(s))"),
-            );
+            let stall = format!("{last_error} (after {attempts} attempt(s))");
+            if last_error.starts_with("hard_deny") {
+                fail_run_step(
+                    &app,
+                    &run_id,
+                    &workflow.id,
+                    index,
+                    total,
+                    step,
+                    &application,
+                    stall,
+                );
+                return;
+            }
+            continue_replay_with_planner(
+                &app, &run_id, &workflow, step, index, history, pinned_tab, stall,
+            )
+            .await;
             return;
         };
         // A one-step approval override is consumed with its step.
@@ -4539,6 +5355,14 @@ async fn drive_workflow_run(
             .and_then(|item| item.get("dataUrl"))
             .and_then(Value::as_str)
             .map(str::to_string);
+        if !skipped {
+            append_goal_run_step(&app, &run_id, step);
+        }
+        history.push(if skipped {
+            format!("{} ({}) — already satisfied", step.title, step.kind)
+        } else {
+            format!("{} ({}) — ok", step.title, step.kind)
+        });
         let detail = if skipped {
             "Already in the desired state; action skipped (idempotent resume).".to_string()
         } else if let Some(name) = &step.save_as {
@@ -4573,6 +5397,111 @@ async fn drive_workflow_run(
             },
         );
     }
+    emit_goal_event(
+        &app,
+        &run_id,
+        workflow.steps.len(),
+        "Verifying the outcome",
+        "Checking the live desktop against the saved result. A successful last click is not enough.",
+        "running",
+        96,
+    );
+    let apps = replay_apps(&workflow);
+    // gather_observations performs blocking native-host round-trips (15 s
+    // timeout per application); keep it off the async worker so pause checks
+    // and event emission keep flowing while the desktop is read. The
+    // observation may be stale by the time the join returns — the user can
+    // pause, stop, or pause-and-resume during the read — so honor run
+    // control and re-gather whenever the control epoch moved, which also
+    // covers a resume that already flipped the mode back to "running".
+    let (observations, _) = loop {
+        // Atomic (mode, epoch) snapshot before the blocking read; comparing
+        // the post-read snapshot catches a pause/resume cycle that already
+        // flipped the mode back to "running" (a mid-gather epoch bump).
+        let snapshot_before = control_snapshot(&app, &run_id);
+        let observe_app = app.clone();
+        let observe_run_id = run_id.clone();
+        let pinned_for_gather = pinned_tab;
+        let (bundle, new_pinned) = tauri::async_runtime::spawn_blocking({
+            let apps = apps.clone();
+            move || gather_observations(&observe_app, &observe_run_id, &apps, pinned_for_gather)
+        })
+        .await
+        .unwrap_or_else(|_| ("(no observations available)".into(), pinned_tab));
+        pinned_tab = new_pinned;
+        match control_snapshot(&app, &run_id) {
+            Some((mode, _)) if mode == "stop" => {
+                stop_run(&app, &run_id, &workflow.id, workflow.steps.len());
+                return;
+            }
+            Some((mode, _)) if mode == "paused" || mode == "waiting" => {
+                if wait_if_paused(&app, &run_id).await {
+                    stop_run(&app, &run_id, &workflow.id, workflow.steps.len());
+                    return;
+                }
+                continue; // resumed: the bundle is stale, gather again
+            }
+            after if after != snapshot_before => {
+                continue; // controls touched mid-gather: bundle is stale
+            }
+            _ => break (bundle, pinned_tab),
+        }
+    };
+    if let Err(stall) = replay_outcome_is_evidenced(&workflow, &observations) {
+        let last = workflow
+            .steps
+            .iter()
+            .rev()
+            .find(|step| !is_replay_probe_step(step));
+        let Some(last) = last else {
+            fail_run_step(
+                &app,
+                &run_id,
+                &workflow.id,
+                workflow.steps.len(),
+                workflow.steps.len().max(1),
+                &WorkflowStep {
+                    id: "replay-verify".into(),
+                    title: "Verify outcome".into(),
+                    kind: "observeWindow".into(),
+                    effect: "observe".into(),
+                    application: Some("Alfred".into()),
+                    intent: None,
+                    target_label: None,
+                    payload: None,
+                    timeout_ms: default_timeout(),
+                    retries: default_retries(),
+                    wait_for: None,
+                    expect: None,
+                    save_as: None,
+                },
+                "Alfred",
+                stall,
+            );
+            return;
+        };
+        continue_replay_with_planner(
+            &app,
+            &run_id,
+            &workflow,
+            last,
+            workflow.steps.len(),
+            history,
+            pinned_tab,
+            stall,
+        )
+        .await;
+        return;
+    }
+    emit_goal_event(
+        &app,
+        &run_id,
+        workflow.steps.len(),
+        "Workflow completed",
+        "Every saved step ran and the live desktop still shows the learned outcome.",
+        "completed",
+        100,
+    );
     let _ = save_checkpoint(
         &app,
         &RunCheckpoint {
@@ -4584,6 +5513,145 @@ async fn drive_workflow_run(
             updated_at: Utc::now(),
         },
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn continue_replay_with_planner(
+    app: &AppHandle,
+    run_id: &str,
+    workflow: &Workflow,
+    step: &WorkflowStep,
+    index: usize,
+    mut history: Vec<String>,
+    pinned_tab: Option<i64>,
+    stall: String,
+) {
+    let settings = match get_settings(app.clone()) {
+        Ok(settings) => settings,
+        Err(error) => {
+            fail_run_step(
+                app,
+                run_id,
+                &workflow.id,
+                index,
+                workflow.steps.len().max(1),
+                step,
+                step.application.as_deref().unwrap_or("Alfred"),
+                format!("{stall} Planner fallback unavailable: {error}"),
+            );
+            return;
+        }
+    };
+    let provider = workflow
+        .planner_provider
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| settings.provider.clone());
+    if !provider_definitions()
+        .iter()
+        .any(|definition| definition.0 == provider)
+    {
+        fail_run_step(
+            app,
+            run_id,
+            &workflow.id,
+            index,
+            workflow.steps.len().max(1),
+            step,
+            step.application.as_deref().unwrap_or("Alfred"),
+            format!("{stall} Planner fallback unavailable: unknown provider {provider}."),
+        );
+        return;
+    }
+    if let Err(error) = preflight_provider(&provider) {
+        fail_run_step(
+            app,
+            run_id,
+            &workflow.id,
+            index,
+            workflow.steps.len().max(1),
+            step,
+            step.application.as_deref().unwrap_or("Alfred"),
+            format!("{stall} Planner fallback unavailable: {error}"),
+        );
+        return;
+    }
+    emit_goal_event(
+        app,
+        run_id,
+        index,
+        "Replaying stalled",
+        "The saved steps no longer match the desktop. The planner is taking over.",
+        "running",
+        ((index * 100) / workflow.steps.len().max(1)) as u8,
+    );
+    history.push(format!(
+        "saved-step replay stalled at '{}': {stall}",
+        step.title
+    ));
+    while history.len() > MAX_PLANNER_HISTORY {
+        history.remove(0);
+    }
+    let remaining: Vec<String> = workflow
+        .steps
+        .iter()
+        .skip(index)
+        .filter(|item| !is_replay_probe_step(item))
+        .map(|item| item.title.clone())
+        .collect();
+    let seeded_session =
+        matches!(provider.as_str(), "grok" | "copilot").then(|| run_id.to_string());
+    let mut memory = GoalRunMemory {
+        schema_version: 1,
+        run_id: run_id.to_string(),
+        provider,
+        provider_session_id: seeded_session,
+        goal: workflow.goal.clone(),
+        applications: workflow.required_apps.clone(),
+        planner_turns: 0,
+        provider_session_resets: 0,
+        next_step_index: index,
+        pinned_browser_tab: pinned_tab,
+        history,
+        working_plan: remaining,
+        consecutive_failures: 0,
+        actions_since_check_in: 0,
+        last_observation: String::new(),
+        pending_action: None,
+        completion_claim: None,
+        completion_evidence: Vec::new(),
+        verification_attempts: 0,
+        last_typed_text: None,
+        last_typed_application: None,
+        last_resolved_label: None,
+        save_baseline: None,
+        save_application: None,
+        saw_publish_commit: false,
+        save_committed: false,
+        status: "running".into(),
+        completion_summary: None,
+        updated_at: Utc::now(),
+    };
+    if let Err(error) = save_goal_run_memory(app, &mut memory) {
+        fail_run_step(
+            app,
+            run_id,
+            &workflow.id,
+            index,
+            workflow.steps.len().max(1),
+            step,
+            step.application.as_deref().unwrap_or("Alfred"),
+            format!("{stall} Planner fallback unavailable: {error}"),
+        );
+        return;
+    }
+    drive_goal_run(
+        app.clone(),
+        memory,
+        0,
+        settings.share_screenshots_with_planner,
+    )
+    .await;
 }
 
 /// One reply from the planner: the next action, a completion signal, or a plan
@@ -4943,7 +6011,8 @@ fn planner_result_digest(value: &Value) -> String {
                 parts.push("[captcha]".into());
             }
             if let Some(how) = map.get("how").and_then(Value::as_str) {
-                if how.starts_with("human") || map.get("trustedInput").and_then(Value::as_bool) == Some(true)
+                if how.starts_with("human")
+                    || map.get("trustedInput").and_then(Value::as_bool) == Some(true)
                 {
                     parts.push(format!("[{how}]"));
                 }
@@ -5331,7 +6400,10 @@ fn summarize_native_observation(value: &Value, application: &str, out: &mut Vec<
         }
         for mark in marks.iter().take(36) {
             let id = mark.get("id").and_then(Value::as_str).unwrap_or("?");
-            let role = mark.get("role").and_then(Value::as_str).unwrap_or("Control");
+            let role = mark
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("Control");
             let name: String = mark
                 .get("name")
                 .and_then(Value::as_str)
@@ -5376,7 +6448,9 @@ fn summarize_native_observation(value: &Value, application: &str, out: &mut Vec<
             out.push(line);
         }
         if marks.is_empty() {
-            out.push("(no interactive marks — call findElement {\"text\":\"...\"} or probe)".into());
+            out.push(
+                "(no interactive marks — call findElement {\"text\":\"...\"} or probe)".into(),
+            );
         }
         if let Some(texts) = value.get("texts").and_then(Value::as_array) {
             for snippet in texts.iter().filter_map(Value::as_str).take(12) {
@@ -5669,30 +6743,20 @@ fn infer_applications_from_goal(goal: &str) -> Vec<String> {
             "Microsoft Edge",
         ),
         (
-            &[
-                "microsoft store",
-                "windows store",
-                "ms store",
-                "store",
-            ],
+            &["microsoft store", "windows store", "ms store", "store"],
             "Microsoft Store",
         ),
         (&["settings", "windows settings"], "Settings"),
-        (
-            &["windows terminal", "terminal", "wt"],
-            "Windows Terminal",
-        ),
+        (&["windows terminal", "terminal", "wt"], "Windows Terminal"),
         (&["excel", "spreadsheet", "workbook"], "Microsoft Excel"),
         (&["ms word", "word document", "word"], "Microsoft Word"),
         (&["powerpoint", "presentation"], "Microsoft PowerPoint"),
-        (&["outlook", "email", "e-mail", "inbox"], "Microsoft Outlook"),
         (
-            &[
-                "visual studio code",
-                "vs code",
-                "vscode",
-                "code.exe",
-            ],
+            &["outlook", "email", "e-mail", "inbox"],
+            "Microsoft Outlook",
+        ),
+        (
+            &["visual studio code", "vs code", "vscode", "code.exe"],
             "Visual Studio Code",
         ),
         (&["slack"], "Slack"),
@@ -6043,12 +7107,14 @@ fn authored_text_anchor(value: &str) -> Option<String> {
             && trimmed.as_bytes()[1] == b':'
             && trimmed.as_bytes()[0].is_ascii_alphabetic());
     let looks_like_filename = !trimmed.contains(' ')
-        && std::path::Path::new(trimmed).extension().is_some_and(|ext| {
-            matches!(
-                ext.to_string_lossy().to_ascii_lowercase().as_str(),
-                "txt" | "md" | "docx" | "xlsx" | "pptx" | "pdf" | "csv" | "rtf"
-            )
-        });
+        && std::path::Path::new(trimmed)
+            .extension()
+            .is_some_and(|ext| {
+                matches!(
+                    ext.to_string_lossy().to_ascii_lowercase().as_str(),
+                    "txt" | "md" | "docx" | "xlsx" | "pptx" | "pdf" | "csv" | "rtf"
+                )
+            });
     if looks_like_path || looks_like_filename {
         return None;
     }
@@ -6094,7 +7160,20 @@ fn evidence_matches_grounding(evidence: &str, grounding: &str) -> bool {
         "completed",
         "application",
     ];
-    let grounding = grounding.to_ascii_lowercase();
+    // Error prose ("Notepad: unavailable (Could not resolve …)") names the very
+    // applications the evidence talks about, so tokens from failed reads must
+    // never count as a positive match — only successfully observed sections
+    // ground evidence.
+    let grounding: String = grounding
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.contains(": unavailable (")
+                && !trimmed.starts_with("page content: unavailable")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_lowercase();
     let mut matched = 0;
     for token in evidence
         .to_ascii_lowercase()
@@ -6282,10 +7361,7 @@ fn is_save_commit(kind: &str, label: Option<&str>, payload: Option<&Value>) -> b
     }
     label.is_some_and(|value| {
         let lowered = value.to_ascii_lowercase();
-        if lowered.contains("don't")
-            || lowered.contains("dont")
-            || lowered.contains("do not")
-        {
+        if lowered.contains("don't") || lowered.contains("dont") || lowered.contains("do not") {
             return false;
         }
         let tokens: Vec<&str> = lowered
@@ -6872,7 +7948,7 @@ async fn drive_goal_run(
         }
         let title = reply.title.clone().unwrap_or_else(|| kind.clone());
         let declared_effect = reply.effect.clone().unwrap_or_else(|| "unknown".into());
-        let step = WorkflowStep {
+        let mut step = WorkflowStep {
             id: format!("goal-step-{step_index}"),
             title: title.clone(),
             kind: kind.clone(),
@@ -6892,6 +7968,7 @@ async fn drive_goal_run(
             expect: None,
             save_as: None,
         };
+        apply_inferred_expect(&mut step);
         if !is_browser && kind == "click" {
             let payload = step.payload.as_ref();
             let has_mark = payload
@@ -7092,16 +8169,17 @@ async fn drive_goal_run(
                 if step.effect != "observe" {
                     memory.actions_since_check_in += 1;
                 }
-                if matches!(kind.as_str(), "typeText" | "browser.type") {
+                if matches!(kind.as_str(), "typeText" | "setValue" | "browser.type") {
                     if let Some(text) = payload
                         .get("text")
                         .or_else(|| payload.get("value"))
                         .and_then(Value::as_str)
                         .and_then(authored_text_anchor)
                     {
-                        let keep_existing = memory.last_typed_text.as_ref().is_some_and(|old| {
-                            old.chars().count() > text.chars().count()
-                        });
+                        let keep_existing = memory
+                            .last_typed_text
+                            .as_ref()
+                            .is_some_and(|old| old.chars().count() > text.chars().count());
                         if !keep_existing {
                             memory.last_typed_text = Some(text);
                             memory.last_typed_application = Some(application.clone());
@@ -7112,7 +8190,11 @@ async fn drive_goal_run(
                     memory.last_resolved_label = Some(live.clone());
                     if matches!(
                         kind.as_str(),
-                        "invokeElement" | "click" | "doubleClick" | "browser.click" | "browser.dblclick"
+                        "invokeElement"
+                            | "click"
+                            | "doubleClick"
+                            | "browser.click"
+                            | "browser.dblclick"
                     ) && is_publish_commit_label(&live)
                     {
                         memory.saw_publish_commit = true;
@@ -7193,7 +8275,10 @@ async fn drive_goal_run(
                     memory.actions_since_check_in = 0;
                     let _ = save_goal_run_memory(&app, &mut memory);
                     if let Ok(mut controls) = app.state::<RuntimeState>().run_controls.lock() {
-                        controls.insert(run_id.clone(), "paused".into());
+                        if let Some(control) = controls.get_mut(&run_id) {
+                            control.mode = "paused".into();
+                            control.epoch += 1;
+                        }
                     }
                     emit_goal_event(
                         &app,
@@ -7329,7 +8414,7 @@ async fn start_goal_run(
         if controls.contains_key(&run_id) {
             return Err("This run is already active.".into());
         }
-        controls.insert(run_id.clone(), "running".into());
+        controls.insert(run_id.clone(), RunControl::running());
     }
     let start = (|| {
         try_acquire_run_lock(&lock_path, &run_id)?;
@@ -7338,9 +8423,8 @@ async fn start_goal_run(
             // deliberately do NOT have to be running here: observations report
             // them as unavailable and the planner can then propose an
             // allow-listed launchApplication — recovering from closed apps is
-            // exactly what the agent loop is for. (Recorded-workflow replay
-            // keeps the stricter apps-running preflight because it has no
-            // planner to recover from a missing app.)
+            // exactly what the agent loop is for. Saved-workflow replay uses
+            // the same host-only preflight and re-resolves each app live.
             native_host_executable(&app)?;
         }
         save_checkpoint(
@@ -7393,7 +8477,11 @@ async fn start_goal_run(
         if let Ok(mut notes) = app_for_run.state::<RuntimeState>().steer_notes.lock() {
             notes.remove(&emitted_run);
         }
-        if let Ok(mut overrides) = app_for_run.state::<RuntimeState>().approved_overrides.lock() {
+        if let Ok(mut overrides) = app_for_run
+            .state::<RuntimeState>()
+            .approved_overrides
+            .lock()
+        {
             overrides.remove(&emitted_run);
         }
     });
@@ -7601,7 +8689,14 @@ fn set_run_control(
     if !controls.contains_key(&run_id) {
         return Err("The run is no longer active.".into());
     }
-    controls.insert(run_id, control);
+    let entry = controls
+        .get_mut(&run_id)
+        .ok_or_else(|| "The run is no longer active.".to_string())?;
+    // Mode and epoch change together under this one lock, so a snapshot taken
+    // by a run blocked on a long observation can never see the new mode with
+    // the old epoch.
+    entry.mode = control;
+    entry.epoch += 1;
     Ok(())
 }
 
@@ -7790,12 +8885,11 @@ fn start_scheduler(app: AppHandle) {
                         load_workflow(&settings.library_path, &schedule.workflow_id)
                     {
                         if ensure_workflow_runnable(&workflow).is_ok() {
-                            let _ = start_goal_run(
+                            let _ = start_workflow_run(
                                 app.clone(),
-                                workflow.goal,
-                                workflow.required_apps,
-                                workflow.planner_provider,
-                                Some(0),
+                                settings.library_path.clone(),
+                                workflow.id,
+                                None,
                             )
                             .await;
                         }
@@ -7906,18 +9000,17 @@ pub fn run() {
                         let _ = window.hide();
                     }
                     if let Ok(settings) = get_settings(app.handle().clone()) {
-                        // Scheduled workflows re-enter the live goal loop so app
-                        // state is re-observed and stale refs/coordinates are
-                        // never replayed blindly.
+                        // Saved workflows replay recorded steps against live
+                        // windows. Stale refs/coordinates are stripped; a
+                        // mismatch hands the same run to the planner.
                         let scheduled = load_workflow(&settings.library_path, workflow_id)
                             .and_then(|(_, workflow)| {
                                 ensure_workflow_runnable(&workflow)?;
-                                tauri::async_runtime::block_on(start_goal_run(
+                                tauri::async_runtime::block_on(start_workflow_run(
                                     app.handle().clone(),
-                                    workflow.goal,
-                                    workflow.required_apps,
-                                    workflow.planner_provider,
-                                    Some(0),
+                                    settings.library_path.clone(),
+                                    workflow.id,
+                                    None,
                                 ))
                             });
                         match scheduled {
@@ -7971,6 +9064,7 @@ pub fn run() {
             complete_goal_run,
             save_goal_run_as_workflow,
             start_goal_run,
+            start_workflow_run,
             set_run_control,
             steer_run,
             approve_run_step,
@@ -8076,10 +9170,7 @@ mod tests {
             effective_effect("navigateApplication", "observe"),
             "external_write"
         );
-        assert_eq!(
-            effective_effect("probe", "unknown"),
-            "observe"
-        );
+        assert_eq!(effective_effect("probe", "unknown"), "observe");
         assert_eq!(
             method_effect_for(
                 "invokeElement",
@@ -8136,23 +9227,34 @@ mod tests {
             "hard_deny"
         );
         assert_eq!(
-            evaluate_base_policy(&request("click", "modify_reversible", Some("Purge all data")))
-                .decision,
+            evaluate_base_policy(&request(
+                "click",
+                "modify_reversible",
+                Some("Purge all data")
+            ))
+            .decision,
             "hard_deny"
         );
         assert_eq!(
-            evaluate_base_policy(&request("click", "modify_reversible", Some("Delete project")))
-                .decision,
+            evaluate_base_policy(&request(
+                "click",
+                "modify_reversible",
+                Some("Delete project")
+            ))
+            .decision,
             "hard_deny"
         );
         assert_eq!(
-            evaluate_base_policy(&request("click", "modify_reversible", Some("Remove workspace")))
-                .decision,
+            evaluate_base_policy(&request(
+                "click",
+                "modify_reversible",
+                Some("Remove workspace")
+            ))
+            .decision,
             "hard_deny"
         );
         assert_eq!(
-            evaluate_base_policy(&request("click", "modify_reversible", Some("Trash")))
-                .decision,
+            evaluate_base_policy(&request("click", "modify_reversible", Some("Trash"))).decision,
             "hard_deny"
         );
         assert_eq!(
@@ -8161,8 +9263,12 @@ mod tests {
             "hard_deny"
         );
         assert_eq!(
-            evaluate_base_policy(&request("click", "modify_reversible", Some("Delete-account")))
-                .decision,
+            evaluate_base_policy(&request(
+                "click",
+                "modify_reversible",
+                Some("Delete-account")
+            ))
+            .decision,
             "hard_deny"
         );
         assert_eq!(
@@ -8212,10 +9318,14 @@ mod tests {
             "hard_deny"
         );
         assert!(is_reversible_remove("remove the Status filter"));
-        assert!(is_reversible_remove("delete the draft text so we can retype"));
+        assert!(is_reversible_remove(
+            "delete the draft text so we can retype"
+        ));
         assert!(!is_reversible_remove("Delete draft"));
         assert!(!is_reversible_remove("remove the filter and the user"));
-        assert!(!is_reversible_remove("remove the filter then delete the account"));
+        assert!(!is_reversible_remove(
+            "remove the filter then delete the account"
+        ));
         assert!(!is_reversible_remove("delete the project after sorting"));
         assert_eq!(
             evaluate_base_policy(&request(
@@ -8266,9 +9376,15 @@ mod tests {
         let mut lines = Vec::new();
         summarize_native_observation(&observation, "Notepad", &mut lines);
         assert!(lines[0].contains("Notepad  gen=4"));
-        assert!(lines.iter().any(|line| line.contains("n1") && line.contains("Document")));
-        assert!(lines.iter().any(|line| line.contains("n2") && line.contains("mFile")));
-        assert!(lines.iter().any(|line| line.starts_with("text: ") && line.contains("document body")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("n1") && line.contains("Document")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("n2") && line.contains("mFile")));
+        assert!(lines
+            .iter()
+            .any(|line| line.starts_with("text: ") && line.contains("document body")));
         assert!(!lines.iter().any(|line| line.contains("[screen")));
     }
     #[test]
@@ -8368,9 +9484,10 @@ mod tests {
             .args
             .windows(2)
             .any(|pair| pair[0] == "-m" && pair[1] == "gpt-5.6-luna"));
-        assert!(codex.args.iter().any(|arg| {
-            arg.starts_with("model_reasoning_effort=") && arg.contains("xhigh")
-        }));
+        assert!(codex
+            .args
+            .iter()
+            .any(|arg| { arg.starts_with("model_reasoning_effort=") && arg.contains("xhigh") }));
 
         let copilot = planner_invocation(
             "copilot",
@@ -8425,16 +9542,8 @@ mod tests {
             .windows(2)
             .any(|pair| pair[0] == "--model" && pair[1] == "gpt-5.5[effort=high]"));
 
-        let cursor_effort_only = planner_invocation(
-            "cursor",
-            "plan",
-            &[],
-            None,
-            false,
-            None,
-            Some("high"),
-        )
-        .unwrap();
+        let cursor_effort_only =
+            planner_invocation("cursor", "plan", &[], None, false, None, Some("high")).unwrap();
         assert!(!cursor_effort_only
             .args
             .iter()
@@ -8509,7 +9618,10 @@ mod tests {
 "#;
         let models = parse_copilot_models_from_help(copilot_help);
         assert_eq!(
-            models.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(),
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
             ["claude-sonnet-5", "gpt-5.4"]
         );
 
@@ -8520,7 +9632,10 @@ mod tests {
 "#;
         let efforts = parse_copilot_efforts_from_help(flag_help);
         assert_eq!(
-            efforts.iter().map(|effort| effort.id.as_str()).collect::<Vec<_>>(),
+            efforts
+                .iter()
+                .map(|effort| effort.id.as_str())
+                .collect::<Vec<_>>(),
             ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
         );
         assert!(parse_copilot_efforts_from_help(
@@ -8532,7 +9647,10 @@ mod tests {
         let (default_model, models) = parse_grok_models_list(grok);
         assert_eq!(default_model.as_deref(), Some("grok-4.6"));
         assert_eq!(
-            models.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(),
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
             ["grok-4.6", "grok-4.5"]
         );
         assert_eq!(
@@ -8751,7 +9869,10 @@ mod tests {
         // The app is intentionally not running when a launch step executes.
         assert!(!needs_process_resolution("launchApplication", "Notepad"));
         assert!(!needs_process_resolution("listApplications", "Alfred"));
-        assert!(!needs_process_resolution("listInstalledApplications", "Alfred"));
+        assert!(!needs_process_resolution(
+            "listInstalledApplications",
+            "Alfred"
+        ));
         assert!(!needs_process_resolution("wait", "Microsoft Store"));
         assert!(needs_process_resolution("typeText", "Notepad"));
         assert!(needs_process_resolution("focusApplication", "Notepad"));
@@ -8818,15 +9939,13 @@ mod tests {
         let leftovers: Vec<_> = fs::read_dir(&directory)
             .unwrap()
             .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .contains(".tmp")
-            })
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
             .collect();
         let _ = fs::remove_dir_all(&directory);
-        assert!(leftovers.is_empty(), "atomic_write left temp files: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "atomic_write left temp files: {leftovers:?}"
+        );
     }
 
     fn sample_library_workflow(status: &str) -> Workflow {
@@ -8841,6 +9960,8 @@ mod tests {
             planner_provider: Some("codex".into()),
             required_apps: vec!["Notepad".into()],
             steps: Vec::new(),
+            completion_evidence: Vec::new(),
+            last_typed_text: None,
         }
     }
 
@@ -8884,6 +10005,10 @@ mod tests {
         let (_, loaded) = load_workflow(&library_path, &workflow.id).unwrap();
         assert_eq!(loaded.status, "recording");
         assert!(path.exists());
+        // A workflow still being recorded must not be run (or scheduled):
+        // replay has no finished steps and the planner fallback would drive
+        // the desktop mid-recording.
+        assert!(ensure_workflow_runnable(&loaded).is_err());
         let _ = fs::remove_dir_all(&library);
     }
 
@@ -8942,9 +10067,7 @@ mod tests {
         assert!(windows_task_is_missing(
             "ERROR: The system cannot find the file specified."
         ));
-        assert!(!windows_task_is_missing(
-            "ERROR: Access is denied."
-        ));
+        assert!(!windows_task_is_missing("ERROR: Access is denied."));
     }
     #[test]
     fn blocks_delete_virtual_key_payload() {
@@ -9009,6 +10132,312 @@ mod tests {
         assert_eq!(extract_saved_value(&browser).as_deref(), Some("page text"));
         let nothing = serde_json::json!({ "clicked": true });
         assert_eq!(extract_saved_value(&nothing), None);
+    }
+    fn replay_step(
+        kind: &str,
+        effect: &str,
+        target: Option<&str>,
+        payload: Value,
+        save_as: Option<&str>,
+    ) -> WorkflowStep {
+        WorkflowStep {
+            id: Uuid::new_v4().to_string(),
+            title: kind.into(),
+            kind: kind.into(),
+            effect: effect.into(),
+            application: Some("Notepad".into()),
+            intent: None,
+            target_label: target.map(str::to_string),
+            payload: Some(payload),
+            timeout_ms: default_timeout(),
+            retries: default_retries(),
+            wait_for: None,
+            expect: None,
+            save_as: save_as.map(str::to_string),
+        }
+    }
+    #[test]
+    fn sanitizes_stale_replay_handles_and_keeps_semantic_fields() {
+        let mut payload = serde_json::json!({
+            "processId": 4321,
+            "mark": "n12",
+            "generation": 3,
+            "ref": "e3",
+            "tabId": 9,
+            "x": 400,
+            "y": 220,
+            "from": "n1",
+            "to": "n2",
+            "text": "Hello",
+            "url": "https://example.test/path",
+            "keys": "CTRL+S",
+            "nx": 0.42,
+            "ny": 0.61,
+            "name": "Send",
+            "fromLabel": "Handle",
+            "toLabel": "Canvas"
+        });
+        sanitize_replay_payload(&mut payload);
+        assert!(payload.get("processId").is_none());
+        assert!(payload.get("mark").is_none());
+        assert!(payload.get("generation").is_none());
+        assert!(payload.get("ref").is_none());
+        assert!(payload.get("tabId").is_none());
+        assert!(payload.get("x").is_none());
+        assert!(payload.get("y").is_none());
+        assert!(payload.get("nx").is_none());
+        assert!(payload.get("ny").is_none());
+        assert!(payload.get("from").is_none());
+        assert!(payload.get("to").is_none());
+        assert_eq!(payload["text"], "Hello");
+        assert_eq!(payload["url"], "https://example.test/path");
+        assert_eq!(payload["keys"], "CTRL+S");
+        assert_eq!(payload["name"], "Send");
+        assert_eq!(payload["fromLabel"], "Handle");
+        assert_eq!(payload["toLabel"], "Canvas");
+    }
+    #[test]
+    fn unique_live_handles_ignore_first_ambiguous_match() {
+        let unique = serde_json::json!({
+            "found": true,
+            "count": 1,
+            "mark": "n4",
+            "matches": [{"id": "n4", "name": "Send", "automationId": "btnSend", "role": "Button"}]
+        });
+        let hints = ReplayMatchHints {
+            label: Some("Send".into()),
+            ..ReplayMatchHints::default()
+        };
+        assert_eq!(unique_native_mark(&unique, &hints).unwrap(), "n4");
+
+        let ambiguous = serde_json::json!({
+            "found": true,
+            "count": 2,
+            "mark": "n1",
+            "matches": [
+                {"id": "n1", "name": "Send", "role": "Button"},
+                {"id": "n2", "name": "Send", "role": "Button"}
+            ]
+        });
+        assert!(unique_native_mark(&ambiguous, &hints)
+            .unwrap_err()
+            .contains("Ambiguous"));
+
+        let disambiguated = serde_json::json!({
+            "found": true,
+            "count": 2,
+            "matches": [
+                {"id": "n1", "name": "Send", "automationId": "composerSend", "role": "Button"},
+                {"id": "n2", "name": "Send", "automationId": "otherSend", "role": "Button"}
+            ]
+        });
+        let by_id = ReplayMatchHints {
+            label: Some("Send".into()),
+            automation_id: Some("otherSend".into()),
+            ..ReplayMatchHints::default()
+        };
+        assert_eq!(unique_native_mark(&disambiguated, &by_id).unwrap(), "n2");
+
+        let browser = serde_json::json!({
+            "ok": true,
+            "result": {
+                "count": 2,
+                "matches": [
+                    {"ref": "e1", "label": "Continue shopping", "tag": "a"},
+                    {"ref": "e7", "label": "Continue", "tag": "button"}
+                ]
+            }
+        });
+        let exact = ReplayMatchHints {
+            label: Some("Continue".into()),
+            control_type: Some("button".into()),
+            ..ReplayMatchHints::default()
+        };
+        assert_eq!(unique_browser_ref(&browser, &exact).unwrap(), "e7");
+    }
+    #[test]
+    fn drag_replay_requires_endpoint_labels() {
+        let payload = serde_json::json!({"from": "n1", "to": "n2"});
+        assert!(drag_replay_endpoints(&payload, None).is_err());
+        let labeled = serde_json::json!({"fromLabel": "Handle", "toLabel": "Canvas"});
+        assert_eq!(
+            drag_replay_endpoints(&labeled, None).unwrap(),
+            ("Handle".into(), "Canvas".into())
+        );
+    }
+    #[test]
+    fn infers_expect_postconditions_for_type_and_navigate() {
+        // Typing steps must NOT infer a name-only expect: the target exists
+        // before the text lands, so the idempotent-resume pre-check would
+        // skip the action and the typed content would never appear.
+        let typed = replay_step(
+            "typeText",
+            "modify_reversible",
+            Some("Invoice"),
+            serde_json::json!({"text": "41.00"}),
+            None,
+        );
+        assert!(inferred_step_expect(&typed).is_none());
+        let navigate = replay_step(
+            "browser.navigate",
+            "external_write",
+            None,
+            serde_json::json!({"url": "https://example.test/sent"}),
+            None,
+        );
+        let expect = inferred_step_expect(&navigate).unwrap();
+        assert_eq!(
+            expect.url_contains.as_deref(),
+            Some("https://example.test/sent")
+        );
+        let click = replay_step(
+            "click",
+            "modify_reversible",
+            Some("OK"),
+            serde_json::json!({"mark": "n12"}),
+            None,
+        );
+        assert!(inferred_step_expect(&click).is_none());
+    }
+    #[test]
+    fn setvalue_steps_count_as_a_typed_text_anchor() {
+        // setValue carries the authored text in `value` (or `text`); without
+        // capturing it, a setValue-only workflow would hit the no-evidence
+        // verification error even after succeeding.
+        let payload = serde_json::json!({ "value": "Quarterly status update for Q3" });
+        let text = payload
+            .get("text")
+            .or_else(|| payload.get("value"))
+            .and_then(Value::as_str)
+            .and_then(authored_text_anchor);
+        assert_eq!(text.as_deref(), Some("Quarterly status update for Q3"));
+    }
+
+    #[test]
+    fn evidence_never_matches_unavailable_error_prose() {
+        // "App: unavailable (…)" names the app, so naive token matching would
+        // turn a failed observation into positive evidence.
+        let evidence = "Notepad window is visible with the invoice";
+        let failed = "Notepad: unavailable (Could not resolve a running window for Notepad.)\n";
+        assert!(!evidence_matches_grounding(evidence, failed));
+        assert!(!evidence_matches_grounding(
+            evidence,
+            "Installed browser: unavailable (extension not connected)\npage content: unavailable (read failed)"
+        ));
+        let observed = "Notepad gen=4\n- Document \"Untitled\"\nwindow: invoice total";
+        assert!(evidence_matches_grounding(evidence, observed));
+    }
+
+    #[test]
+    fn replay_completion_requires_visible_outcome() {
+        let mut workflow = sample_library_workflow("ready");
+        workflow.completion_evidence = vec!["Invoice total 41.00 is in Notepad".into()];
+        let visible = "Notepad gen=4\n- Document \"Untitled\"\ntext: Invoice total 41.00";
+        assert!(replay_outcome_is_evidenced(&workflow, visible).is_ok());
+        assert!(replay_outcome_is_evidenced(&workflow, "Notepad gen=4\n- Button \"OK\"").is_err());
+
+        workflow.completion_evidence.clear();
+        workflow.last_typed_text = Some("hello from alfred".into());
+        assert!(replay_outcome_is_evidenced(&workflow, "text: hello from alfred").is_ok());
+        assert!(replay_outcome_is_evidenced(&workflow, "text: something else").is_err());
+
+        workflow.goal = "send an email".into();
+        workflow.last_typed_text = Some("Quarterly status update".into());
+        workflow.steps = vec![replay_step(
+            "click",
+            "external_write",
+            Some("Send email"),
+            serde_json::json!({}),
+            None,
+        )];
+        let published = "- Text \"Quarterly status update\"\ntext: Quarterly status update";
+        assert!(replay_outcome_is_evidenced(&workflow, published).is_ok());
+        assert!(
+            replay_outcome_is_evidenced(&workflow, "- Edit \"Quarterly status update\"").is_err()
+        );
+
+        // No evidence, typed text, publish, or save proof captured: success
+        // would be vacuous, so verification must refuse rather than pass.
+        workflow.goal = "open notepad".into();
+        workflow.last_typed_text = None;
+        workflow.steps.clear();
+        assert!(replay_outcome_is_evidenced(&workflow, "Notepad gen=4").is_err());
+    }
+    #[test]
+    fn replay_skips_probes_unless_they_capture_a_value() {
+        let observe = replay_step(
+            "observeWindow",
+            "observe",
+            None,
+            serde_json::json!({}),
+            None,
+        );
+        assert!(is_replay_probe_step(&observe));
+        let find = replay_step(
+            "findElement",
+            "observe",
+            Some("OK"),
+            serde_json::json!({"text": "OK"}),
+            None,
+        );
+        assert!(is_replay_probe_step(&find));
+        let capture = replay_step(
+            "getValue",
+            "observe",
+            Some("Invoice"),
+            serde_json::json!({"name": "Invoice"}),
+            Some("total"),
+        );
+        assert!(!is_replay_probe_step(&capture));
+        let click = replay_step(
+            "click",
+            "modify_reversible",
+            Some("OK"),
+            serde_json::json!({"mark": "n12"}),
+            None,
+        );
+        assert!(!is_replay_probe_step(&click));
+        assert!(validate_workflow_step(&click).is_ok());
+    }
+    #[test]
+    fn ready_workflows_with_actions_can_replay() {
+        let click = replay_step(
+            "click",
+            "modify_reversible",
+            Some("OK"),
+            serde_json::json!({"mark": "n12"}),
+            None,
+        );
+        let mut workflow = sample_library_workflow("ready");
+        workflow.steps = vec![
+            replay_step(
+                "observeWindow",
+                "observe",
+                None,
+                serde_json::json!({}),
+                None,
+            ),
+            click.clone(),
+        ];
+        assert!(workflow_can_replay(&workflow));
+        workflow.steps.pop();
+        assert!(!workflow_can_replay(&workflow));
+        workflow.status = "goal".into();
+        workflow.steps.clear();
+        assert!(!workflow_can_replay(&workflow));
+        // One invalid step among valid ones must disqualify replay (the run
+        // would die mid-replay at the invalid step): the workflow falls back
+        // to the live planner instead.
+        workflow.status = "ready".into();
+        let broken = replay_step(
+            "typeText",
+            "modify_reversible",
+            Some("Editor"),
+            serde_json::json!({}), // missing text -> invalid
+            None,
+        );
+        workflow.steps = vec![click, broken];
+        assert!(!workflow_can_replay(&workflow));
     }
     #[test]
     fn step_conditions_and_save_as_default_off_in_old_workflows() {
@@ -9105,20 +10534,45 @@ mod tests {
         assert!(prompt.contains("non-editable published content"));
 
         let mark_catalog = "Microsoft Edge  gen=4  dpi=144  focused=n3\nn3  Hyperlink \"Fun fact: Octopuses have three hearts and two stop beating when they swim.\"\ntext: Fun fact: Octopuses have three hearts and two stop beating when they swim.";
-        assert!(is_verified_completion(&reply, mark_catalog, Some(text), true));
+        assert!(is_verified_completion(
+            &reply,
+            mark_catalog,
+            Some(text),
+            true
+        ));
         let mark_draft = "Microsoft Edge  gen=4  focused=n1\nn1  Document \"Fun fact: Octopuses have three hearts and two stop beating when they swim.\"  value+text";
-        assert!(!is_verified_completion(&reply, mark_draft, Some(text), true));
+        assert!(!is_verified_completion(
+            &reply,
+            mark_draft,
+            Some(text),
+            true
+        ));
         let draft_plus_text = "Microsoft Edge  gen=4  focused=n1\nn1  Document \"Fun fact: Octopuses have three hearts and two stop beating when they swim.\"  value+text\ntext: Fun fact: Octopuses have three hearts and two stop beating when they swim.";
         assert!(
             !is_verified_completion(&reply, draft_plus_text, Some(text), true),
             "a sibling text: line must not prove publication while the composer still holds the draft"
         );
         let draft_plus_prose = "Installed browser:\n- Document e1 \"Fun fact: Octopuses have three hearts and two stop beating when they swim.\"\nread-prose: Fun fact: Octopuses have three hearts and two stop beating when they swim.";
-        assert!(!is_verified_completion(&reply, draft_plus_prose, Some(text), true));
+        assert!(!is_verified_completion(
+            &reply,
+            draft_plus_prose,
+            Some(text),
+            true
+        ));
         let published_link = "Installed browser:\n- a e15 \"Fun fact: Octopuses have three hearts and two stop beating when they swim.\"";
-        assert!(is_verified_completion(&reply, published_link, Some(text), true));
+        assert!(is_verified_completion(
+            &reply,
+            published_link,
+            Some(text),
+            true
+        ));
         let sanitized_feed = "Installed browser:\npage: https://x.com/you\nread-prose: Fun fact: Octopuses have three hearts and two stop beating when they swim.";
-        assert!(is_verified_completion(&reply, sanitized_feed, Some(text), true));
+        assert!(is_verified_completion(
+            &reply,
+            sanitized_feed,
+            Some(text),
+            true
+        ));
     }
     #[test]
     fn save_goals_need_a_visible_transition() {
@@ -9158,13 +10612,7 @@ mod tests {
             "an unchanged named title is not save proof"
         );
         assert!(
-            !observation_shows_save_transition(
-                before,
-                Some(before),
-                None,
-                true,
-                Some("Notepad")
-            ),
+            !observation_shows_save_transition(before, Some(before), None, true, Some("Notepad")),
             "Ctrl+S that leaves Untitled unchanged is not a save"
         );
         assert!(!goal_requires_save_proof(
@@ -9473,8 +10921,12 @@ mod tests {
         assert_eq!(browser_trusted_point(&click), Some((0.42, 0.61)));
         assert_eq!(trusted_browser_native_method("click"), Some("click"));
         assert_eq!(trusted_browser_native_method("type"), Some("typeText"));
-        assert_eq!(trusted_browser_native_method("dblclick"), Some("doubleClick"));
-        let ordinary = serde_json::json!({ "ok": true, "result": { "clicked": true, "nx": 0.2, "ny": 0.3 } });
+        assert_eq!(
+            trusted_browser_native_method("dblclick"),
+            Some("doubleClick")
+        );
+        let ordinary =
+            serde_json::json!({ "ok": true, "result": { "clicked": true, "nx": 0.2, "ny": 0.3 } });
         assert!(!browser_result_needs_trusted_input("click", &ordinary));
         let typed = serde_json::json!({ "ok": true, "result": { "typed": false, "verified": false, "nx": 0.5, "ny": 0.5 } });
         assert!(browser_result_needs_trusted_input("type", &typed));
@@ -9484,7 +10936,10 @@ mod tests {
         );
         let result = merged.get("result").unwrap();
         assert_eq!(result.get("trustedInput"), Some(&Value::Bool(true)));
-        assert_eq!(result.get("how").and_then(Value::as_str), Some("humanClick"));
+        assert_eq!(
+            result.get("how").and_then(Value::as_str),
+            Some("humanClick")
+        );
         assert_eq!(result.get("needsTrustedInput"), Some(&Value::Bool(false)));
         let digest = planner_result_digest(&merged);
         assert!(digest.contains("[humanClick]"));
@@ -9553,8 +11008,12 @@ mod tests {
         let launched_digest = planner_result_digest(&launched);
         assert!(launched_digest.contains("[alreadyRunning]"));
         assert!(launched_digest.contains("application=Settings"));
-        assert!(payload_has_normalized_point(Some(&serde_json::json!({"nx": 0.4, "ny": 0.6}))));
-        assert!(!payload_has_normalized_point(Some(&serde_json::json!({"nx": null, "ny": null, "x": 900, "y": 600}))));
+        assert!(payload_has_normalized_point(Some(
+            &serde_json::json!({"nx": 0.4, "ny": 0.6})
+        )));
+        assert!(!payload_has_normalized_point(Some(
+            &serde_json::json!({"nx": null, "ny": null, "x": 900, "y": 600})
+        )));
         let prose_only = serde_json::json!({
             "ok": true,
             "result": {
@@ -9637,10 +11096,7 @@ mod tests {
             "anything",
             &["Microsoft Store".to_string()]
         ));
-        assert!(!goal_needs_store_skill(
-            "Open Notepad and type hello",
-            &[]
-        ));
+        assert!(!goal_needs_store_skill("Open Notepad and type hello", &[]));
         assert!(!goal_needs_store_skill("restore the last draft", &[]));
         let prompt = build_planner_prompt(
             "Open the Microsoft Store and find Calculator",

@@ -26,7 +26,7 @@ Alfred is a local-first desktop workflow agent for repetitive work across applic
 | Codex, Copilot, Cursor, and Grok CLI adapters | Beta; requires the selected CLI to be installed and authenticated |
 | Goal runs (live planner loop with policy gate, approvals, and guardrails) | Implemented; provider answer parsing is best-effort per CLI and needs the Windows validation pass |
 | Planner vision (per-turn screenshots to the CLI) | Implemented for Codex (`--image`), Copilot (`--attachment`), Grok and Cursor (prompt-listed file paths); opt-in setting, off by default |
-| Workflow YAML recording, replay, pause/stop, and recovery | Implemented with per-step app re-resolution, retries, timeouts, a single-run lock, wait/expect state conditions, cross-app variables, and mid-run approval prompts; full cross-application validation is pending |
+| Workflow YAML recording, replay, pause/stop, and recovery | Implemented: Library Run replays recorded steps with live window/PID/mark/ref re-binding (unique match only; stale `nx`/`ny` stripped), retries, timeouts, a single-run lock, wait/expect, cross-app variables, mid-run approval, and a final live-outcome check; the planner takes over if a step is missing, ambiguous, or the saved result is not visible — including workflows saved without outcome evidence, which fall back on every replay until re-saved with captured evidence. Full cross-application validation is pending |
 | Scheduling | Implemented in the core; Windows Task Scheduler validation is pending |
 | Windows portable ZIP plus MSI/NSIS packaging | Build scripts and CI are present; binaries are unsigned and pre-release |
 | macOS native application control and screen capture | Not implemented; Swift host contract only |

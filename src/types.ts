@@ -107,6 +107,8 @@ export interface Workflow {
   plannerProvider?: string;
   requiredApps: string[];
   steps: WorkflowStep[];
+  completionEvidence?: string[];
+  lastTypedText?: string;
 }
 
 export interface RunEvent {

@@ -70,7 +70,7 @@ The Chromium Manifest V3 extension is an optional accelerator for DOM-backed obs
 
 ## Persistence
 
-Workflow definitions live in the user-selected library as YAML files. A saved workflow is a goal definition with the brain that learned it, target-app hints, and a successful action audit trail. Running it re-enters the live planner instead of blindly replaying stale browser refs or coordinates. Secrets, provider authentication, screenshots, provider session ids, and machine-specific run state are never embedded in shareable workflow files.
+Workflow definitions live in the user-selected library as YAML files. A saved workflow is a goal definition with the brain that learned it, target-app hints, a successful action audit trail, and the outcome evidence from the learning run. Running it replays those recorded actions after stripping stale marks, browser refs, PIDs, and screen coordinates (including normalized `nx`/`ny`). Each target rebinds only on a unique live match—label plus automation id and control type when recorded; ambiguous names such as “Send” fall back to the planner rather than the first hit. Drag steps rebind both `fromLabel` and `toLabel`. Replay does not declare success until a final observation still shows the learned outcome. If a step no longer matches, the same run hands off to the live planner with the replay history. Secrets, provider authentication, screenshots, provider session ids, and machine-specific run state are never embedded in shareable workflow files.
 
 Machine-specific goal memory lives under app data in `goal-runs/<run-id>.json`; successful reusable steps live in the separate run-step ledger. Both use atomic replacement.
 
